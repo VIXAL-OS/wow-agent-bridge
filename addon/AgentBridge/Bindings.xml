@@ -1,0 +1,8 @@
+<Bindings>
+	<Binding name="AGENTBRIDGE_TOGGLE" header="AGENTBRIDGE">
+		AgentBridge.Toggle()
+	</Binding>
+	<Binding name="AGENTBRIDGE_FOCUS">
+		AgentBridge.Focus()
+	</Binding>
+</Bindings>

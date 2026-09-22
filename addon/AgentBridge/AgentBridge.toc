@@ -1,0 +1,14 @@
+## Interface: 30300
+## Title: Agent Bridge
+## Notes: Chat with Claude Code or Codex from inside the game. Prompts leave as a pixel strip; replies return through font metrics.
+## Version: 0.1.0
+## SavedVariables: AgentBridgeState
+Epoch.lua
+Core.lua
+Protocol.lua
+Panel.lua
+Format.lua
+Strip.lua
+Receiver.lua
+Links.lua
+Commands.lua
