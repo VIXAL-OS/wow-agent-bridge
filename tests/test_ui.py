@@ -87,9 +87,6 @@ class InGame(unittest.TestCase):
         self.assertIn('Echo: remember me', self.sim.body())
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class ReplyFormatting(unittest.TestCase):
     """Markdown from agents, made readable in a narrow panel."""
@@ -142,3 +139,7 @@ class ReplyFormatting(unittest.TestCase):
         self.assertTrue(sim.run(60, until=lambda: sim.last_reply() is not None))
         self.assertIn('Slot', sim.body())
         self.assertIn('free', sim.body())
+
+
+if __name__ == '__main__':
+    unittest.main()

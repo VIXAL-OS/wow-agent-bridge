@@ -103,11 +103,24 @@ Neither mode can run arbitrary shell commands without approval, and there is no 
 
 Replies render as plain text. `[Name](item:ID)` references become real item links with tooltips; everything else is escaped. Nothing in a reply can run as code or perform a game action.
 
-## Limits and what is not verified yet
+## What has been verified, and what has not
 
-- **Confirmed live (2026-09-22):** the addon loads, measures fonts and reports per-size results in the real client. The capped em was found this way.
-- **Still unverified live:** that a pre-created font file loads fresh from disk on its first use. That is what the whole reply channel rests on, and the first successful reply is what proves it.
-- About 3 s from sending to the first status update, then a cheap header poll every 2–8 s while the agent works. Measured in simulation: a short reply appears ~3.5 s after the agent finishes, and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
+**Verified in the live client** (ChromieCraft, 3.3.5a, 1920×1080 windowed, 2026-09-22):
+
+- **The whole round trip.** Real Claude Code replies were sent from the game, answered, and delivered back into the panel. That proves the channel's central assumption: a pre-created font file loads fresh from disk on its first use.
+- **The font self-test** passes at every size, with byte values ~4 px apart and 0 of 2,032 check glyphs misread. The original byte-per-glyph encoding failed here — sizes 128, 192 and 256 returned identical widths — which is how the capped em was found.
+- **Reading the strip at 20% opacity** over the game scene, and **through the window** while WoW was covered by another app.
+- **Latency:** Claude answered in ~4 s, and the reply was in the panel ~10 s after the companion picked the prompt up.
+
+**Not yet exercised live** (covered by simulation and unit tests only):
+
+- Replies longer than one 4,060-byte packet, and streaming previews.
+- Aligned tables in the fixed-width font, and item-link tooltips.
+- Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
+
+In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
+
+**Limits:**
 - WoW may be covered or in the background, but not minimized: a minimized window stops rendering, so nothing can be read.
 - If WoW starts while the companion is not running, that game session continues from the saved slot instead of recycling. With 65,535 slots, that is rarely a problem.
 
