@@ -175,7 +175,7 @@ class Sim:
 
     # Views -------------------------------------------------------------
     def body(self):
-        return b'\n'.join(bytes(line) for line in self.g.AgentBridgeBody.lines.values()).decode('utf-8')
+        return bytes(self.ns.BodyText()).decode('utf-8')
 
     def last_reply(self):
         last = self.g.AgentBridgeState.last

@@ -66,12 +66,12 @@ local function renderTable(rows, columns, aligned, out)
     if fits then
         local line = {}
         for i, cell in ipairs(header) do line[#line+1] = pad(cell, widths[i]) end
-        out[#out+1] = {text = table.concat(line, '   '), style = 'heading'}
-        out[#out+1] = {text = string.rep('-', math.min(columns, width(header))), style = 'dim'}
+        out[#out+1] = {text = table.concat(line, '   '), style = 'heading', mono = true}
+        out[#out+1] = {text = string.rep('-', math.min(columns, width(header))), style = 'dim', mono = true}
         for _, row in ipairs(body) do
             line = {}
             for i = 1, #widths do line[#line+1] = pad(row[i] or '', widths[i]) end
-            out[#out+1] = {text = table.concat(line, '   ')}
+            out[#out+1] = {text = table.concat(line, '   '), mono = true}
         end
         return
     end
@@ -102,7 +102,7 @@ function NS.FormatLines(text, columns)
             mono = true
             index = index + 1
             while index <= #lines and not lines[index]:match('^%s*```') do
-                out[#out+1] = {text = lines[index], style = 'code'}
+                out[#out+1] = {text = lines[index], style = 'code', mono = true}
                 index = index + 1
             end
         elseif isRow(line) and lines[index+1] and isDivider(lines[index+1]) then

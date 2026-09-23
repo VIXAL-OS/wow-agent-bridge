@@ -91,6 +91,10 @@ local function query(id)
     retryUntil = GetTime() + 10
 end
 
+-- Links only become interactive where the client dispatches hyperlink events
+-- for this frame type; elsewhere they still show as coloured names.
+local function hook(script, handler) pcall(body.SetScript, body, script, handler) end
+
 local STYLE = {heading = 'ffffd100', label = 'ff8dbdff', dim = 'ff909090', code = 'ffb7e4c7'}
 local links = 0
 
@@ -117,29 +121,31 @@ local function renderInline(text)
     return table.concat(chunks), missing
 end
 
--- Returns panel markup, whether an item is still loading, and whether the
--- reply needs the fixed-width font (tables and code blocks do).
+-- Returns the joined markup, whether an item is still loading, whether any
+-- line needs the fixed-width font, and the rows for the panel.
 function NS.RenderReply(text)
     local entries, mono = NS.FormatLines(text, NS.BodyColumns())
-    local out, missing = {}, false
+    local out, rows, missing = {}, {}, false
     allowed, links = {}, 0
     for _, entry in ipairs(entries) do
         local line, gap = renderInline(entry.text)
         missing = missing or gap
         local color = entry.style and STYLE[entry.style]
-        out[#out+1] = color and ('|c'..color..line..'|r') or line
+        line = color and ('|c'..color..line..'|r') or line
+        out[#out+1] = line
+        rows[#rows+1] = {text = line, mono = entry.mono}
     end
-    return table.concat(out, '\n'), missing, mono
+    return table.concat(out, '\n'), missing, mono, rows
 end
 
 local STATE_NOTE = {[0] = 'waiting for the companion', [1] = 'queued', [2] = 'working', [3] = 'writing...',
     [5] = 'finished with a problem', [6] = 'interrupted'}
 function NS.ShowReply(text, state, complete)
-    local markup, missing, mono = NS.RenderReply(text)
+    local markup, missing, _, rows = NS.RenderReply(text)
     local note = STATE_NOTE[state]
     if not complete and state >= 4 then note = 'receiving the rest...' end
     current = {text = text, state = state, complete = complete, markup = markup}
-    NS.RenderBody(NS.currentPrompt, markup, note and ('('..note..')'), mono)
+    NS.RenderBody(NS.currentPrompt, rows, note and ('('..note..')'))
     if complete and state >= 4 then NS.S.last = {prompt = NS.currentPrompt, reply = text, state = state} end
     return missing
 end
@@ -156,13 +162,13 @@ poll:SetScript('OnUpdate', function(_, dt)
     if not missing then retryUntil = 0 end
 end)
 
-body:SetScript('OnHyperlinkEnter', function(self, data)
+hook('OnHyperlinkEnter', function(self, data)
     if not allowed[data] then return end
     GameTooltip:SetOwner(self, 'ANCHOR_CURSOR')
     if pcall(GameTooltip.SetHyperlink, GameTooltip, data) then GameTooltip:Show() else GameTooltip:Hide() end
 end)
-body:SetScript('OnHyperlinkLeave', function() GameTooltip:Hide() end)
-body:SetScript('OnHyperlinkClick', function(self, data, link, button)
+hook('OnHyperlinkLeave', function() GameTooltip:Hide() end)
+hook('OnHyperlinkClick', function(self, data, link, button)
     if not allowed[data] then return end
     if IsModifiedClick('CHATLINK') and edit:HasFocus() then NS.InsertLink(link); return end
     SetItemRef(data, link, button)

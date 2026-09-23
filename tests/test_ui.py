@@ -54,7 +54,7 @@ class InGame(unittest.TestCase):
         text = bytes(self.ns.MakePromptText(link.encode() + b' worth it?')).decode()
         self.assertEqual(text, '[Frostmourne] (item 36942; link item:36942:0:0:0:0:0:0:0:80) worth it?')
         # Unknown items stay plain text, and markup in replies is escaped.
-        markup, missing, mono = self.ns.RenderReply(b'See [Thunderfury](item:19019) and |cffff0000fake|r')
+        markup, missing, mono, rows = self.ns.RenderReply(b'See [Thunderfury](item:19019) and |cffff0000fake|r')
         markup = bytes(markup).decode()
         self.assertEqual(markup, 'See Thunderfury (item 19019) and ||cffff0000fake||r')
 
@@ -79,6 +79,21 @@ class InGame(unittest.TestCase):
         mm.scripts[b'OnDragStop'](mm)
         self.ns.Toggle()
         self.assertFalse(panel.shown)
+
+    def test_scrolling_keeps_your_place_within_an_exchange(self):
+        scroll = self.g.AgentBridgeScroll
+        long = '\n'.join(f'line {i}' for i in range(120)).encode()
+        rows = lambda text: self.ns.RenderReply(text)[3]
+        self.ns.RenderBody(b'question', rows(long))
+        self.assertGreater(scroll.GetVerticalScrollRange(scroll), 0)
+        self.assertEqual(scroll.GetVerticalScroll(scroll), 0, 'a new exchange starts at the top')
+        # No filler: the page is exactly as tall as its lines.
+        self.assertEqual(self.g.AgentBridgeBody.height, (120 + 2) * 16)
+        scroll.SetVerticalScroll(scroll, 500)  # you scroll down to read
+        self.ns.RenderBody(b'question', rows(long + b'\nmore'), b'(writing...)')
+        self.assertEqual(scroll.GetVerticalScroll(scroll), 500, 'an update does not yank you back up')
+        self.ns.RenderBody(b'another question', rows(b'short'))
+        self.assertEqual(scroll.GetVerticalScroll(scroll), 0)
 
     def test_saved_reply_restored_after_reload(self):
         self.sim.send('remember me')

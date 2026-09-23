@@ -8,7 +8,8 @@ local ABSENT = {SetColorTexture = true, SetShown = true, SetSize = true, SetResi
     SetHyperlinksEnabled = true, SetWordWrap = true}
 -- Plain data fields read back as nil when unset, like real widget state;
 -- only missing *methods* fall back to a no-op.
-local DATA = {font = true, size = true, color = true, file = true, focus = true, width = true, height = true}
+local DATA = {font = true, size = true, color = true, file = true, focus = true, width = true, height = true,
+    child = true, vscroll = true}
 local allFrames = {}
 STUB = {frames = allFrames, events = {}, messages = {}, prints = {}, sounds = {}}
 
@@ -69,6 +70,14 @@ function Object:SetFont(path, size)
     return 1
 end
 function Object:GetFont() return self.font, self.size end
+function Object:GetStringHeight() return 14 end
+-- ScrollFrame: the range is how far the child overhangs the visible area.
+function Object:SetScrollChild(child) self.child = child end
+function Object:GetVerticalScrollRange()
+    return self.child and math.max(0, (self.child.height or 0) - self:GetHeight()) or 0
+end
+function Object:GetVerticalScroll() return self.vscroll or 0 end
+function Object:SetVerticalScroll(value) self.vscroll = value end
 function Object:GetStringWidth()
     if not self.font then error('Font not set') end
     return py.measure(self.font, self.size, self.text)

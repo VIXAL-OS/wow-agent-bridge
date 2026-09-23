@@ -23,7 +23,10 @@ GUIDANCE = (
     'put the essentials first and keep the rest brief. For a WoW item whose numeric item ID the user supplied or you '
     'verified, write [Item Name](item:12345) with the real name and ID; the panel turns that into '
     'a native item link with tooltip. Never invent item IDs; leave unverified items as plain '
-    'names. Never output raw WoW pipe markup. Nothing you write can act inside the game.'
+    'names. Never output raw WoW pipe markup. Nothing you write can act inside the game. '
+    'When web search is available, use it to check game facts instead of answering from memory. '
+    'The realm runs patch 3.3.5a, so prefer sources for that patch and say when something differs '
+    'in Classic re-releases or later versions.'
 )
 
 BACKENDS = {'claude': 'Claude Code', 'codex': 'Codex', 'mock': 'Mock agent'}
@@ -39,6 +42,7 @@ class AgentConfig:
     codex: str = ''
     timeout: int = 1800
     guidance_file: Path | None = None
+    web: bool = True
 
 
 @dataclass
@@ -243,9 +247,13 @@ class CodexStream:
                 self.on_update(text)
         elif kind == 'item.started' and itype == 'command_execution':
             self.on_activity(describe_tool('Run', {'command': item.get('command') or ''}))
-        elif kind == 'item.started' and itype in ('file_change', 'web_search', 'mcp_tool_call'):
-            self.on_activity({'file_change': 'Editing files', 'web_search': 'Searching the web',
-                              'mcp_tool_call': 'Using a tool'}[itype])
+        elif itype == 'web_search' and kind == 'item.completed':
+            # The query only arrives on completion. Showing it tells a real search
+            # apart from a reply that merely claims a source.
+            query = item.get('query') or ''
+            self.on_activity(describe_tool('Searched', {'query': query}) if query else 'Searched the web')
+        elif kind == 'item.started' and itype in ('file_change', 'mcp_tool_call'):
+            self.on_activity({'file_change': 'Editing files', 'mcp_tool_call': 'Using a tool'}[itype])
 
     def outcome(self, returncode, tail, timed_out):
         if timed_out:
@@ -257,16 +265,24 @@ class CodexStream:
         return Result('done', latest or '(No text response.)', self.thread)
 
 
+WEB_TOOLS = ['WebSearch', 'WebFetch']
+
+
 def claude_command(cfg, job):
     command = [cfg.claude, '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']
+    web = WEB_TOOLS if cfg.web else []
+    # Headless runs cannot ask for approval, so every tool the level allows is
+    # listed up front; anything else is refused rather than left waiting.
     if cfg.sandbox == 'workspace-write+shell':
         # Edits and shell commands run unattended: the caller opted in.
-        command += ['--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Glob,Grep,Edit,Write,Bash']
+        command += ['--permission-mode', 'acceptEdits', '--allowedTools',
+                    ','.join(['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'] + web)]
     elif cfg.sandbox == 'workspace-write':
         command += ['--permission-mode', 'acceptEdits']
+        if web:
+            command += ['--allowedTools', ','.join(web)]
     else:
-        # Anything that would need approval is refused; reading the project is allowed.
-        command += ['--permission-mode', 'dontAsk', '--allowedTools', 'Read,Glob,Grep']
+        command += ['--permission-mode', 'dontAsk', '--allowedTools', ','.join(['Read', 'Glob', 'Grep'] + web)]
     if cfg.guidance_file:
         command += ['--append-system-prompt-file', str(cfg.guidance_file)]
     if cfg.model:
@@ -286,16 +302,19 @@ def codex_sandbox(level):
 
 
 def codex_command(cfg, job=None):
+    # Web search is a config value rather than --search, because `exec resume`
+    # does not accept that flag.
+    web = ['-c', f'web_search="{"live" if cfg.web else "disabled"}"']
     if job is not None and job.resume:
         # `exec resume` takes neither --sandbox nor -C; the sandbox goes through
         # a config override and the working folder comes from the process itself.
         command = [cfg.codex, 'exec', 'resume', '--json', '--skip-git-repo-check',
-                   '-c', f'sandbox_mode="{codex_sandbox(cfg.sandbox)}"']
+                   '-c', f'sandbox_mode="{codex_sandbox(cfg.sandbox)}"'] + web
         if cfg.model:
             command += ['-m', cfg.model]
         return command + [job.resume, '-']
     command = [cfg.codex, 'exec', '--json', '--sandbox', codex_sandbox(cfg.sandbox), '--skip-git-repo-check',
-               '--color', 'never', '-C', str(cfg.project)]
+               '--color', 'never', '-C', str(cfg.project)] + web
     if cfg.model:
         command += ['-m', cfg.model]
     return command + ['-']

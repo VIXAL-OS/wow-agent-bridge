@@ -1,7 +1,34 @@
-"""Find native agent CLIs even when Explorer's PATH differs from a terminal's."""
+"""Find native agent CLIs and the models they offer on this machine."""
+import json
 import os
 from pathlib import Path
+import re
 import shutil
+
+CLAUDE_ALIASES = ['opus', 'sonnet', 'haiku']  # each means "the latest of that family"
+
+
+def claude_models(config=Path.home() / '.claude.json'):
+    """Model IDs Claude Code has seen here, newest version first, then the aliases."""
+    try:
+        text = Path(config).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        text = ''
+    found = {name.rstrip('-') for name in re.findall(r'claude-(?:opus|sonnet|haiku|fable)-\d[\w-]*', text)}
+
+    def version(name):
+        return tuple(int(n) for n in re.findall(r'\d+', name)[:2])
+    return sorted(found, key=lambda name: (version(name), name), reverse=True) + CLAUDE_ALIASES
+
+
+def codex_models(cache=Path.home() / '.codex' / 'models_cache.json'):
+    """Models Codex lists for this account, in its own order; hidden ones are skipped."""
+    try:
+        data = json.loads(Path(cache).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    return [m['slug'] for m in data.get('models', [])
+            if isinstance(m, dict) and m.get('slug') and m.get('visibility', 'list') == 'list']
 
 
 def _first(paths):

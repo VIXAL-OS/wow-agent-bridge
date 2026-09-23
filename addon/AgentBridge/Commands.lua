@@ -17,7 +17,7 @@ local function submit()
     NS.ClearReply()
     NS.BeginRequest(sequence)
     NS.SetBadge(nil)
-    NS.RenderBody(text, '', '(sending...)')
+    NS.RenderBody(text, {}, '(sending...)')
     NS.SetStatus('Prompt #'..sequence..' sent. You can close this panel and keep playing.')
     edit:SetText(''); edit:ClearFocus()
 end
@@ -30,7 +30,7 @@ function NS.NewChat()
     NS.S.conversation = math.max(time(), (NS.S.conversation or 0) + 1); NS.S.last = nil
     NS.NewSession()
     NS.currentPrompt = nil
-    NS.RenderBody(nil, '', '(new conversation)')
+    NS.RenderBody(nil, {}, '(new conversation)')
     NS.SetStatus('New conversation. The agent will not see earlier messages.')
 end
 

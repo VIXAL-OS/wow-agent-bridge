@@ -163,7 +163,7 @@ class Agents(unittest.TestCase):
         cfg = AgentConfig('claude', Path('.'), claude='claude.exe', sandbox='workspace-write+shell')
         command = claude_command(cfg, Job('k', 'p'))
         self.assertIn('acceptEdits', command)
-        self.assertIn('Read,Glob,Grep,Edit,Write,Bash', command)
+        self.assertIn('Read,Glob,Grep,Edit,Write,Bash,WebSearch,WebFetch', command)
         self.assertEqual(codex_sandbox('workspace-write+shell'), 'workspace-write')
         self.assertEqual(codex_sandbox('read-only'), 'read-only')
 
@@ -424,3 +424,42 @@ class CompanionModules(unittest.TestCase):
             self.assertIn('why is the sky blue?', body)
             self.assertIn('Rayleigh scattering.', body)
             self.assertTrue(path.name.endswith('abc-1.md'))
+
+
+class WebAndModels(unittest.TestCase):
+    def test_web_tools_follow_the_toggle_at_every_access_level(self):
+        for level in ('read-only', 'workspace-write', 'workspace-write+shell'):
+            on = ' '.join(claude_command(AgentConfig('claude', Path('.'), sandbox=level, claude='c', web=True), Job('k', 'p')))
+            off = ' '.join(claude_command(AgentConfig('claude', Path('.'), sandbox=level, claude='c', web=False), Job('k', 'p')))
+            self.assertIn('WebSearch,WebFetch', on, level)
+            self.assertNotIn('WebSearch', off, level)
+
+    def test_codex_web_search_is_a_config_value_on_both_paths(self):
+        from companion.agents import codex_command
+        cfg = AgentConfig('codex', Path('.'), codex='codex', web=True)
+        self.assertIn('web_search="live"', codex_command(cfg, Job('k', 'p')))
+        self.assertIn('web_search="live"', codex_command(cfg, Job('k', 'p', resume='T')))
+        cfg.web = False
+        self.assertIn('web_search="disabled"', codex_command(cfg, Job('k', 'p', resume='T')))
+
+    def test_codex_reports_the_real_search_query(self):
+        seen = []
+        stream = CodexStream(None, seen.append)
+        stream.feed({'type': 'item.started', 'item': {'type': 'web_search', 'query': ''}})
+        stream.feed({'type': 'item.completed', 'item': {'type': 'web_search', 'query': 'wotlk disenchanting'}})
+        self.assertEqual(seen, ['Searched: wotlk disenchanting'])
+
+    def test_model_lists_come_from_each_cli(self):
+        from companion.launching import claude_models, codex_models
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'claude.json'
+            config.write_text('{"a": "claude-sonnet-5", "b": "claude-opus-5-5", "c": "claude-haiku-4-5-20251001", '
+                              '"d": "claude-opus-5-5"}', encoding='utf-8')
+            self.assertEqual(claude_models(config), ['claude-opus-5-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001',
+                                                     'opus', 'sonnet', 'haiku'])
+            cache = Path(tmp) / 'models.json'
+            cache.write_text(json.dumps({'models': [{'slug': 'gpt-6-astra', 'visibility': 'list'},
+                                                    {'slug': 'internal', 'visibility': 'hide'},
+                                                    {'slug': 'gpt-5.5', 'visibility': 'list'}]}), encoding='utf-8')
+            self.assertEqual(codex_models(cache), ['gpt-6-astra', 'gpt-5.5'])
+            self.assertEqual(codex_models(Path(tmp) / 'missing.json'), [])

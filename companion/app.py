@@ -17,7 +17,7 @@ from tkinter import filedialog, scrolledtext, ttk
 
 from .agents import BACKENDS, GUIDANCE, AgentConfig, Job, run_agent
 from .capture import grab, grab_window
-from .launching import find_claude, find_codex
+from .launching import claude_models, codex_models, find_claude, find_codex
 from .native import NativeBridge, validate_addon
 from .notifications import ReplyBanner
 from .protocol import Assembler, decode_image, frame_kind, parse_control
@@ -164,6 +164,7 @@ class App:
         self.model = tk.StringVar(value=s.get('model', ''))
         # Editable: the lists are shortcuts, any name the CLI accepts works.
         self.model_box = ttk.Combobox(row, textvariable=self.model, width=16, values=self.model_choices())
+        self.model_box.configure(postcommand=lambda: self.model_box.configure(values=self.model_choices()))
         self.model_box.pack(side='left', padx=4)
         self.model_box.bind('<<ComboboxSelected>>', lambda _: self.save(model=self.model.get().strip()))
         self.model_box.bind('<FocusOut>', lambda _: self.save(model=self.model.get().strip()))
@@ -189,6 +190,9 @@ class App:
                         command=lambda: self.save(use_manual_crop=self.manual.get())).pack(side='left', padx=(12, 4))
         self.crop = tk.StringVar(value=s.get('manual_crop', '600,0,720,22'))
         ttk.Entry(row, textvariable=self.crop, width=18).pack(side='left')
+        self.web = tk.BooleanVar(value=s.get('web', True))
+        ttk.Checkbutton(row, text='Web search', variable=self.web,
+                        command=lambda: self.save(web=self.web.get())).pack(side='right', padx=(8, 0))
         self.notify_enabled = tk.BooleanVar(value=s.get('notifications', True))
         ttk.Checkbutton(row, text='Desktop banner', variable=self.notify_enabled,
                         command=lambda: self.save(notifications=self.notify_enabled.get())).pack(side='right')
@@ -225,10 +229,11 @@ class App:
     def open_window(self):
         self.root.deiconify(); self.root.lift()
 
-    MODELS = {'claude': ('', 'sonnet', 'opus', 'haiku'), 'codex': ('', 'gpt-5-codex', 'gpt-5', 'gpt-5-mini')}
-
     def model_choices(self):
-        return self.MODELS.get(self.backend.get(), ('',))
+        # Read fresh each time, so a model added to either CLI shows up here.
+        backend = self.backend.get()
+        found = claude_models() if backend == 'claude' else codex_models() if backend == 'codex' else []
+        return tuple([''] + found)
 
     def on_backend(self):
         self.save(backend=self.backend.get())
@@ -323,7 +328,7 @@ class App:
         return AgentConfig(backend=self.backend.get(), project=self.project(), sandbox=self.sandbox.get(),
                            model=self.model.get().strip(), claude=find_claude(self.settings.get('claude', '')),
                            codex=find_codex(self.settings.get('codex', '')), timeout=self.args.timeout,
-                           guidance_file=self.guidance)
+                           guidance_file=self.guidance, web=self.web.get())
 
     def worker(self):
         context = Context(self.inbox.path)

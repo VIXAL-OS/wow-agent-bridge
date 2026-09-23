@@ -42,16 +42,32 @@ inset:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
     insets = {left = 4, right = 4, top = 4, bottom = 4}})
 inset:SetBackdropColor(0, 0, 0, .65)
 
-local body = CreateFrame('ScrollingMessageFrame', 'AgentBridgeBody', inset)
+-- A document view: a scroll frame whose child holds one font string per line.
+-- (A chat-style message frame stacks text against its bottom edge and scrolls
+-- by whole messages, which reads badly for a reply.)
+local scroll = CreateFrame('ScrollFrame', 'AgentBridgeScroll', inset, 'UIPanelScrollFrameTemplate')
+scroll:SetPoint('TOPLEFT', 10, -8); scroll:SetPoint('BOTTOMRIGHT', -30, 8)
+local body = CreateFrame('Frame', 'AgentBridgeBody', scroll)
 NS.Body = body
-body:SetPoint('TOPLEFT', 10, -8); body:SetPoint('BOTTOMRIGHT', -10, 8)
-body:SetFontObject(ChatFontNormal); body:SetJustifyH('LEFT'); body:SetFading(false); body:SetMaxLines(3000)
+Size(body, 10, 10)
+scroll:SetScrollChild(body)
 if body.SetHyperlinksEnabled then body:SetHyperlinksEnabled(true) end
-body:EnableMouseWheel(true)
-body:SetScript('OnMouseWheel', function(self, delta)
-    local step = IsShiftKeyDown() and self.PageUp or self.ScrollUp
-    if delta < 0 then step = IsShiftKeyDown() and self.PageDown or self.ScrollDown end
-    for _ = 1, IsShiftKeyDown() and 1 or 3 do step(self) end
+local bar = _G.AgentBridgeScrollScrollBar
+
+local function bodySize()
+    local ok, _, size = pcall(function() return ChatFontNormal:GetFont() end)
+    return ok and tonumber(size) or 12
+end
+-- Move through the slider when the template provides one, so it stays in step.
+local function scrollTo(offset)
+    local range = scroll:GetVerticalScrollRange() or 0
+    offset = math.max(0, math.min(range, offset))
+    if bar and bar.SetValue then bar:SetValue(offset) else scroll:SetVerticalScroll(offset) end
+end
+scroll:EnableMouseWheel(true)
+scroll:SetScript('OnMouseWheel', function(self, delta)
+    local step = IsShiftKeyDown() and self:GetHeight() * .9 or (bodySize() + 2) * 3
+    scrollTo((self:GetVerticalScroll() or 0) - delta * step)
 end)
 
 -- Tables and code need equal-width characters. The installer copies a fixed
@@ -60,10 +76,6 @@ end)
 local MONO, monoWidth = NS.PATH..'mono.ttf', nil
 local probe = panel:CreateFontString(nil, 'ARTWORK')
 probe:SetPoint('TOPLEFT'); probe:SetAlpha(0)
-local function bodySize()
-    local _, size = body:GetFont()
-    return tonumber(size) or 12
-end
 -- SetFont reports failure by returning nothing, and measuring an unset font
 -- raises, so check the result before trusting the font.
 local function applyFont(region, size)
@@ -83,43 +95,68 @@ local function monoCharWidth()
     return monoWidth
 end
 
+local function textWidth() return math.max(60, (scroll:GetWidth() or 480) - 4) end
+
 -- Characters that fit across the panel, or 0 when there is no fixed-width font.
 function NS.BodyColumns()
     local char = monoCharWidth()
     if not char then return 0 end
-    return math.floor((body:GetWidth() - 12) / char)
+    return math.floor(textWidth() / char)
 end
 
-local function setBodyFont(mono)
-    if mono and monoCharWidth() and applyFont(body, bodySize()) then return end
-    body:SetFontObject(ChatFontNormal)
+local lines, shown, current = {}, 0, nil
+local function line(i)
+    if not lines[i] then
+        local fs = body:CreateFontString(nil, 'ARTWORK')
+        fs:SetJustifyH('LEFT')
+        if fs.SetJustifyV then fs:SetJustifyV('TOP') end
+        if fs.SetNonSpaceWrap then fs:SetNonSpaceWrap(true) end  -- long paths and URLs
+        lines[i] = fs
+    end
+    return lines[i]
 end
 
--- A scrolling message frame stacks messages against its bottom edge, which
--- leaves a reply floating at the bottom under empty space and pushes later
--- lines out of view. Trailing blank lines put the text at the top instead.
-local function fillBelow()
-    local _, size = body:GetFont()
-    for _ = 1, math.ceil(body:GetHeight() / ((tonumber(size) or 12) + 3)) + 2 do
-        body:AddMessage(' ')
+local function layout(keepScroll)
+    if not current then return end
+    local width, y, n = textWidth(), 0, 0
+    Size(body, width, 10)
+    local function add(text, mono)
+        n = n + 1
+        local fs = line(n)
+        if not (mono and monoCharWidth() and applyFont(fs, bodySize())) then fs:SetFontObject(ChatFontNormal) end
+        fs:SetTextColor(.95, .95, .95)
+        fs:SetWidth(width)
+        fs:ClearAllPoints(); fs:SetPoint('TOPLEFT', body, 'TOPLEFT', 0, -y)
+        fs:SetText(text ~= '' and text or ' ')
+        fs:Show()
+        local height = fs.GetStringHeight and tonumber((fs:GetStringHeight()))
+        y = y + math.max(height or 0, bodySize()) + 2
     end
+    if current.prompt and current.prompt ~= '' then
+        add('|cff88bbffYou:|r '..NS.Escape(current.prompt)); add('')
+    end
+    for _, row in ipairs(current.rows) do add(row.text, row.mono) end
+    if current.note then add('|cff999999'..current.note..'|r') end
+    for i = n + 1, #lines do lines[i]:Hide() end
+    shown = n
+    body:SetHeight(math.max(1, y))
+    if scroll.UpdateScrollChildRect then scroll:UpdateScrollChildRect() end
+    scrollTo(keepScroll and (scroll:GetVerticalScroll() or 0) or 0)
 end
 
--- Show the current exchange. `markup` is already escaped (see Links.lua).
-function NS.RenderBody(prompt, markup, note, mono)
-    setBodyFont(mono)
-    body:Clear()
-    if prompt and prompt ~= '' then
-        body:AddMessage('|cff88bbffYou:|r '..NS.Escape(prompt))
-        body:AddMessage(' ')
-    end
-    for line in ((markup or '')..'\n'):gmatch('(.-)\r?\n') do
-        body:AddMessage(line ~= '' and line or ' ', 1, 1, 1)
-    end
-    if note then body:AddMessage('|cff999999'..note..'|r') end
-    fillBelow()
-    body:ScrollToTop()
+-- Show the current exchange. Row text is already escaped (see Links.lua).
+-- Updates to the same exchange keep your place; a new prompt starts at the top.
+function NS.RenderBody(prompt, rows, note)
+    local same = current ~= nil and current.prompt == prompt
+    current = {prompt = prompt, rows = rows or {}, note = note}
+    layout(same)
 end
+function NS.BodyText()
+    local out = {}
+    for i = 1, shown do out[#out+1] = lines[i]:GetText() end
+    return table.concat(out, '\n')
+end
+panel:SetScript('OnSizeChanged', function() layout(true) end)
 
 local edit = CreateFrame('EditBox', 'AgentBridgeInput', panel, 'InputBoxTemplate')
 NS.Input = edit
