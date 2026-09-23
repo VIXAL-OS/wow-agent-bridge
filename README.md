@@ -19,7 +19,7 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 
 **Why four bits per glyph.** Measured in the live 3.3.5a client: the rasterised em is capped around 32 px, and asking for a bigger font size changes measured widths not at all — sizes 128, 192 and 256 all returned identical widths. A whole byte per glyph (the original's `em/64` step) therefore lands byte values ~0.5 px apart, and they collide. A nibble step of `em/8` keeps them ~4 px apart at the cost of two glyphs per byte.
 
-**Markdown, in a narrow panel.** Replies are reformatted rather than rendered. A table is laid out in aligned columns when it fits and as one block per row when it does not, which is what usually happens to a six-column table at 70 characters. Tables and fenced code switch the panel to a fixed-width font: the installer copies one from this machine's Windows fonts to `mono.ttf` (a local copy, never redistributed), and without it tables simply use the block form. Headings and lists are kept, bold and inline-code marks are stripped, and typographic punctuation becomes ASCII because the 2010 fonts lack it. Column widths count characters, not bytes, so accented text still lines up. The untouched reply is always in the companion, which also writes every finished reply to `state/replies/*.md`.
+**Markdown, in a narrow panel.** Replies are reformatted rather than rendered. A table is laid out in aligned columns when it fits and as one block per row when it does not, which is what usually happens to a six-column table at 70 characters. Aligned tables and fenced code use a fixed-width font, line by line, while prose stays in the normal chat font. The installer copies one from this machine's Windows fonts to `mono.ttf` (a local copy, never redistributed); without it, tables simply use the block form. Headings and lists are kept, bold and inline-code marks are stripped, and typographic punctuation becomes ASCII because the 2010 fonts lack it. Column widths count characters, not bytes, so accented text still lines up. The untouched reply is always in the companion, which also writes every finished reply to `state/replies/*.md`.
 
 **Why a bank of 65,535 fonts.** The client caches a font file forever once it has loaded it. Changing it on disk later has no effect until the game restarts. Pre-created, never-loaded filenames can be filled in just before first use. Slots are NTFS hard links to 128 shared placeholders, so a fresh bank is about 5 MB. Publishing replaces one name atomically.
 
@@ -47,6 +47,7 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 - **Two agents.**
   - Claude Code runs `claude -p --output-format stream-json`, with live streaming and tool-activity status. Follow-ups use native `--resume`.
   - Codex runs `codex exec --json`, resuming threads with `exec resume` (its sandbox goes through a config override there), and falls back to passing history as data.
+  - Both can search the web, which is on by default. The status line shows each real query, so you can tell a search that happened from a reply that only claims a source.
   - Either way, prompts go on stdin, never on a command line.
 
 ## Install
@@ -71,8 +72,9 @@ If the font format ever changes, the installer rebuilds the bank — but only wh
 
 On first launch, pick the folder the agent should work in. In the window you can:
 - choose **Claude Code**, **Codex** or **Mock agent** (the mock tests the transport without an agent)
-- choose the access level
-- optionally set a model
+- choose the access level (see below)
+- pick a model: the dropdown lists the models each CLI offers on this machine, read from its own data, so new ones appear without an update. You can also type any name the CLI accepts; blank uses your default
+- turn **Web search** on or off
 
 Capture starts automatically and finds the strip by itself.
 
@@ -80,10 +82,11 @@ Capture starts automatically and finds the strip by itself.
 
 | Access | Claude Code | Codex |
 | --- | --- | --- |
-| `read-only` (default) | `--permission-mode dontAsk --allowedTools Read,Glob,Grep` | `--sandbox read-only` |
+| `read-only` (default) | `--permission-mode dontAsk`, allowing `Read`, `Glob`, `Grep` | `--sandbox read-only` |
 | `workspace-write` | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
+| `workspace-write+shell` | `acceptEdits`, also allowing `Edit`, `Write`, `Bash` | `--sandbox workspace-write` |
 
-Neither mode can run arbitrary shell commands without approval, and there is no bypass mode.
+A headless run cannot stop to ask for approval, so anything a level does not allow is refused. Only `workspace-write+shell` runs shell commands unattended — git, tests, tools — so choose it deliberately. With web search on, Claude also gets `WebSearch` and `WebFetch`, and Codex gets `web_search="live"`. There is no bypass mode.
 
 ## In game
 
@@ -92,30 +95,34 @@ Neither mode can run arbitrary shell commands without approval, and there is no 
 | Show / hide the panel | `/ab` (also `/agent`, `/claude`, `/codex`), minimap button, or a key binding |
 | Type a prompt quickly | Right-click the minimap button, or bind "Open panel and type a prompt" |
 | Link an item | Focus the input box, then Shift-click or drag an item into it |
-| New conversation | **New chat** or `/ab new`. Otherwise follow-ups continue the conversation, even across `/reload` |
+| Scroll back through the conversation | Mouse wheel or the scrollbar; Shift+wheel pages |
+| New conversation | **New chat** or `/ab new` gives a clean page. Otherwise follow-ups continue the conversation, even across `/reload` |
 | Continue an existing chat | In the companion: **Continue a conversation…**, pick one, then send from the game |
 | Check the font channel | **Self-test** or `/ab test` (prints per-size results) |
 | See through the strip | `/ab alpha 0.5` (0.2 to 1) |
 | Read the full, unformatted reply | **Saved replies** in the companion |
-| Pick a model | Companion **Model** box: choose an alias or type any name the CLI takes; blank uses your default |
 | Channel state | `/ab status` |
 | Move the strip | `/ab strip top` (or `topleft`, `topright`, `bottom`, `bottomleft`, `bottomright`); the companion follows |
 
-Replies render as plain text. `[Name](item:ID)` references become real item links with tooltips; everything else is escaped. Nothing in a reply can run as code or perform a game action.
+The panel is a scrolling transcript of the conversation, with every prompt and reply in order. Sending a prompt scrolls it into view, and updates to a reply keep your place, so you can read back while it arrives. The last 40 exchanges (up to 150 KB) are kept across `/reload` and restarts; the companion keeps every reply permanently.
+
+Replies render as plain text. `[Name](item:ID)` references become item links; everything else is escaped. Nothing in a reply can run as code or perform a game action.
 
 ## What has been verified, and what has not
 
-**Verified in the live client** (ChromieCraft, 3.3.5a, 1920×1080 windowed, 2026-09-22):
+**Verified in the live client** (ChromieCraft, 3.3.5a, 1920×1080 windowed, 2026-09-22 and 23):
 
 - **The whole round trip.** Real Claude Code replies were sent from the game, answered, and delivered back into the panel. That proves the channel's central assumption: a pre-created font file loads fresh from disk on its first use.
 - **The font self-test** passes at every size, with byte values ~4 px apart and 0 of 2,032 check glyphs misread. The original byte-per-glyph encoding failed here — sizes 128, 192 and 256 returned identical widths — which is how the capped em was found.
 - **Reading the strip at 20% opacity** over the game scene, and **through the window** while WoW was covered by another app.
 - **Latency:** Claude answered in ~4 s, and the reply was in the panel ~10 s after the companion picked the prompt up.
+- **The scrolling reply panel and web search**, in real WoW questions answered through the game.
 
 **Not yet exercised live** (covered by simulation and unit tests only):
 
+- The multi-prompt transcript, which shipped after the last live session.
 - Replies longer than one 4,060-byte packet, and streaming previews.
-- Aligned tables in the fixed-width font, and item-link tooltips.
+- Aligned tables in the fixed-width font, and item-link tooltips. The panel is now a plain frame, and 3.3.5a may not send hover events there; if not, item links show as coloured names without tooltips.
 - Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
 
 In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
@@ -139,7 +146,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - window resize recalibration
 - epoch recycling
 
-Unit tests cover the wire formats and pixel sampling under display scaling, fonts and bank hard-link isolation, publisher deadlines, both agent parsers, strip geometry and the installer.
+Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload`, New chat and its size cap.
 
 ## Credits and licence
 
