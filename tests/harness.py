@@ -178,8 +178,10 @@ class Sim:
         return bytes(self.ns.BodyText()).decode('utf-8')
 
     def last_reply(self):
-        last = self.g.AgentBridgeState.last
-        return bytes(last.reply).decode('utf-8') if last else None
+        history = self.g.AgentBridgeState.history
+        if not history or len(history) == 0:
+            return None
+        return bytes(history[len(history)].r).decode('utf-8')
 
     def status(self):
         return self.ns.ReceiverInfo()

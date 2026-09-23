@@ -103,6 +103,64 @@ class InGame(unittest.TestCase):
 
 
 
+class Transcript(unittest.TestCase):
+    """Scrolling back through a conversation, across prompts and reloads."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sim = Sim(self.tmp.name, agent(lambda p: 'Echo: ' + p))
+        self.sim.run(2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ask(self, text):
+        self.sim.send(text)
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.last_reply() == 'Echo: ' + text), text)
+
+    def finish(self, prompt, reply):
+        """Record a finished exchange directly, without a round trip."""
+        self.sim.ns.currentPrompt = prompt.encode()
+        self.sim.ns.ShowReply(reply.encode(), 4, True)
+
+    def test_earlier_exchanges_stay_on_the_page_in_order(self):
+        self.ask('first question')
+        self.ask('second question')
+        body = self.sim.body()
+        order = [body.index(s) for s in ('first question', 'Echo: first question',
+                                         'second question', 'Echo: second question')]
+        self.assertEqual(order, sorted(order))
+
+    def test_transcript_survives_reload_but_not_new_chat(self):
+        self.ask('remember this')
+        self.sim.reload()
+        self.assertIn('Echo: remember this', self.sim.body())
+        self.sim.g.SlashCmdList.AGENTBRIDGE(b'new')
+        self.assertNotIn('remember this', self.sim.body())
+        self.assertIn('(new conversation)', self.sim.body())
+
+    def test_history_is_capped_and_never_duplicated(self):
+        for n in range(45):
+            self.finish(f'q{n}', f'a{n}')
+        self.finish('q44', 'a44')  # the same reply shown again, as item data or a reload would
+        history = self.sim.g.AgentBridgeState.history
+        self.assertEqual(len(history), 40)
+        self.assertEqual(bytes(history[1].p), b'q5')
+        self.assertEqual(bytes(history[40].r), b'a44')
+
+    def test_new_prompt_scrolls_to_itself_and_updates_keep_your_place(self):
+        for n in range(30):
+            self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))
+        scroll = self.sim.g.AgentBridgeScroll
+        self.sim.ns.StartExchange(b'brand new')
+        bottom = scroll.GetVerticalScroll(scroll)
+        self.assertGreater(bottom, 0, 'the new prompt is brought into view')
+        scroll.SetVerticalScroll(scroll, 100)  # you scroll back up to reread
+        self.sim.ns.currentPrompt = b'brand new'
+        self.sim.ns.ShowReply(b'partial answer', 3, False)
+        self.assertEqual(scroll.GetVerticalScroll(scroll), 100, 'an update does not drag you back down')
+
+
 class ReplyFormatting(unittest.TestCase):
     """Markdown from agents, made readable in a narrow panel."""
 

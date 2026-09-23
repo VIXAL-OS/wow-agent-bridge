@@ -126,7 +126,9 @@ end
 function NS.RenderReply(text)
     local entries, mono = NS.FormatLines(text, NS.BodyColumns())
     local out, rows, missing = {}, {}, false
-    allowed, links = {}, 0
+    -- Links accumulate across the whole transcript, so older replies keep
+    -- their tooltips; the per-reply cap still applies.
+    links = 0
     for _, entry in ipairs(entries) do
         local line, gap = renderInline(entry.text)
         missing = missing or gap
@@ -140,25 +142,93 @@ end
 
 local STATE_NOTE = {[0] = 'waiting for the companion', [1] = 'queued', [2] = 'working', [3] = 'writing...',
     [5] = 'finished with a problem', [6] = 'interrupted'}
+
+-- Transcript ---------------------------------------------------------------
+-- Finished exchanges live in saved settings, so the conversation survives a
+-- /reload. Kept small: saved variables are rewritten on every logout.
+local KEEP_EXCHANGES, KEEP_BYTES = 40, 150000
+local rendered = setmetatable({}, {__mode = 'k'})  -- exchange -> rows at a width
+
+local function history()
+    if type(NS.S.history) ~= 'table' then NS.S.history = {} end
+    return NS.S.history
+end
+
+local function record(prompt, reply, state)
+    local list = history()
+    local last = list[#list]
+    -- Re-showing a finished reply (item data arriving, a reload) must not
+    -- store it twice.
+    if last and last.c == NS.S.conversation and last.p == prompt and last.r == reply then return end
+    list[#list+1] = {c = NS.S.conversation, p = prompt, r = reply, s = state}
+    local total = 0
+    for _, exchange in ipairs(list) do total = total + #(exchange.r or '') end
+    while #list > KEEP_EXCHANGES or (total > KEEP_BYTES and #list > 1) do
+        total = total - #(list[1].r or '')
+        table.remove(list, 1)
+    end
+end
+
+local function blockFor(exchange, columns)
+    local hit = rendered[exchange]
+    if hit and hit.columns == columns then return hit.block end
+    local _, _, _, rows = NS.RenderReply(exchange.r or '')
+    local note = exchange.s ~= 4 and ('('..(STATE_NOTE[exchange.s] or 'finished with a problem')..')') or nil
+    local block = {prompt = exchange.p, rows = rows, note = note}
+    rendered[exchange] = {columns = columns, block = block}
+    return block
+end
+
+-- Redraw this conversation: finished exchanges, then the one in progress.
+function NS.RefreshTranscript(focus)
+    if not NS.S then return end
+    local columns, blocks = NS.BodyColumns(), {}
+    for _, exchange in ipairs(history()) do
+        if exchange.c == NS.S.conversation then blocks[#blocks+1] = blockFor(exchange, columns) end
+    end
+    if current and not current.recorded then
+        blocks[#blocks+1] = {prompt = current.prompt, rows = current.rows, note = current.note}
+    end
+    if #blocks == 0 then blocks[1] = {rows = {}, note = '(new conversation)'} end
+    NS.RenderTranscript(blocks, focus)
+end
+
+-- A prompt was just sent: show it at the bottom of the conversation.
+function NS.StartExchange(prompt)
+    current = {prompt = prompt, rows = {}, note = '(sending...)', text = ''}
+    NS.RefreshTranscript('last')
+end
+
 function NS.ShowReply(text, state, complete)
     local markup, missing, _, rows = NS.RenderReply(text)
     local note = STATE_NOTE[state]
     if not complete and state >= 4 then note = 'receiving the rest...' end
-    current = {text = text, state = state, complete = complete, markup = markup}
-    NS.RenderBody(NS.currentPrompt, rows, note and ('('..note..')'))
-    if complete and state >= 4 then NS.S.last = {prompt = NS.currentPrompt, reply = text, state = state} end
+    local recorded = complete and state >= 4
+    if recorded then record(NS.currentPrompt, text, state) end
+    current = {text = text, state = state, complete = complete, markup = markup, prompt = NS.currentPrompt,
+               rows = rows, note = note and ('('..note..')'), recorded = recorded}
+    NS.RefreshTranscript()
     return missing
 end
-function NS.ClearReply() current, allowed, queried, queryCount, retryUntil = nil, {}, {}, 0, 0 end
+function NS.ClearReply() current, queried, queryCount, retryUntil = nil, {}, 0, 0 end
+function NS.HasHistory()
+    for _, exchange in ipairs(history()) do
+        if exchange.c == NS.S.conversation then return true end
+    end
+    return false
+end
 
 -- Re-render once uncached items arrive from the server (bounded to 10 s).
 local poll, elapsed = CreateFrame('Frame'), 0
 poll:SetScript('OnUpdate', function(_, dt)
     elapsed = elapsed + dt
-    if elapsed < 1 or not current or GetTime() > retryUntil then return end
+    if elapsed < 1 or not current or not current.markup or GetTime() > retryUntil then return end
     elapsed = 0
     local markup, missing = NS.RenderReply(current.text)
-    if markup ~= current.markup then NS.ShowReply(current.text, current.state, current.complete) end
+    if markup ~= current.markup then
+        for exchange in pairs(rendered) do rendered[exchange] = nil end
+        NS.ShowReply(current.text, current.state, current.complete)
+    end
     if not missing then retryUntil = 0 end
 end)
 

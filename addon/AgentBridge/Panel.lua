@@ -104,7 +104,7 @@ function NS.BodyColumns()
     return math.floor(textWidth() / char)
 end
 
-local lines, shown, current = {}, 0, nil
+local lines, shown, blocks, lastPrompt = {}, 0, {}, nil
 local function line(i)
     if not lines[i] then
         local fs = body:CreateFontString(nil, 'ARTWORK')
@@ -116,9 +116,10 @@ local function line(i)
     return lines[i]
 end
 
-local function layout(keepScroll)
-    if not current then return end
-    local width, y, n = textWidth(), 0, 0
+-- Lay out every exchange in order. focus = 'last' brings the newest exchange
+-- to the top of the view; otherwise you stay exactly where you were.
+local function layout(focus)
+    local width, y, n, lastTop = textWidth(), 0, 0, 0
     Size(body, width, 10)
     local function add(text, mono)
         n = n + 1
@@ -132,31 +133,44 @@ local function layout(keepScroll)
         local height = fs.GetStringHeight and tonumber((fs:GetStringHeight()))
         y = y + math.max(height or 0, bodySize()) + 2
     end
-    if current.prompt and current.prompt ~= '' then
-        add('|cff88bbffYou:|r '..NS.Escape(current.prompt)); add('')
+    for index, block in ipairs(blocks) do
+        if index > 1 then add(''); add('|cff505050'..string.rep('-', 48)..'|r'); add('') end
+        lastTop = y
+        if block.prompt and block.prompt ~= '' then
+            add('|cff88bbffYou:|r '..NS.Escape(block.prompt)); add('')
+        end
+        for _, row in ipairs(block.rows or {}) do add(row.text, row.mono) end
+        if block.note then add('|cff999999'..block.note..'|r') end
     end
-    for _, row in ipairs(current.rows) do add(row.text, row.mono) end
-    if current.note then add('|cff999999'..current.note..'|r') end
     for i = n + 1, #lines do lines[i]:Hide() end
     shown = n
     body:SetHeight(math.max(1, y))
     if scroll.UpdateScrollChildRect then scroll:UpdateScrollChildRect() end
-    scrollTo(keepScroll and (scroll:GetVerticalScroll() or 0) or 0)
+    scrollTo(focus == 'last' and lastTop or (scroll:GetVerticalScroll() or 0))
 end
 
--- Show the current exchange. Row text is already escaped (see Links.lua).
--- Updates to the same exchange keep your place; a new prompt starts at the top.
+-- The conversation so far: a list of {prompt, rows, note}. Row text is already
+-- escaped (see Links.lua).
+function NS.RenderTranscript(list, focus)
+    blocks = list or {}
+    layout(focus)
+end
+-- A single exchange on its own page. A different prompt starts at the top;
+-- updates to the same one keep your place.
 function NS.RenderBody(prompt, rows, note)
-    local same = current ~= nil and current.prompt == prompt
-    current = {prompt = prompt, rows = rows or {}, note = note}
-    layout(same)
+    local focus = prompt ~= lastPrompt and 'last' or nil
+    lastPrompt = prompt
+    NS.RenderTranscript({{prompt = prompt, rows = rows or {}, note = note}}, focus)
 end
 function NS.BodyText()
     local out = {}
     for i = 1, shown do out[#out+1] = lines[i]:GetText() end
     return table.concat(out, '\n')
 end
-panel:SetScript('OnSizeChanged', function() layout(true) end)
+-- A new width changes how tables fit, so rebuild the rows, not just the layout.
+panel:SetScript('OnSizeChanged', function()
+    if NS.RefreshTranscript then NS.RefreshTranscript() else layout() end
+end)
 
 local edit = CreateFrame('EditBox', 'AgentBridgeInput', panel, 'InputBoxTemplate')
 NS.Input = edit

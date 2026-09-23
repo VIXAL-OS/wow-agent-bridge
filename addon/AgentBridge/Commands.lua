@@ -17,7 +17,7 @@ local function submit()
     NS.ClearReply()
     NS.BeginRequest(sequence)
     NS.SetBadge(nil)
-    NS.RenderBody(text, {}, '(sending...)')
+    NS.StartExchange(text)
     NS.SetStatus('Prompt #'..sequence..' sent. You can close this panel and keep playing.')
     edit:SetText(''); edit:ClearFocus()
 end
@@ -30,7 +30,7 @@ function NS.NewChat()
     NS.S.conversation = math.max(time(), (NS.S.conversation or 0) + 1); NS.S.last = nil
     NS.NewSession()
     NS.currentPrompt = nil
-    NS.RenderBody(nil, {}, '(new conversation)')
+    NS.RefreshTranscript('last')
     NS.SetStatus('New conversation. The agent will not see earlier messages.')
 end
 
@@ -82,10 +82,14 @@ end
 
 NS.OnLoad(function(S)
     NS.SetTitle('Agent Bridge '..NS.VERSION)
+    -- Earlier versions kept only the last reply; carry it into the transcript.
     local last = S.last
-    if type(last) == 'table' and type(last.reply) == 'string' then
-        NS.currentPrompt = last.prompt
-        NS.ShowReply(last.reply, last.state or 4, true)
-        NS.SetStatus('Previous reply shown. Send a prompt to continue the conversation.')
+    if type(S.history) ~= 'table' and type(last) == 'table' and type(last.reply) == 'string' then
+        S.history = {{c = S.conversation, p = last.prompt, r = last.reply, s = last.state or 4}}
+    end
+    S.last = nil
+    NS.RefreshTranscript('last')
+    if NS.HasHistory() then
+        NS.SetStatus('Conversation restored. Scroll up for earlier replies; send a prompt to continue.')
     end
 end)
