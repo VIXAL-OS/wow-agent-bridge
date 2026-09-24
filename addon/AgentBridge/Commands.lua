@@ -150,7 +150,6 @@ SlashCmdList.AGENTBRIDGE = function(arg)
     elseif cmd == 'pause' then NS.Pause(); NS.SetStatus('Reply checks paused. Resume or Send to continue.')
     elseif cmd == 'resume' then NS.Resume()
     elseif cmd == 'test' then NS.RunSelfTest(true)
-    elseif cmd == 'lodtest' and NS.LoDTest then NS.LoDTest()
     elseif cmd == 'status' then
         local r = NS.ReceiverInfo()
         NS.Print(string.format('slot %d/%d, %d request(s) waiting, %s, font size %s, strip %s%s', r.slot,

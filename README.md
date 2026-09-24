@@ -23,6 +23,13 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 
 **Why a bank of 65,535 fonts.** The client caches a font file forever once it has loaded it. Changing it on disk later has no effect until the game restarts. Pre-created, never-loaded filenames can be filled in just before first use. Slots are NTFS hard links to 128 shared placeholders, so a fresh bank is about 5 MB. Publishing replaces one name atomically.
 
+**Why not load-on-demand addons.** [wow-claude](https://github.com/chelinho139/wow-claude) returns replies by writing Lua into pre-made load-on-demand addons and loading one. Measured on this client (2026-09-24):
+- A load-on-demand addon's file is read fresh on its first load after launch, and again after each `/reload`.
+- 60 KB of hostile text (quotes, long brackets, escapes, UTF-8, NULs) arrived intact in 1–2 ms.
+- `PlaySoundFile` returns `1` for an empty file and a valid one alike, so it cannot tell the addon a reply is ready.
+
+Each such addon runs once per UI load, so without a ready signal every check for a reply would use one up. Checks would have to stay on fonts, leaving the addons to speed up only the delivery of finished replies over 4 KB, by a few seconds. That would cost a second transport, a dozen or more entries in the AddOns list, and the game running a file whose contents come from agent replies. For that gain, replies stay on fonts, which are only measured and never run.
+
 ## What changed for 3.3.5a
 
 - **API port.**
