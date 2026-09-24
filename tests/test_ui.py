@@ -348,6 +348,54 @@ class ParallelChats(unittest.TestCase):
         self.assertEqual(self.state.chat, first)
         self.assertIn('alpha question', self.sim.body())
 
+    def sidebar(self):
+        """{chat id: (title, agent tag)} for the rows showing in the chat list."""
+        rawget = self.sim.lua.eval('rawget')
+        return {rawget(f, b'chat'): (bytes(rawget(f, b'label').text).decode(), bytes(rawget(f, b'tag').text).decode())
+                for f in self.g.STUB.frames.values()
+                if f.kind == b'Button' and rawget(f, b'chat') is not None and f.shown}
+
+    def test_each_chat_has_its_own_agent_and_model(self):
+        slash = lambda text: self.g.SlashCmdList.AGENTBRIDGE(text.encode())
+        first = self.state.chat
+        # No choice made: the companion decides, and says which agent answered.
+        self.sim.send('mocked')
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.replies(first)))
+        self.assertEqual(self.sim.replies(first), ['Echo: mocked'], 'the header is not part of the reply')
+        self.assertNotIn('agent', self.job('mocked')['fields'])
+        self.assertEqual(bytes(self.ns.ChatAgent(first)[0]), b'mock')
+        # A second chat on another agent and model, chosen in game.
+        self.ns.NewChat(b'Codex one')
+        second = self.state.chat
+        slash('agent codex')
+        slash('model gpt-5.5')
+        self.sim.send('coded')
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.replies(second)))
+        fields = self.job('coded')['fields']
+        self.assertEqual((fields['agent'], fields['model']), (['codex'], ['gpt-5.5']))
+        agent, model, own_agent, own_model = self.ns.ChatAgent(second)
+        self.assertEqual((bytes(agent), bytes(model), own_agent, own_model), (b'codex', b'gpt-5.5', True, True))
+        self.assertEqual(self.sidebar()[first][1], 'Mock')
+        self.assertEqual(self.sidebar()[second][1], 'Codex')
+        slash('model')
+        self.assertIn('Codex (set for this chat), model gpt-5.5 (set for this chat)', self.prints()[-1])
+        # Only model names get through, and "default" hands the choice back.
+        slash('model --dangerously-skip-permissions')
+        self.assertIn('is not a model name', self.prints()[-1])
+        slash('model default')
+        self.assertIsNone(self.ns.FindChat(second)[0].model)
+        # The model dialog from the chat list does the same as /ab model.
+        self.ns.AskModel(second)
+        self.g.StaticPopup1EditBox.text = b'gpt-6-astra'
+        self.g.StaticPopupDialogs.AGENTBRIDGE_MODEL.OnAccept(self.g.STUB.popups[len(self.g.STUB.popups)].dialog)
+        self.assertEqual(bytes(self.ns.FindChat(second)[0].model), b'gpt-6-astra')
+        # A new agent cannot resume the old one's session, and drops its model.
+        slash('agent claude')
+        self.assertIn('starts a new Claude session', self.prints()[-1])
+        self.assertIsNone(self.ns.FindChat(second)[0].model)
+        slash('agent bash')
+        self.assertIn('Unknown agent', self.prints()[-1])
+
     def test_one_conversation_from_an_earlier_version_becomes_chats(self):
         sim = Sim(self.tmp.name + '3', agent(lambda p: 'x'), saved={
             'conversation': 1757000000, 'nextSlot': 1,

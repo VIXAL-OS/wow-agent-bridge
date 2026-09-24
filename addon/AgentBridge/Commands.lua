@@ -4,23 +4,26 @@ local edit = NS.Input
 local sequence = 0
 
 -- Send a prompt to the chat you are reading. The companion gets an envelope:
--- which chat it belongs to, its name, and (unless /ab context off) where your
--- character is and what it is doing; then your text with links spelled out
--- and their tooltips. Returns false and a reason when nothing was sent.
+-- which chat it belongs to, its name, the agent and model if you chose them for
+-- it, and (unless /ab context off) where your character is and what it is
+-- doing; then your text with links spelled out and their tooltips. Returns
+-- false and a reason when nothing was sent.
 function NS.Send(raw)
     if type(raw) ~= 'string' or not raw:find('%S') then return false, 'Type a message first.' end
     local chat = NS.CurrentChat()
     -- An unnamed chat is titled by its first message.
     local title = chat.name or chat.auto or NS.ShortTitle(select(2, NS.MakePromptText(raw)))
     local fields = {{'chat', chat.id}, {'name', title}}
+    if chat.agent then fields[#fields+1] = {'agent', chat.agent} end
+    if chat.model then fields[#fields+1] = {'model', chat.model} end
     if NS.S.context then
         local ok, context = pcall(NS.GameContext)
         if ok and type(context) == 'string' then
             for line in context:gmatch('[^\n]+') do fields[#fields+1] = {'ctx', line} end
         end
     end
-    local agent, display = NS.MakePromptText(raw, NS.MAX_PROMPT - #NS.Envelope(fields, ''))
-    local text = NS.Envelope(fields, agent)
+    local body, display = NS.MakePromptText(raw, NS.MAX_PROMPT - #NS.Envelope(fields, ''))
+    local text = NS.Envelope(fields, body)
     if #text > NS.MAX_PROMPT then
         return false, 'Message plus link details is too long ('..#text..'/'..NS.MAX_PROMPT..' bytes). Shorten it.'
     end
@@ -63,11 +66,31 @@ local function listChats()
     for index, chat in ipairs(NS.S.chats) do
         local mark = chat.id == NS.S.chat and '|cff66bbff>|r ' or '  '
         local state = NS.IsChatBusy(chat.id) and ' (working)' or chat.unread and ' (unread)' or ''
-        NS.Print(mark..index..'. '..NS.Escape(NS.ChatTitle(chat.id))..state)
+        local agent, model = NS.ChatAgent(chat.id)
+        local who = agent and (' |cff909090- '..NS.AGENTS[agent]..(model and (', '..NS.Escape(model)) or '')..'|r') or ''
+        NS.Print(mark..index..'. '..NS.Escape(NS.ChatTitle(chat.id))..state..who)
     end
 end
 
 local ECHO = {off = 0, short = 800, full = 100000}
+
+-- Switching agents cannot carry a session over: the new agent starts afresh,
+-- given the chat's recent turns as history.
+function NS.UseAgent(id, agent)
+    local before = NS.ChatAgent(id)
+    if not NS.SetChatAgent(id, agent) then
+        NS.Print('Unknown agent "'..NS.Escape(agent)..'". Use /ab agent claude, codex or mock.')
+        return false
+    end
+    local title = NS.Escape(NS.ChatTitle(id))
+    if before and before ~= agent and NS.HasHistory(id) then
+        NS.Print('"'..title..'" now uses '..NS.AGENTS[agent]..'. Its next prompt starts a new '..NS.AGENTS[agent]
+            ..' session, given this chat\'s recent turns as history.')
+    else
+        NS.Print('"'..title..'" uses '..NS.DescribeAgent(id)..'.')
+    end
+    return true
+end
 
 local HELP = {
     '/ab - show or hide the panel (also /agent, /claude, /codex)',
@@ -75,6 +98,8 @@ local HELP = {
     '/ab new [name] - start another chat (the others keep going)',
     '/ab chats - list chats;  /ab chat <number or name> - switch',
     '/ab rename <name> | delete - rename or delete the current chat',
+    '/ab agent claude|codex - which agent answers the current chat (no name: show it)',
+    '/ab model <name>|default - the model for the current chat (no name: show it)',
     '/ab copy [all] - copy the last reply (or the whole chat) out of the game',
     '/ab echo off|short|full|<n> - copy finished replies you are not reading into chat',
     '/ab context on|off|show - send your character, zone, money, talents and professions with each prompt',
@@ -106,6 +131,10 @@ SlashCmdList.AGENTBRIDGE = function(arg)
         end
     elseif cmd == 'rename' and rest ~= '' then NS.RenameChat(NS.S.chat, rest)
     elseif cmd == 'delete' then NS.AskDelete(NS.S.chat)
+    elseif cmd == 'agent' and word ~= '' then NS.UseAgent(NS.S.chat, word)
+    elseif cmd == 'model' and rest ~= '' then NS.ApplyModel(NS.S.chat, rest)
+    elseif cmd == 'agent' or cmd == 'model' then
+        NS.Print('"'..NS.Escape(NS.ChatTitle(NS.S.chat))..'" uses '..NS.DescribeAgent(NS.S.chat)..'.')
     elseif cmd == 'copy' then NS.ShowCopy(word == 'all')
     elseif cmd == 'echo' and (ECHO[word] or tonumber(word)) then
         NS.S.echo = ECHO[word] or math.max(0, math.floor(tonumber(word)))

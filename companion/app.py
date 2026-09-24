@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -57,6 +58,34 @@ class Request:
     chat: str
     name: str = ''
     context: str = ''
+    agent: str = 'claude'
+    model: str = ''  # '' = the CLI's own default
+
+
+# Passed as one argv item, never through a shell; this also keeps it from
+# reading as a flag.
+MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,63}')
+
+
+def resolve_agent(fields, last_backend, default_backend, default_models):
+    """Which agent and model answer a prompt, plus notes on anything refused.
+
+    A chat's own choice (sent by the addon) wins. Otherwise a chat keeps the agent
+    it last used, since only that agent can resume its session; a new chat takes
+    the companion's selection. The model is the chat's own, or the companion's
+    default for that agent.
+    """
+    notes = []
+    agent = (fields.get('agent') or [''])[0]
+    if agent and agent not in BACKENDS:
+        notes.append(f'unknown agent {agent!r} ignored')
+        agent = ''
+    agent = agent or last_backend or default_backend
+    model = (fields.get('model') or [''])[0]
+    if model and not MODEL_NAME.fullmatch(model):
+        notes.append(f'model name {model!r} refused')
+        model = ''
+    return agent, model or default_models.get(agent, ''), notes
 
 
 class Scheduler:
@@ -125,14 +154,19 @@ class Inbox:
         self.db.execute("UPDATE jobs SET state='interrupted' WHERE state IN ('queued','working','streaming')")
         self.db.commit()
 
-    def add(self, request, backend):
-        meta = json.dumps({'name': request.name, 'context': request.context}, ensure_ascii=False)
+    def add(self, request):
+        meta = json.dumps({'name': request.name, 'context': request.context, 'model': request.model},
+                          ensure_ascii=False)
         with self.db:
             cursor = self.db.execute('INSERT OR IGNORE INTO jobs (id, prompt, state, reply, backend, agent_session, '
                                      'created, chat, meta) VALUES (?,?,?,?,?,?,?,?,?)',
-                                     (request.key, request.prompt, 'queued', '', backend, None, time.time(),
+                                     (request.key, request.prompt, 'queued', '', request.agent, None, time.time(),
                                       request.chat, meta))
         return cursor.rowcount == 1
+
+    def last_backend(self, chat):
+        row = self.db.execute('SELECT backend FROM jobs WHERE chat=? ORDER BY rowid DESC LIMIT 1', (chat,)).fetchone()
+        return row[0] if row else None
 
     def update(self, key, state, reply, agent_session=None):
         with self.db:
@@ -140,8 +174,15 @@ class Inbox:
                             (state, reply, agent_session, key))
 
     def get(self, key):
-        row = self.db.execute('SELECT id,prompt,state,reply FROM jobs WHERE id=?', (key,)).fetchone()
-        return dict(zip(('id', 'prompt', 'state', 'reply'), row)) if row else None
+        row = self.db.execute('SELECT id,prompt,state,reply,backend,meta FROM jobs WHERE id=?', (key,)).fetchone()
+        if not row:
+            return None
+        try:
+            meta = json.loads(row[5] or '{}')
+        except ValueError:
+            meta = {}
+        return {'id': row[0], 'prompt': row[1], 'state': row[2], 'reply': row[3], 'agent': row[4],
+                'model': meta.get('model', '') if isinstance(meta, dict) else ''}
 
     def recent(self, n=12):
         return self.db.execute('SELECT id,prompt,state,reply FROM jobs ORDER BY rowid DESC LIMIT ?', (n,)).fetchall()[::-1]
@@ -191,19 +232,30 @@ class App:
             self.settings = json.loads(self.settings_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             self.settings = {}
-        for name in ('backend', 'project', 'addon', 'sandbox', 'model', 'claude', 'codex'):
+        for name in ('backend', 'project', 'addon', 'sandbox', 'claude', 'codex'):
             value = getattr(args, name, None)
             if value:
                 self.settings[name] = str(value)
         self.settings.setdefault('backend', 'claude' if find_claude(self.settings.get('claude', '')) else 'codex')
+        # A default model per agent: a Claude model name means nothing to Codex.
+        # Earlier versions kept one model, which belonged to the selected agent.
+        models = self.settings.get('models')
+        if not isinstance(models, dict):
+            models = {self.settings['backend']: self.settings.get('model', '')}
+        if getattr(args, 'model', None):
+            models[self.settings['backend']] = args.model
+        self.settings['models'] = models
+        self.settings.pop('model', None)
         self.guidance = args.state / 'guidance.txt'
         self.guidance.write_text(GUIDANCE, encoding='utf-8')
         self.inbox = Inbox(args.state / 'inbox.sqlite3')
         self.assembler = Assembler()
         self.scheduler, self.context, self.events = Scheduler(), Context(self.inbox.path), queue.Queue()
         self.activity, self.names, self.capturing, self.closed = {}, {}, False, False
-        self.pending_resume = getattr(args, 'resume_session', None)
-        self.pending_branch, self.picker_lock = True, threading.Lock()
+        # (session id, agent, branch): continues on the next prompt that agent answers.
+        resume = getattr(args, 'resume_session', None)
+        self.pending_resume = (resume, self.settings['backend'], True) if resume else None
+        self.picker_lock = threading.Lock()
         self.frames, self.retry_at, self.last_status = 0, 0.0, None
         self.last_frame_at = self.last_attempt = self.window_at = -1e9
         self.capture_mode = 'screen'
@@ -243,7 +295,9 @@ class App:
         ttk.Label(root, textvariable=self.capture_status).pack(anchor='w', **pad)
 
         row = ttk.Frame(root); row.pack(fill='x', **pad)
-        ttk.Label(row, text='Agent:').pack(side='left')
+        # The agent a new chat starts with; a chat keeps its own after that, and
+        # can pick one in game with /ab agent.
+        ttk.Label(row, text='New chats use:').pack(side='left')
         self.backend = tk.StringVar(value=s.get('backend', 'claude'))
         for key, label in BACKENDS.items():
             ttk.Radiobutton(row, text=label, value=key, variable=self.backend,
@@ -254,13 +308,16 @@ class App:
         box.pack(side='left', padx=4)
         box.bind('<<ComboboxSelected>>', lambda _: self.save(sandbox=self.sandbox.get()))
         ttk.Label(row, text='   Model:').pack(side='left')
-        self.model = tk.StringVar(value=s.get('model', ''))
+        # The default model of the agent selected above; a chat can set its own
+        # with /ab model. The box follows the agent buttons.
+        self.model_backend = self.backend.get()
+        self.model = tk.StringVar(value=self.default_model(self.model_backend))
         # Editable: the lists are shortcuts, any name the CLI accepts works.
         self.model_box = ttk.Combobox(row, textvariable=self.model, width=16, values=self.model_choices())
         self.model_box.configure(postcommand=lambda: self.model_box.configure(values=self.model_choices()))
         self.model_box.pack(side='left', padx=4)
-        self.model_box.bind('<<ComboboxSelected>>', lambda _: self.save(model=self.model.get().strip()))
-        self.model_box.bind('<FocusOut>', lambda _: self.save(model=self.model.get().strip()))
+        self.model_box.bind('<<ComboboxSelected>>', lambda _: self.save_model())
+        self.model_box.bind('<FocusOut>', lambda _: self.save_model())
         ttk.Label(row, text='(blank = default)').pack(side='left')
 
         row = ttk.Frame(root); row.pack(fill='x', **pad)
@@ -328,7 +385,19 @@ class App:
         found = claude_models() if backend == 'claude' else codex_models() if backend == 'codex' else []
         return tuple([''] + found)
 
+    def default_model(self, backend):
+        return (self.settings.get('models') or {}).get(backend, '')
+
+    def save_model(self):
+        models = dict(self.settings.get('models') or {})
+        models[self.model_backend] = self.model.get().strip()
+        self.save(models=models)
+
     def on_backend(self):
+        # Keep what was typed for the previous agent, then show this one's.
+        self.save_model()
+        self.model_backend = self.backend.get()
+        self.model.set(self.default_model(self.model_backend))
         self.save(backend=self.backend.get())
         self.model_box.configure(values=self.model_choices())
 
@@ -360,8 +429,9 @@ class App:
         window = tk.Toplevel(self.root)
         window.title(f'Continue a {BACKENDS[backend]} conversation in game')
         window.geometry('840x430')
-        ttk.Label(window, text=f'The next prompt you send in game continues the {BACKENDS[backend]} '
-                               'conversation you pick.', justify='left').pack(anchor='w', padx=12, pady=8)
+        ttk.Label(window, text=f'The next prompt {BACKENDS[backend]} answers continues the conversation you '
+                               f'pick. Send it from a new chat in game, or one set to {BACKENDS[backend]}.',
+                  justify='left').pack(anchor='w', padx=12, pady=8)
         branch = tk.BooleanVar(value=True)
         if backend == 'claude':
             ttk.Checkbutton(window, variable=branch, text='Branch off, leaving the original untouched. Clear this '
@@ -380,8 +450,8 @@ class App:
             if not selection:
                 return
             session = found[selection[0]]
-            self.pending_resume = session.id
-            self.pending_branch = bool(branch.get()) and backend == 'claude'
+            with self.picker_lock:
+                self.pending_resume = (session.id, backend, bool(branch.get()) and backend == 'claude')
             folder = Path(session.cwd)
             if folder.is_dir() and folder != self.project():
                 # --resume only finds a session from its own working folder.
@@ -417,9 +487,10 @@ class App:
         self.save(capture=self.capturing)
 
     # ---- agent worker ---------------------------------------------------
-    def agent_config(self):
-        return AgentConfig(backend=self.backend.get(), project=self.project(), sandbox=self.sandbox.get(),
-                           model=self.model.get().strip(), claude=find_claude(self.settings.get('claude', '')),
+    def agent_config(self, request):
+        """The agent and model were settled when the prompt arrived (see resolve_agent)."""
+        return AgentConfig(backend=request.agent, project=self.project(), sandbox=self.sandbox.get(),
+                           model=request.model, claude=find_claude(self.settings.get('claude', '')),
                            codex=find_codex(self.settings.get('codex', '')), timeout=self.args.timeout,
                            guidance_file=self.guidance, web=self.web.get())
 
@@ -427,7 +498,7 @@ class App:
         while True:
             request = self.scheduler.take()
             key = request.key
-            cfg = self.agent_config()
+            cfg = self.agent_config(request)
             label = BACKENDS.get(cfg.backend, 'The agent')
             self.events.put((key, 'working', f'{label} is working ({cfg.sandbox}).', None))
             actions = 0
@@ -440,11 +511,16 @@ class App:
                 self.events.put((key, 'activity', f'{label} is working · {count} · {what}', None))
             try:
                 job = self.context.job(request, cfg.backend)
+                # A conversation picked in the companion waits for a prompt its agent answers.
                 with self.picker_lock:
-                    chosen, self.pending_resume = self.pending_resume, None
+                    chosen = self.pending_resume
+                    if chosen and chosen[1] == cfg.backend:
+                        self.pending_resume = None
+                    else:
+                        chosen = None
                 if chosen:
-                    job = Job(key, request.prompt, resume=chosen, history=job.history,
-                              fork=self.pending_branch and cfg.backend == 'claude', context=request.context)
+                    job = Job(key, request.prompt, resume=chosen[0], history=job.history,
+                              fork=chosen[2] and cfg.backend == 'claude', context=request.context)
                     self.root.after(0, lambda: self.conversation.set('In-game conversation: continuing the last one'))
                 result = run_agent(cfg, job, on_update=lambda text: self.events.put((key, 'streaming', text, None)),
                                    on_activity=activity)
@@ -462,6 +538,8 @@ class App:
             row['reply'] = self.activity[key]
         if row['state'] == 'queued':
             row['reply'] = self.scheduler.describe(key)
+        if row.get('agent'):
+            row['label'] = BACKENDS.get(row['agent'], 'The agent')  # the reply header names it too
         return row
 
     def name_of(self, key):
@@ -641,11 +719,16 @@ class App:
         if result and self.scheduler.open() < MAX_OPEN:
             key, blob = result
             fields, body = parse_envelope(blob)
-            name = (fields.get('name') or [''])[0]
-            request = Request(key, body, chat_of(key, fields), name, '\n'.join(fields.get('ctx', [])))
-            if self.inbox.add(request, self.backend.get()):
+            name, chat = (fields.get('name') or [''])[0], chat_of(key, fields)
+            agent, model, notes = resolve_agent(fields, self.inbox.last_backend(chat), self.backend.get(),
+                                                self.settings.get('models') or {})
+            request = Request(key, body, chat, name, '\n'.join(fields.get('ctx', [])), agent, model)
+            if self.inbox.add(request):
                 self.names[key] = name
-                self.write(f'[queued] {self.name_of(key)}\nYou: {body}')
+                for note in notes:
+                    self.write(f'Note: {note}; using the default instead.')
+                who = BACKENDS.get(agent, agent) + (f', {model}' if model else '')
+                self.write(f'[queued] {self.name_of(key)} ({who})\nYou: {body}')
                 self.job_status.set(f'Queued: {self.name_of(key)}')
                 self.scheduler.put(request)
 

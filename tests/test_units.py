@@ -514,18 +514,49 @@ class ChatsAndContext(unittest.TestCase):
             db.execute("INSERT INTO jobs VALUES ('11111111bbbbbbbb:1', 'other', 'done', 'x', 'claude', 'S9', 2)")
             db.commit(); db.close()
             inbox = Inbox(path)
-            later = Request('77777777cccccccc:1', 'new q', '68c0b8d0', 'Raid prep', 'Location: Dalaran')
-            self.assertTrue(inbox.add(later, 'claude'))
+            self.assertEqual(inbox.last_backend('68c0b8d0'), 'claude')
+            self.assertIsNone(inbox.last_backend('99999999'))
+            later = Request('77777777cccccccc:1', 'new q', '68c0b8d0', 'Raid prep', 'Location: Dalaran', 'claude', 'opus')
+            self.assertTrue(inbox.add(later))
+            row = inbox.get(later.key)
+            self.assertEqual((row['agent'], row['model']), ('claude', 'opus'))
             job = Context(path).job(later, 'claude')
             self.assertEqual((job.resume, job.history, job.context), ('S1', [('old q', 'old a')], 'Location: Dalaran'))
             # Another chat's turn, just finished in memory, is not mixed in.
             context = Context(path)
             other = Request('77777777cccccccc:2', 'next', '11111111')
-            inbox.add(other, 'claude')
+            inbox.add(other)
             context.remember('11111111bbbbbbbb:1', 'claude', Result('done', 'x', 'S10'))
             self.assertEqual(context.job(other, 'claude').resume, 'S10')
             self.assertEqual(context.job(later, 'claude').resume, 'S1')
             inbox.db.close()
+
+    def test_each_chat_picks_its_agent_and_model(self):
+        from companion.app import resolve_agent
+        defaults = {'claude': 'opus', 'codex': 'gpt-5.5'}
+        # The chat's own choice wins over its history and the companion's selection.
+        self.assertEqual(resolve_agent({'agent': ['codex'], 'model': ['gpt-6-astra']}, 'claude', 'claude', defaults),
+                         ('codex', 'gpt-6-astra', []))
+        # Unset: a chat keeps the agent it last used, with that agent's default model.
+        self.assertEqual(resolve_agent({}, 'codex', 'claude', defaults), ('codex', 'gpt-5.5', []))
+        # A new chat takes the companion's selection.
+        self.assertEqual(resolve_agent({}, None, 'claude', defaults), ('claude', 'opus', []))
+        # Anything unusable is refused and noted, never passed to a command line.
+        agent, model, notes = resolve_agent({'agent': ['bash'], 'model': ['--dangerously-skip-permissions']},
+                                            None, 'claude', {})
+        self.assertEqual((agent, model), ('claude', ''))
+        self.assertEqual(len(notes), 2)
+
+    def test_reply_names_the_agent_answering(self):
+        from companion.protocol import reply_text
+        state, data = reply_text({'state': 'done', 'reply': 'Hi', 'agent': 'codex', 'model': 'gpt-5.5'})
+        self.assertEqual((state, data), (4, b'\x01agent=codex\nmodel=gpt-5.5\x02Hi'))
+        _, working = reply_text({'state': 'working', 'reply': '', 'agent': 'codex', 'label': 'Codex'})
+        self.assertTrue(working.endswith(b'\x02Codex is working.'))
+        _, waiting = reply_text({'state': 'waiting', 'reply': ''})
+        self.assertFalse(waiting.startswith(b'\x01'), 'no header before the companion has the prompt')
+        _, long = reply_text({'state': 'done', 'reply': 'x' * 70000, 'agent': 'claude'})
+        self.assertLessEqual(len(long), protocol.MAX_TEXT)
 
     def test_game_context_reaches_each_agent(self):
         from companion.agents import codex_prompt, guidance_for

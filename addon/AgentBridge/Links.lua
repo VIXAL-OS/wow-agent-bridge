@@ -294,9 +294,22 @@ local function echo(chat, text, state)
     end
 end
 
+-- The companion names the agent and model answering ahead of the text:
+-- \1agent=codex\nmodel=gpt-5.5\2. Only the text after it is shown or kept.
+local function splitMeta(text)
+    local head, rest = text:match('^\1([^\2]*)\2(.*)$')
+    if not head then return nil, text end
+    local meta = {}
+    for key, value in head:gmatch('(%a+)=([^\n]*)') do meta[key] = value end
+    return meta, rest
+end
+
 function NS.ShowReply(request, text, state, complete)
     local item = inflight[request]
     if not item then return end
+    local meta
+    meta, text = splitMeta(text)
+    if meta then NS.NoteAgent(item.chat, meta.agent, meta.model) end
     if complete and state >= 4 then
         inflight[request] = nil
         record(item.chat, item.prompt, text, state)

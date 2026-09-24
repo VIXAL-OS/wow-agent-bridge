@@ -146,7 +146,11 @@ class Sim:
         if not job:
             return {'id': key, 'state': 'waiting', 'reply': ''}
         state, reply = self.agent(job['prompt'], self.t - job['start'])
-        return {'id': key, 'state': state, 'reply': reply}
+        # Like the companion: name the agent and model answering, so the reply
+        # carries the header the addon strips.
+        fields = job['fields']
+        return {'id': key, 'state': state, 'reply': reply, 'agent': (fields.get('agent') or ['mock'])[0],
+                'model': (fields.get('model') or [''])[0]}
 
     def capture(self):
         data = self.g.STUB.strip()

@@ -141,20 +141,32 @@ def frame_kind(frame):
     return {b'CPB1': 'prompt', b'CPBN': 'control'}.get(bytes(frame[:4]))
 
 
+def reply_meta(agent, model=''):
+    """Header ahead of reply text: which agent and model answer this prompt.
+
+    `\\x01agent=codex\\nmodel=gpt-5.5\\x02`, the same shape as the prompt
+    envelope. The addon strips it and shows the agent beside the chat's name.
+    """
+    return ('\x01agent=' + agent + '\nmodel=' + (model or '') + '\x02').encode('utf-8')
+
+
 def reply_text(snapshot, agent='The agent'):
     """UTF-8 bytes shown in game for a job snapshot, capped at MAX_TEXT."""
     state = STATES.get(snapshot.get('state'), 0)
+    agent = snapshot.get('label') or agent
     text = snapshot.get('reply') or {
         0: 'Waiting for the companion to receive your prompt.',
         1: 'Your prompt is queued.',
         2: f'{agent} is working.',
         3: f'{agent} is writing.',
     }.get(state, 'Finished without response text.')
+    head = reply_meta(snapshot['agent'], snapshot.get('model')) if snapshot.get('agent') else b''
+    limit = MAX_TEXT - len(head)
     encoded = str(text).encode('utf-8')
-    if len(encoded) > MAX_TEXT:
+    if len(encoded) > limit:
         note = b'\n\n[Preview limit reached. The full reply is in the companion.]'
-        encoded = encoded[:MAX_TEXT - len(note)].decode('utf-8', errors='ignore').encode('utf-8') + note
-    return state, encoded
+        encoded = encoded[:limit - len(note)].decode('utf-8', errors='ignore').encode('utf-8') + note
+    return state, head + encoded
 
 
 def make_reply_packet(session, request, slot, part, state, encoded):

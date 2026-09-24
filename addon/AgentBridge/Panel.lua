@@ -246,17 +246,24 @@ local newChat = CreateFrame('Button', nil, side, 'UIPanelButtonTemplate')
 Size(newChat, SIDEBAR - 14, 22); newChat:SetPoint('TOP', 0, -6); newChat:SetText('+ New chat')
 newChat:SetScript('OnClick', function() NS.NewChat(); edit:SetFocus() end)
 
+local MENU = {
+    {'Rename...', function(id) NS.AskRename(id) end},
+    {'Delete...', function(id) NS.AskDelete(id) end},
+    {'Use Claude Code', function(id) NS.UseAgent(id, 'claude') end},
+    {'Use Codex', function(id) NS.UseAgent(id, 'codex') end},
+    {'Model...', function(id) NS.AskModel(id) end},
+    {'Cancel', function() end},
+}
 local menu = CreateFrame('Frame', 'AgentBridgeChatMenu', panel)
-Size(menu, 112, 82); menu:SetFrameStrata('FULLSCREEN_DIALOG'); menu:Hide()
+Size(menu, 128, 12 + #MENU * 22); menu:SetFrameStrata('FULLSCREEN_DIALOG'); menu:Hide()
 menu:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
     edgeFile = 'Interface\\Tooltips\\UI-Tooltip-Border', tile = true, tileSize = 16, edgeSize = 16,
     insets = {left = 4, right = 4, top = 4, bottom = 4}})
 menu:SetBackdropColor(0, 0, 0, .9)
 tinsert(UISpecialFrames, 'AgentBridgeChatMenu')
-for index, entry in ipairs({{'Rename', function(id) NS.AskRename(id) end},
-                            {'Delete', function(id) NS.AskDelete(id) end}, {'Cancel', function() end}}) do
+for index, entry in ipairs(MENU) do
     local b = CreateFrame('Button', nil, menu, 'UIPanelButtonTemplate')
-    Size(b, 96, 20); b:SetPoint('TOP', 0, -8 - (index - 1) * 22); b:SetText(entry[1])
+    Size(b, 112, 20); b:SetPoint('TOP', 0, -8 - (index - 1) * 22); b:SetText(entry[1])
     b:SetScript('OnClick', function() menu:Hide(); entry[2](menu.chat) end)
 end
 
@@ -269,9 +276,20 @@ local function row(i)
     b:SetHighlightTexture('Interface\\QuestFrame\\UI-QuestTitleHighlight', 'ADD')
     b.selected = b:CreateTexture(nil, 'BACKGROUND')
     b.selected:SetAllPoints(b); b.selected:SetTexture(.25, .45, 1, .35)
+    -- Which agent answers this chat, at the right; the title takes the rest.
+    b.tag = b:CreateFontString(nil, 'OVERLAY', 'GameFontDisableSmall')
+    b.tag:SetPoint('RIGHT', b, 'RIGHT', -3, 0); b.tag:SetJustifyH('RIGHT')
     b.label = b:CreateFontString(nil, 'OVERLAY', 'GameFontHighlightSmall')
-    b.label:SetPoint('LEFT', b, 'LEFT', 4, 0); b.label:SetPoint('RIGHT', b, 'RIGHT', -4, 0)
+    b.label:SetPoint('LEFT', b, 'LEFT', 4, 0); b.label:SetPoint('RIGHT', b.tag, 'LEFT', -3, 0)
     b.label:SetHeight(ROW); b.label:SetJustifyH('LEFT')
+    b:SetScript('OnEnter', function(self)
+        GameTooltip:SetOwner(self, 'ANCHOR_RIGHT')
+        GameTooltip:SetText(NS.ChatTitle(self.chat), 1, 1, 1)
+        GameTooltip:AddLine(NS.DescribeAgent(self.chat), .8, .8, .8, true)
+        GameTooltip:AddLine('Right-click to rename, delete, or change agent or model.', .6, .6, .6, true)
+        GameTooltip:Show()
+    end)
+    b:SetScript('OnLeave', function() GameTooltip:Hide() end)
     b:SetScript('OnClick', function(self, which)
         if which == 'RightButton' then
             menu.chat = self.chat
@@ -296,6 +314,8 @@ function NS.RefreshChats()
             b.chat = chat.id
             local mark = NS.IsChatBusy(chat.id) and '|cffffd100...|r ' or chat.unread and '|cff66ff88*|r ' or ''
             b.label:SetText(mark..NS.Escape(NS.ChatTitle(chat.id)))
+            local agent = NS.ChatAgent(chat.id)
+            b.tag:SetText(agent and NS.AGENTS[agent] or '')
             if chat.id == NS.S.chat then b.selected:Show() else b.selected:Hide() end
             b:Show()
         elseif rows[i] then

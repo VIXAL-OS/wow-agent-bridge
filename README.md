@@ -71,16 +71,23 @@ If the font format ever changes, the installer rebuilds the bank — but only wh
 ```
 
 On first launch, pick the folder the agent should work in. In the window you can:
-- choose **Claude Code**, **Codex** or **Mock agent** (the mock tests the transport without an agent)
+- choose which agent new chats use: **Claude Code**, **Codex** or **Mock agent** (the mock tests the transport without an agent)
 - choose the access level (see below)
-- pick a model: the dropdown lists the models each CLI offers on this machine, read from its own data, so new ones appear without an update. You can also type any name the CLI accepts; blank uses your default
+- pick each agent's default model: the dropdown follows the agent buttons and lists the models that CLI offers on this machine, read from its own data, so new ones appear without an update. You can also type any name the CLI accepts; blank uses the CLI's own default
 - turn **Web search** on or off
 
 Capture starts automatically and finds the strip by itself.
 
-**Chats and sessions.** Each chat in the panel is its own agent conversation. A follow-up resumes that chat's previous session with whichever agent answered last — `--resume` for Claude Code, `exec resume` for Codex — across `/reload` and game restarts. Up to three agents run at once, one per chat; a second prompt in the same chat waits for the first, since it resumes the session that one produces.
+**Chats and sessions.** Each chat in the panel is its own agent conversation. A follow-up resumes that chat's previous session — `--resume` for Claude Code, `exec resume` for Codex — across `/reload` and game restarts. Up to three agents run at once, one per chat; a second prompt in the same chat waits for the first, since it resumes the session that one produces.
 
-**Continuing a conversation you started elsewhere.** To pick up a conversation you had at your desk, click **Continue a conversation…**, choose it from the list, and send your next prompt in game; the work folder switches to match it. Claude Code branches with `--fork-session`, leaving the original transcript untouched. Codex has no branching, so in-game turns are appended to that thread.
+**Agents and models per chat.** So one chat can be on Codex while two others are on Claude Code, each chat has its own agent:
+- the one you set in game (`/ab agent codex`, or right-click the chat);
+- otherwise the agent it last used, since only that one can resume its session;
+- for a new chat, the companion's selection.
+
+The model works the same way: `/ab model <name>` for the chat, otherwise the companion's default for that agent. The chat list shows each chat's agent, and hovering shows the model. Changing a chat's agent starts a new session with the new agent, given the chat's recent turns as history.
+
+**Continuing a conversation you started elsewhere.** To pick up a conversation you had at your desk, click **Continue a conversation…** and choose it from the list; the work folder switches to match it. The next prompt that agent answers continues it, so send from a new chat or one set to that agent. Claude Code branches with `--fork-session`, leaving the original transcript untouched. Codex has no branching, so in-game turns are appended to that thread.
 
 | Access | Claude Code | Codex |
 | --- | --- | --- |
@@ -101,6 +108,7 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Start another chat | **+ New chat** in the list, or `/ab new [name]`. The others keep running |
 | Switch chats | Click one in the list, or `/ab chat <number or name>`; `/ab chats` lists them |
 | Rename or delete a chat | Right-click it in the list, or `/ab rename <name>` and `/ab delete` |
+| Choose a chat's agent or model | Right-click it in the list, or `/ab agent claude\|codex` and `/ab model <name>\|default`; with no name, they show the current choice |
 | Copy a reply out of the game | **Copy** or `/ab copy` (last reply), `/ab copy all` (whole chat); then Ctrl+C |
 | Replies in the chat frame | `/ab echo short` (default, 800 characters), `full`, `off`, or a number |
 | Game context | `/ab context on` (default), `off`, or `show` to see exactly what is sent |
@@ -136,7 +144,7 @@ Replies render as plain text. `[Name](item:ID)` references become item links; ev
 
 **Not yet exercised live** (covered by simulation and unit tests only):
 
-- Parallel chats and the chat list, the game context, linked tooltips, the progress line, `/ai`, the copy box and chat-frame echo, all added after the last live session.
+- Parallel chats and the chat list, per-chat agents and models, the game context, linked tooltips, the progress line, `/ai`, the copy box and chat-frame echo, all added after the last live session.
 - The multi-prompt transcript, beyond the scroll-on-open fix.
 - Replies longer than one 4,060-byte packet, and streaming previews.
 - Aligned tables in the fixed-width font, and item-link tooltips. The panel is now a plain frame, and 3.3.5a may not send hover events there; if not, item links show as coloured names without tooltips.
@@ -163,7 +171,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - window resize recalibration
 - epoch recycling
 
-Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, and check the envelope each prompt carries (chat, name, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, the inbox migration and how game context reaches each agent.
+Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.
 
 ## Credits and licence
 
