@@ -4,7 +4,7 @@ Chat with **Claude Code** or **Codex** from a panel inside World of Warcraft 3.3
 
 This is a port of [0xInuarashi/wow-forever-codex](https://github.com/0xInuarashi/wow-forever-codex), which does the same for WoW: Forever. The core idea is theirs: an addon can't open a connection, so prompts leave the game as a pixel strip and replies come back as font glyph widths. This version re-implements it for the Wrath 3.3.5a client that ChromieCraft uses, and adds a Claude Code backend alongside Codex.
 
-No DLL injection, no memory access, no synthetic input. The addon uses documented 3.3.5a APIs only (textures, `SetFont`, `SetText`, `GetStringWidth`). The companion reads a small screen rectangle and writes files in the addon folder.
+No DLL injection, no memory access, no synthetic input. The addon uses documented 3.3.5a APIs only (textures, `SetFont`, `SetText`, `GetStringWidth`, `LoadAddOn`). The companion reads a small screen rectangle and writes ordinary files.
 
 ## How the two channels work
 
@@ -12,6 +12,7 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 | --- | --- | --- |
 | Game → companion | 128 × 8 cell strip at the top of the screen, any opacity | Differences between cell pairs in a screen capture |
 | Companion → game | An unused font file in the addon's bank | Glyph advance widths via `GetStringWidth` |
+| Companion → game, finished replies over 4,060 bytes | One of 16 optional load-on-demand addons | A fixed hex-data assignment, announced by a checksummed font packet |
 
 **Prompts.** The addon splits the UTF-8 prompt (max 8,000 bytes, including the header, linked tooltips and game context described under [In game](#in-game)) into 64-byte checksummed frames and flashes them on the strip. Every bit is a *pair* of neighbouring cells, one light and one dark, and the companion reads the difference between them. Because only the difference matters, the strip decodes at any opacity, so you can turn it down with `/ab alpha 0.5` and still see the UI through it. A pair straddling a hard UI edge reads as low contrast and rejects the frame rather than guessing. The strip also carries a *control* frame: which font slot the addon will load next, how many milliseconds until it does, and which reply fragment it needs. The strip is only shown during an exchange.
 
@@ -23,12 +24,20 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 
 **Why a bank of 65,535 fonts.** The client caches a font file forever once it has loaded it. Changing it on disk later has no effect until the game restarts. Pre-created, never-loaded filenames can be filled in just before first use. Slots are NTFS hard links to 128 shared placeholders, so a fresh bank is about 5 MB. Publishing replaces one name atomically.
 
-**Why not load-on-demand addons.** [wow-claude](https://github.com/chelinho139/wow-claude) returns replies by writing Lua into pre-made load-on-demand addons and loading one. Measured on this client (2026-09-24):
+**Hybrid long replies.** [wow-claude](https://github.com/chelinho139/wow-claude) demonstrated returning replies through pre-made load-on-demand addons. Earlier probes on this client (2026-09-24) measured:
 - A load-on-demand addon's file is read fresh on its first load after launch, and again after each `/reload`.
 - 60 KB of hostile text (quotes, long brackets, escapes, UTF-8, NULs) arrived intact in 1–2 ms.
 - `PlaySoundFile` returns `1` for an empty file and a valid one alike, so it cannot tell the addon a reply is ready.
 
-Each such addon runs once per UI load, so without a ready signal every check for a reply would use one up. Checks would have to stay on fonts, leaving the addons to speed up only the delivery of finished replies over 4 KB, by a few seconds. That would cost a second transport, a dozen or more entries in the AddOns list, and the game running a file whose contents come from agent replies. For that gain, replies stay on fonts, which are only measured and never run.
+The integrated hybrid keeps readiness checks, progress and short replies on fonts. When a finished reply exceeds 4,060 bytes (including its small agent/model header), the companion atomically writes it into the unused slot advertised by the addon, then publishes a font packet announcing it. The game loads that slot once. Sixteen slots are available per UI load; `/reload` frees them. Missing, disabled or exhausted slots fall back to fonts. A failed or invalid load disables the hybrid until the next UI load and retries the reply through fonts. During combat the addon offers no new hybrid slot.
+
+Only one fixed Lua assignment is generated: `AgentBridgeHybridData = "<lowercase hex>"`. The writer validates the entire source template immediately before publication. Reply text never enters Lua source directly. The receiver clears the global before and after loading, decodes hex, and checks the session, request, slot, final state, exact length and checksum against the font descriptor before displaying anything. The payload limit remains 60,000 bytes including metadata. There is no `loadstring` or reply-driven function call. This protects against reply text becoming code; it is not a sandbox for someone who can independently replace local addon files.
+
+The 16 slots appear as `AgentBridgeReply01` through `AgentBridgeReply16` in AddOns. Run the updated installer and fully exit/relaunch WoW once so it discovers these new folders; restart the companion to load the updated publisher too. Until the slots are discovered, normal font replies continue working. Subsequent code updates only need `/reload`; font paths still cannot be reused until a full game restart.
+
+**Performance.** Published fonts now map the 8,192 data codepoints onto 16 shared glyph shapes with exactly the same widths and outlines as before. This reduces file size and glyph loading work without changing the font protocol or rebuilding the installed bank. Existing cached fonts and the self-test remain valid. Glyph measurement uses a 1 ms frame budget (up to 256 measurements when the profiling clock is unavailable). The strip repaints only changed bits, and the transcript defers layout while hidden and reuses unchanged line properties.
+
+Use `/ab perf on`, reproduce a transfer, then `/ab perf` to print call counts, average/max addon timings and the worst frame interval. `/ab perf reset` clears the measurements; `/ab perf off` stops recording. Font loading, receive steps (including font/hybrid loading), hybrid loading, transcript formatting/layout and strip painting are timed separately. Recording is opt-in and does not reset the client's shared profiling clock. Frame intervals cover the whole game, including loading screens, so they can reveal a dip without proving this addon caused it. For comparable measurements, stay in the same area and avoid loading screens or alt-tabbing during the recording. The new implementation is covered by Lua 5.1 simulation tests; live frame-time improvement still needs measurement on this client.
 
 ## What changed for 3.3.5a
 
@@ -51,6 +60,7 @@ Each such addon runs once per UI load, so without a ready signal every check for
   - Multi-part transfers are served from a frozen copy, so all fragments share one revision even while the agent is still writing.
   - Polling backs off while nothing changes.
   - Prompts stop repeating once the companion acknowledges them.
+  - Long final replies can use one checked addon slot instead of many font fragments.
 - **Two agents.**
   - Claude Code runs `claude -p --output-format stream-json`, with live streaming and tool-activity status. Follow-ups use native `--resume`.
   - Codex runs `codex exec --json`, resuming threads with `exec resume` (its sandbox goes through a config override there), and falls back to passing history as data.
@@ -76,6 +86,14 @@ If the font format ever changes, the installer rebuilds the bank — but only wh
 ```powershell
 .\.venv\Scripts\pythonw.exe 'Launch Agent Bridge.pyw'
 ```
+
+To restart the companion, run the included helper from the repository folder:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Restart Agent Bridge.ps1"
+```
+
+The helper closes this installation's companion gracefully and opens it again. If a job keeps it open, it asks you to let the job finish instead of starting another companion. For a desktop shortcut, use the same command with an absolute path to the script; add `-WindowStyle Hidden` before `-File` to hide the helper's console. The companion window still opens normally.
 
 On first launch, pick the folder the agent should work in. In the window you can:
 - choose which agent new chats use: **Claude Code**, **Codex** or **Mock agent** (the mock tests the transport without an agent)
@@ -109,6 +127,7 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Action | How |
 | --- | --- |
 | Show / hide the panel | `/ab` (also `/agent`, `/claude`, `/codex`), minimap button, or a key binding |
+| Resize the panel | Drag the labelled grip in the bottom-right corner. Width and height are saved automatically (minimum 560 × 320) |
 | Type a prompt quickly | `/ai <message>` from the chat box, right-click the minimap button, or bind "Open panel and type a prompt" |
 | Link an item, spell or quest | Focus the input box, then Shift-click or drag it in; with `/ai`, Shift-click into the chat box as usual |
 | Scroll back through a chat | Mouse wheel or the scrollbar; Shift+wheel pages |
@@ -124,6 +143,7 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | See through the strip | `/ab alpha 0.5` (0.2 to 1) |
 | Read the full, unformatted reply | **Saved replies** in the companion |
 | Channel state | `/ab status` |
+| Measure transfer performance | `/ab perf on`, then `/ab perf`; `off` stops and `reset` clears measurements |
 | Move the strip | `/ab strip top` (or `topleft`, `topright`, `bottom`, `bottomleft`, `bottomright`); the companion follows |
 
 The panel lists your chats down the left: the one you are reading is highlighted, `...` marks one still working, and `*` one with a reply you have not read. Each chat is a scrolling transcript. Sending a prompt scrolls it into view, and updates to a reply keep your place, so you can read back while it arrives. Under a prompt still under way, a line shows what the agent is doing (how many actions so far and the latest one, such as a file it read or a search) and a running clock. The last 30 exchanges per chat (up to 200 KB in all) are kept across `/reload` and restarts; the companion keeps every reply permanently.
@@ -177,6 +197,10 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - `/reload` mid-request
 - window resize recalibration
 - epoch recycling
+- hybrid hostile-text delivery, stale/corrupt payload rejection and font fallback
+- hybrid slot reuse after reload, exhaustion and concurrent-chat isolation
+- compact-font widths, fixed source validation and locked-file recovery
+- hidden transcript deferral, incremental strip painting and performance reporting
 
 Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.
 
@@ -189,6 +213,10 @@ prompts leave as pixels and replies return as font metrics.
 This is a separate implementation for the 3.3.5a client, written against that published design
 rather than copied from it. The upstream repository carries no licence file, so it grants no
 redistribution rights; nothing here is derived from its source.
+
+Thanks to [chelinho139](https://github.com/chelinho139) for
+[wow-claude](https://github.com/chelinho139/wow-claude), whose use of load-on-demand addons
+for replies inspired the optional hybrid long-reply transport in this project.
 
 This code is MIT licensed (see [LICENSE](LICENSE)). Two things it deliberately does not ship:
 

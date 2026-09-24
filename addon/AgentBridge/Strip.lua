@@ -59,6 +59,24 @@ local function wanted()
     return NS.IsReceiving() or (#frames > 0 and GetTime() - lastSubmit < 120)
 end
 
+local function paint(data)
+    for byte = 1, #data do
+        local value, old = data:byte(byte), lastData and lastData:byte(byte)
+        if value ~= old or alpha ~= lastAlpha then
+            for bit = 0, 7 do
+                local v = math.floor(value / 2^(7-bit)) % 2
+                if not old or alpha ~= lastAlpha or v ~= math.floor(old / 2^(7-bit)) % 2 then
+                    local i = (byte-1)*8 + bit
+                    local index = math.floor(i/64)*COLS + 2*(i % 64) + 1
+                    cells[index]:SetTexture(v, v, v, alpha)
+                    cells[index+1]:SetTexture(1-v, 1-v, 1-v, alpha)
+                end
+            end
+        end
+    end
+    lastData, lastAlpha = data, alpha
+end
+
 local driver = CreateFrame('Frame')
 driver:SetScript('OnUpdate', function(_, dt)
     elapsed = elapsed + dt
@@ -80,12 +98,5 @@ driver:SetScript('OnUpdate', function(_, dt)
         data = frames[cursor]; cursor = cursor % #frames + 1
     end
     if data == lastData and alpha == lastAlpha then return end
-    lastData, lastAlpha = data, alpha
-    for i = 0, #data*8-1 do
-        local v = math.floor(data:byte(math.floor(i/8)+1) / 2^(7 - i%8)) % 2
-        -- Bit i lives in row floor(i/64), columns 2*(i%64) and +1.
-        local index = math.floor(i/64)*COLS + 2*(i % 64) + 1
-        cells[index]:SetTexture(v, v, v, alpha)
-        cells[index+1]:SetTexture(1-v, 1-v, 1-v, alpha)
-    end
+    NS.Profile('strip-paint', paint, data)
 end)

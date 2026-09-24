@@ -1,7 +1,7 @@
 """Reply bytes -> glyph advance widths in first-use addon fonts.
 
 Each byte uses two glyphs, one per 4-bit nibble: glyph U+E000 + i carries
-nibble i with advance (2 + value) * 256 font units at 1024 units/em, so one
+nibble i with advance (2 + value) * 128 font units at 1024 units/em, so one
 step is an eighth of an em.
 
 That step matters. WoW 3.3.5a caps the rasterised em (~32 px measured), and a
@@ -20,7 +20,8 @@ import time
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
-from .protocol import BANK_SIZE, REPLY_SIZE, make_reply_packet, reply_text
+from .protocol import BANK_SIZE, REPLY_SIZE, REPLY_CHUNK, make_reply_packet, reply_text
+from .hybrid import payload as hybrid_payload, slot_path, validate_source
 
 ADDON_NAME = 'AgentBridge'
 UNITS_PER_EM = 1024
@@ -59,17 +60,21 @@ def make_font(data, tag=0):
     # '"' are the 0/15 calibration glyphs and '~' is the common trailing glyph.
     latin = {c: 8 for c in range(33, 127)}
     latin.update({33: 0, 34: 15, 126: 8})
-    order = ['.notdef', 'space'] + [f'g{c}' for c in latin] + [f'd{i}' for i in range(GLYPHS)]
-    cmap = {32: 'space', **{c: f'g{c}' for c in latin}, **{PUA + i: f'd{i}' for i in range(GLYPHS)}}
+    # Many codepoints may share a glyph: only 16 distinct advances exist.
+    # Keep the same outlines and metrics as the original bank so a running
+    # client needs no recalibration or bank reset. Avoid 8,192 duplicate boxes.
+    order = ['.notdef', 'space'] + [f'g{c}' for c in latin] + [f'd{i}' for i in range(VALUES)]
+    cmap = {32: 'space', **{c: f'g{c}' for c in latin},
+            **{PUA + i: f'd{v}' for i, v in enumerate(nibbles(data))}}
     if 'glyphs' not in _TEMPLATE:
         glyphs = {'.notdef': _box(64, 512), 'space': TTGlyphPen(None).glyph()}
         glyphs.update({f'g{c}': _box(64, 512) for c in latin})
         # Tiny data outlines keep rasterisation cheap; only the advance matters.
-        glyphs.update({f'd{i}': _box(32, 32) for i in range(GLYPHS)})
+        glyphs.update({f'd{i}': _box(32, 32) for i in range(VALUES)})
         _TEMPLATE['glyphs'] = glyphs
     metrics = {'.notdef': (512, 0), 'space': (256, 0)}
     metrics.update({f'g{c}': (advance(v), 0) for c, v in latin.items()})
-    metrics.update({f'd{i}': (advance(v), 0) for i, v in enumerate(nibbles(data))})
+    metrics.update({f'd{i}': (advance(i), 0) for i in range(VALUES)})
     fb = FontBuilder(UNITS_PER_EM, isTTF=True)
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap(cmap)
@@ -274,6 +279,7 @@ class NativeBridge:
     def _reset(self):
         self.slot, self.deadline, self.was_active = 0, 0, False
         self.written, self.written_at, self.frozen = None, 0, {}
+        self.unavailable_hybrid = set()
 
     def accept(self, control, snapshot):
         if self.session != control.session:
@@ -299,7 +305,19 @@ class NativeBridge:
         else:
             content = self.frozen[key]
         state, encoded = content
-        packet = make_reply_packet(control.session, control.request, control.slot, control.part, state, encoded)
+        hybrid = None
+        if (control.hybrid_slot and control.hybrid_slot not in self.unavailable_hybrid
+                and control.part == 1 and state >= 4 and len(encoded) > REPLY_CHUNK):
+            try:
+                target = slot_path(self.directory, control.hybrid_slot)
+                if target.is_file():
+                    descriptor, source = hybrid_payload(control.session, control.request,
+                                                        control.hybrid_slot, state, encoded)
+                    hybrid = target, source
+            except (OSError, ValueError):
+                pass  # Normal fonts remain available if the optional pool is absent.
+        packet = make_reply_packet(control.session, control.request, control.slot, control.part,
+                                   7 if hybrid else state, descriptor if hybrid else encoded)
         identity = (control.session, control.slot, packet)
         if identity == self.written:
             return False
@@ -311,6 +329,19 @@ class NativeBridge:
         path = font_path(self.directory, control.slot)
         if not path.is_file():
             raise ValueError('Font slot missing; reinstall the bank')
+        if hybrid:
+            try:
+                validate_source(hybrid[1])  # Gate the exact bytes passed to atomic_write.
+                atomic_write(*hybrid)
+            except (OSError, ValueError):
+                # A locked/missing optional file must not strand a reply.
+                self.unavailable_hybrid.add(control.hybrid_slot)
+                packet = make_reply_packet(control.session, control.request, control.slot,
+                                           control.part, state, encoded)
+                identity = (control.session, control.slot, packet)
+                body = make_font(packet, control.slot)
+            if self.clock() >= self.deadline:
+                return False
         atomic_write(path, body)
         self.written, self.written_at = identity, self.clock()
         # Later fragments must come from exactly the text whose part 1 was written.

@@ -180,6 +180,7 @@ class Transcript(unittest.TestCase):
         for n in range(30):
             self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))
         panel, scroll = self.sim.g.AgentBridgePanel, self.sim.g.AgentBridgeScroll
+        panel.Show(panel)
         scroll.SetVerticalScroll(scroll, 0)  # left at the top last time
         panel.scripts[b'OnShow'](panel)
         end = scroll.GetVerticalScrollRange(scroll)
@@ -190,6 +191,8 @@ class Transcript(unittest.TestCase):
         self.assertTrue(self.sim.body().rstrip().endswith('line 4'))
 
     def test_new_prompt_scrolls_to_itself_and_updates_keep_your_place(self):
+        panel = self.sim.g.AgentBridgePanel
+        panel.Show(panel)
         for n in range(30):
             self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))
         scroll = self.sim.g.AgentBridgeScroll

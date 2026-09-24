@@ -106,6 +106,7 @@ local HELP = {
     '/ab pause | resume - stop or restart reply checks',
     '/ab test - run the font self-test and print results',
     '/ab status - show channel state',
+    '/ab perf on|off|reset - record performance; /ab perf prints timings',
     '/ab strip top|topleft|topright|bottom|bottomleft|bottomright - move the pixel strip',
     '/ab alpha 0.5 - strip opacity, so you can see the UI behind it (0.2 to 1)',
     '/ab sound on|off - chime when a reply is ready',
@@ -150,11 +151,13 @@ SlashCmdList.AGENTBRIDGE = function(arg)
     elseif cmd == 'pause' then NS.Pause(); NS.SetStatus('Reply checks paused. Resume or Send to continue.')
     elseif cmd == 'resume' then NS.Resume()
     elseif cmd == 'test' then NS.RunSelfTest(true)
+    elseif cmd == 'perf' then NS.PerfCommand(word)
     elseif cmd == 'status' then
         local r = NS.ReceiverInfo()
         NS.Print(string.format('slot %d/%d, %d request(s) waiting, %s, font size %s, strip %s%s', r.slot,
             NS.BANK_SIZE, r.pending, r.active and 'receiving' or 'idle', tostring(r.calib or 'not calibrated'),
             NS.S.strip, NS.recycledFrom and (', recycled from slot '..NS.recycledFrom) or ''))
+        NS.Print('Hybrid: '..NS.HybridInfo())
     elseif cmd == 'strip' and NS.ANCHORS[word:upper()] then
         NS.S.strip = word:upper(); NS.PlaceStrip(NS.S.strip)
         NS.Print('strip moved to '..NS.S.strip..'. The companion finds it automatically.')

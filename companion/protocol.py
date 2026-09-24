@@ -82,15 +82,19 @@ class Control:
     active: bool
     request: int
     loaded: int
+    hybrid_slot: int = 0
 
     @property
     def key(self):
         return f'{self.session}:{self.request}'
 
 
-def encode_control(session=b'12345678', slot=1, remaining_ms=5000, part=1, active=True, request=1):
-    body = FRAME_HEADER.pack(b'CPBN', CONTROL_VERSION, CONTROL.size, 0, 1, session, 0)
+def encode_control(session=b'12345678', slot=1, remaining_ms=5000, part=1, active=True, request=1, hybrid_slot=0):
+    body = FRAME_HEADER.pack(b'CPBN', 4 if hybrid_slot else CONTROL_VERSION,
+                             CONTROL.size + (2 if hybrid_slot else 0), 0, 1, session, 0)
     body += CONTROL.pack(slot, remaining_ms, part, int(active), request, slot - 1)
+    if hybrid_slot:
+        body += struct.pack('>H', hybrid_slot)
     body = body.ljust(60, b'\0')
     frame = body + adler(body)
     parse_control(frame)
@@ -100,9 +104,10 @@ def encode_control(session=b'12345678', slot=1, remaining_ms=5000, part=1, activ
 def parse_control(frame):
     _check_frame(frame)
     magic, version, length, part, total, session, message = FRAME_HEADER.unpack(frame[:20])
-    if magic != b'CPBN' or (version, length, part, total, message) != (CONTROL_VERSION, CONTROL.size, 0, 1, 0):
+    if (magic != b'CPBN' or (part, total, message) != (0, 1, 0)
+            or (version, length) not in ((3, CONTROL.size), (4, CONTROL.size + 2))):
         raise ValueError('Invalid control header')
-    if any(frame[20 + CONTROL.size:60]):
+    if any(frame[20 + length:60]):
         raise ValueError('Invalid control padding')
     slot, remaining, fragment, flags, request, loaded = CONTROL.unpack(frame[20:40])
     if not 1 <= slot <= BANK_SIZE + 1 or loaded != slot - 1:
@@ -111,7 +116,10 @@ def parse_control(frame):
         raise ValueError('Invalid control fields')
     if flags and (slot > BANK_SIZE or request == 0):
         raise ValueError('Invalid active control')
-    return Control(session.hex(), slot, remaining, fragment, bool(flags), request, loaded)
+    hybrid = struct.unpack('>H', frame[40:42])[0] if version == 4 else 0
+    if version == 4 and not 1 <= hybrid <= 16:
+        raise ValueError('Invalid hybrid slot')
+    return Control(session.hex(), slot, remaining, fragment, bool(flags), request, loaded, hybrid)
 
 
 ENVELOPE = '\x01AB1\n'
@@ -187,7 +195,7 @@ def parse_reply_packet(data):
     if len(data) != REPLY_SIZE or adler(data[:-4]) != data[-4:]:
         raise ValueError('Invalid reply checksum')
     magic, version, state, length, session, request, slot, revision, part, total = REPLY_HEADER.unpack(data[:32])
-    if magic != b'CFN2' or version != 2 or state > 6 or length > REPLY_CHUNK:
+    if magic != b'CFN2' or version != 2 or state > 7 or length > REPLY_CHUNK:
         raise ValueError('Invalid reply header')
     return dict(state=state, session=session.hex(), request=request, slot=slot, revision=revision,
                 part=part, total=total, text=data[32:32 + length])

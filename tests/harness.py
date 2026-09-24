@@ -15,6 +15,7 @@ from lupa.lua51 import LuaRuntime
 from companion.native import BANK_FORMAT, NativeBridge, copy_mono_font, make_font, prepare_bank, selftest_data
 from companion.protocol import Assembler, BANK_SIZE, frame_kind, parse_control, parse_envelope
 from companion.wow import write_epoch
+from companion.hybrid import install_slots, slot_name
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'addon' / 'AgentBridge'
@@ -95,8 +96,13 @@ class Client:
 class Sim:
     FRAME, CAPTURE = 1 / 60, 0.07
 
-    def __init__(self, game, agent, saved=None, scale=1080 / 768, rounding=True, slots=96):
+    def __init__(self, game, agent, saved=None, scale=1080 / 768, rounding=True, slots=96, hybrid=False):
         self.addon = install_small(game, slots)
+        if hybrid:
+            install_slots(self.addon)
+        self.hybrid_installed = {slot_name(i).encode() for i in range(1, 17)
+                                 if (self.addon.parent / slot_name(i) / 'Inbox.lua').is_file()}
+        self.hybrid_loads, self.hybrid_transform = [], lambda source: source
         self.t, self.agent = 1000.0, agent
         self.client = Client(self.addon, scale, rounding)
         self.native = NativeBridge(self.addon, clock=lambda: self.t)
@@ -107,8 +113,12 @@ class Sim:
     def boot(self, saved=None):
         """A UI load: fresh Lua state, same client process (font cache kept)."""
         self.lua = LuaRuntime(encoding=None, unpack_returned_tuples=True)
+        self.hybrid_loaded = set()
         bridge = self.lua.table_from({b'now': lambda: self.t, b'load': self.client.load,
-                                      b'measure': self.client.measure})
+                                      b'measure': self.client.measure,
+                                      b'addon_info': lambda name: name in self.hybrid_installed,
+                                      b'addon_loaded': lambda name: name in self.hybrid_loaded,
+                                      b'load_addon': self.load_addon})
         self.lua.execute((ROOT / 'tests' / 'wowstub.lua').read_bytes(), bridge)
         if saved is not None:
             self.lua.globals().AgentBridgeState = self.to_lua(saved)
@@ -119,6 +129,15 @@ class Sim:
         self.g.STUB.fire(b'ADDON_LOADED', b'AgentBridge')
         self.g.STUB.fire(b'PLAYER_ENTERING_WORLD')
         self.ns = self.g.AgentBridge
+
+    def load_addon(self, name):
+        if name not in self.hybrid_installed or name in self.hybrid_loaded:
+            return None
+        self.hybrid_loaded.add(name)
+        self.hybrid_loads.append(name)
+        source = (self.addon.parent / name.decode() / 'Inbox.lua').read_bytes()
+        self.lua.execute(self.hybrid_transform(source))
+        return 1
 
     def to_lua(self, value):
         if isinstance(value, dict):
@@ -182,6 +201,8 @@ class Sim:
 
     # Views -------------------------------------------------------------
     def body(self):
+        # Explicit document inspection, even when the real UI is hidden.
+        self.ns.RefreshTranscript(None, True)
         return bytes(self.ns.BodyText()).decode('utf-8')
 
     def last_reply(self):

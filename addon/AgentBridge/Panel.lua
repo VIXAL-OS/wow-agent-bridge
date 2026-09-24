@@ -117,6 +117,7 @@ function NS.BodyColumns()
 end
 
 local lines, shown, blocks, lastPrompt, liveLine = {}, 0, {}, nil, nil
+local lineState = {}
 local function line(i)
     if not lines[i] then
         local fs = body:CreateFontString(nil, 'ARTWORK')
@@ -136,11 +137,17 @@ local function layout(focus)
     local function add(text, mono)
         n = n + 1
         local fs = line(n)
-        if not (mono and monoCharWidth() and applyFont(fs, bodySize())) then fs:SetFontObject(ChatFontNormal) end
-        fs:SetTextColor(.95, .95, .95)
-        fs:SetWidth(width)
-        fs:ClearAllPoints(); fs:SetPoint('TOPLEFT', body, 'TOPLEFT', 0, -y)
-        fs:SetText(text ~= '' and text or ' ')
+        local previous = lineState[n] or {}
+        local size = bodySize()
+        if previous.mono ~= mono or previous.size ~= size then
+            if not (mono and monoCharWidth() and applyFont(fs, size)) then fs:SetFontObject(ChatFontNormal) end
+            fs:SetTextColor(.95, .95, .95)
+        end
+        if previous.width ~= width then fs:SetWidth(width) end
+        if previous.y ~= y then fs:ClearAllPoints(); fs:SetPoint('TOPLEFT', body, 'TOPLEFT', 0, -y) end
+        local value = text ~= '' and text or ' '
+        if fs:GetText() ~= value then fs:SetText(value) end
+        lineState[n] = {mono = mono, size = size, width = width, y = y}
         fs:Show()
         local height = fs.GetStringHeight and tonumber((fs:GetStringHeight()))
         y = y + math.max(height or 0, bodySize()) + 2
@@ -186,8 +193,10 @@ function NS.BodyText()
     return table.concat(out, '\n')
 end
 -- A new width changes how tables fit, so rebuild the rows, not just the layout.
+-- Wait until the next frame so anchored children have their new dimensions.
+local resizePending = false
 panel:SetScript('OnSizeChanged', function()
-    if NS.RefreshTranscript then NS.RefreshTranscript() else layout() end
+    resizePending = true
 end)
 
 -- Opening the panel lands on the newest line. The layout is redone first: a
@@ -200,6 +209,10 @@ function NS.ScrollToEnd()
     pin = 10
 end
 settle:SetScript('OnUpdate', function()
+    if resizePending then
+        resizePending = false
+        if NS.RefreshTranscript then NS.RefreshTranscript() else layout() end
+    end
     if pin <= 0 then return end
     pin = pin - 1
     scrollTo(scroll:GetVerticalScrollRange() or 0)
@@ -224,7 +237,7 @@ local send = button('Send', 84, 'LEFT', edit, 'RIGHT', 8, 0)
 local pause = button('Pause', 90, 'BOTTOMLEFT', 20, 18)
 local copy = button('Copy', 90, 'LEFT', pause, 'RIGHT', 6, 0)
 local test = button('Self-test', 90, 'LEFT', copy, 'RIGHT', 6, 0)
-local hide = button('Hide', 70, 'BOTTOMRIGHT', -34, 18)
+local hide = button('Hide', 70, 'BOTTOMRIGHT', -94, 18)
 NS.SendButton = send
 hide:SetScript('OnClick', function() panel:Hide() end)
 pause:SetScript('OnClick', function() if NS.IsReceiving() then NS.Pause() else NS.Resume() end end)
@@ -335,13 +348,40 @@ panel:HookScript('OnShow', function()
     NS.RefreshChats()
 end)
 
-local grip = CreateFrame('Button', nil, panel)
-Size(grip, 16, 16); grip:SetPoint('BOTTOMRIGHT', -10, 10)
+-- A visible, generous target instead of a tiny unlabelled corner.
+local grip = CreateFrame('Button', 'AgentBridgeResizeGrip', panel)
+Size(grip, 28, 28); grip:SetPoint('BOTTOMRIGHT', -8, 8)
+grip:EnableMouse(true); grip:RegisterForDrag('LeftButton')
 grip:SetNormalTexture('Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up')
 grip:SetHighlightTexture('Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight')
 grip:SetPushedTexture('Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down')
-grip:SetScript('OnMouseDown', function() panel:StartSizing('BOTTOMRIGHT') end)
-grip:SetScript('OnMouseUp', function() panel:StopMovingOrSizing(); savePanel() end)
+local resizeLabel = panel:CreateFontString(nil, 'OVERLAY', 'GameFontNormalSmall')
+resizeLabel:SetPoint('RIGHT', grip, 'LEFT', -4, 0); resizeLabel:SetText('Resize')
+local resizing = false
+local function stopResize()
+    if not resizing then return end
+    resizing = false
+    panel:StopMovingOrSizing()
+    savePanel()
+    resizePending = true
+end
+grip:SetScript('OnDragStart', function()
+    resizing = true
+    pin = 0
+    GameTooltip:Hide()
+    panel:StartSizing('BOTTOMRIGHT')
+end)
+grip:SetScript('OnDragStop', stopResize)
+grip:SetScript('OnMouseUp', function(_, which) if which == 'LeftButton' then stopResize() end end)
+panel:HookScript('OnHide', stopResize)
+grip:SetScript('OnEnter', function(self)
+    GameTooltip:SetOwner(self, 'ANCHOR_TOP')
+    GameTooltip:SetText('Resize Agent Bridge')
+    GameTooltip:AddLine('Drag this corner to change the width and height.', 1, 1, 1)
+    GameTooltip:AddLine('Your window size is saved automatically.', .7, .7, .7)
+    GameTooltip:Show()
+end)
+grip:SetScript('OnLeave', function() GameTooltip:Hide() end)
 
 function NS.Toggle()
     if panel:IsShown() then panel:Hide() else panel:Show() end

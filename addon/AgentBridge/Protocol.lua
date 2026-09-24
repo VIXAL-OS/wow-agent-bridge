@@ -33,9 +33,10 @@ end
 
 -- CPBN v3: which slot the addon loads next, how long until then, which reply
 -- fragment it needs, whether it is receiving, and for which request.
-function NS.EncodeControl(session, slot, remaining, part, active, request)
+function NS.EncodeControl(session, slot, remaining, part, active, request, hybrid)
     local data = U32(slot)..U32(remaining)..U16(part)..U16(active and 1 or 0)..U32(request)..U32(slot-1)
-    local body = 'CPBN'..string.char(3, #data, 0, 1)..session..U32(0)..data..string.rep(ZERO, 40-#data)
+    if hybrid and hybrid > 0 then data = data..U16(hybrid) end
+    local body = 'CPBN'..string.char(#data == 22 and 4 or 3, #data, 0, 1)..session..U32(0)..data..string.rep(ZERO, 40-#data)
     return body..Adler(body)
 end
 
@@ -45,7 +46,8 @@ local function uint(s, a, n)
     return result
 end
 
--- CFN2: 32-byte header, 988-byte padded payload, Adler-32.
+-- CFN2: 32-byte header, 4060-byte padded payload, Adler-32.
+-- State 7 is a 15-byte hybrid descriptor, only sent after v4 slot negotiation.
 function NS.ParseReply(data, session, request, slot)
     if #data ~= PACKET then return nil, 'Invalid reply packet' end
     if data == EMPTY then return nil, 'Empty reply slot' end
@@ -53,9 +55,10 @@ function NS.ParseReply(data, session, request, slot)
     if Adler(data:sub(1, PACKET-4)) ~= data:sub(PACKET-3) then return nil, 'Invalid reply checksum' end
     local state, length = data:byte(6), uint(data, 7, 2)
     local revision, part, total = uint(data, 25, 4), uint(data, 29, 2), uint(data, 31, 2)
-    if state > 6 or length > CHUNK or part < 1 or total < 1 or total > 127 or part > total then
+    if state > 7 or length > CHUNK or part < 1 or total < 1 or total > 127 or part > total then
         return nil, 'Invalid reply fields'
     end
+    if state == 7 and (part ~= 1 or total ~= 1 or length ~= 15) then return nil, 'Invalid hybrid packet' end
     if data:sub(9, 16) ~= session or uint(data, 17, 4) ~= request or uint(data, 21, 4) ~= slot then
         return nil, 'Stale reply packet'
     end

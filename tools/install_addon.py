@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from companion.native import ADDON_NAME, copy_mono_font, ensure_bank, make_font, selftest_data  # noqa: E402
+from companion.hybrid import install_slots  # noqa: E402
 from companion.wow import game_dir_for, game_processes, write_epoch  # noqa: E402
 
 SOURCE = ROOT / 'addon' / ADDON_NAME
@@ -37,6 +38,7 @@ def install(destination, progress=None, count=None, settings_path=ROOT / 'state'
             file.write(make_font(selftest_data(), 0))
     running = bool(game_processes(game_dir_for(destination)))
     report = ensure_bank(destination, **({'count': count} if count else {}), progress=progress, running=running)
+    report['hybrid_files_created'] = install_slots(destination)
     settings_path = Path(settings_path)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     try:

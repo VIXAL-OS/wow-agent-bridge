@@ -11,8 +11,8 @@ local FIRST_WINDOW, FRAGMENT_WINDOW, POLL_WINDOW, MAX_POLL = 3, 1.5, 2, 8
 local READ_TIMEOUT, WATCH_LIMIT = 15, 3600
 -- Measuring is spread over frames by time, not by a fixed count, so a fast
 -- machine finishes a packet sooner and a slow one never loses frame rate.
-local FRAME_BUDGET, MIN_PER_FRAME, MAX_PER_FRAME = 3, 32, 512
-local profile = type(debugprofilestart) == 'function' and type(debugprofilestop) == 'function'
+local FRAME_BUDGET, MIN_PER_FRAME, MAX_PER_FRAME = 1, 8, 256
+local profile = type(debugprofilestop) == 'function'
 local SELFTEST = NS.PATH..'selftest.ttf'
 local TEST_SIZES = {64, 96, 128, 48, 32}
 
@@ -123,7 +123,7 @@ local function stepTest(now)
     if not size then finishTest(); return end
     if not test.ready then
         if now < test.nextTry then return end
-        local ok, why = assign(tester, SELFTEST, size)
+        local ok, why = NS.Profile('font-load', assign, tester, SELFTEST, size)
         test.tries = test.tries + 1
         if not ok then
             test.nextTry = now + .5
@@ -135,9 +135,9 @@ local function stepTest(now)
         end
         test.ready, test.measured, test.i = true, {}, 0
     end
-    if profile then debugprofilestart() end
+    local started = profile and debugprofilestop()
     for measured = 1, MAX_PER_FRAME do
-        if measured > MIN_PER_FRAME and profile and debugprofilestop() > FRAME_BUDGET then return end
+        if measured > MIN_PER_FRAME and profile and debugprofilestop() - started > FRAME_BUDGET then return end
         test.measured[test.i] = width(tester, GLYPH[test.i])
         test.i = test.i + 1
         if test.i == GLYPHS then
@@ -208,7 +208,7 @@ function NS.ControlFrame()
         remaining = math.max(0, math.min(30000, math.floor((job.due - GetTime())*1000)))
     end
     return NS.EncodeControl(session or NS.session, math.min(slot, SIZE + 1), remaining,
-        job and job.assembly.nextPart or 1, job ~= nil and slot <= SIZE, job and job.request or 0)
+        job and job.assembly.nextPart or 1, job ~= nil and slot <= SIZE, job and job.request or 0, NS.HybridSlot())
 end
 function NS.ReceiverInfo()
     local count = 0
@@ -296,7 +296,7 @@ local function stepReceiver(now)
     if not reading.ready then
         if now < reading.nextTry then return end
         reading.nextTry = now + 1
-        local ok, why = assign(meter, NS.SlotPath(slot), calib.size)
+        local ok, why = NS.Profile('font-load', assign, meter, NS.SlotPath(slot), calib.size)
         reading.reason = why
         if not ok then return end
         local low, high = width(meter, '!'), width(meter, '"')
@@ -309,9 +309,9 @@ local function stepReceiver(now)
         end
         reading.ready = true
     end
-    if profile then debugprofilestart() end
+    local started = profile and debugprofilestop()
     for measured = 1, MAX_PER_FRAME do
-        if measured > MIN_PER_FRAME and profile and debugprofilestop() > FRAME_BUDGET then return end
+        if measured > MIN_PER_FRAME and profile and debugprofilestop() - started > FRAME_BUDGET then return end
         local v = lookup(calib, width(meter, GLYPH[reading.index]))
         if not v then finish(job, 'Font byte measurement'); return end
         if reading.index % 2 == 0 then
@@ -331,6 +331,17 @@ local function stepReceiver(now)
         if reading.index == GLYPHS then
             local packet, why = NS.ParseReply(table.concat(reading.bytes), session, job.request, slot)
             if not packet then finish(job, why); return end
+            if packet.state == 7 then
+                local text, state = NS.Profile('hybrid-load', NS.LoadHybrid, packet.text, session, job.request)
+                if not text then
+                    job.assembly, job.lastRevision = NS.NewAssembly(), nil
+                    finish(job, 'Stale reply packet')
+                    NS.SetStatus('Long-reply slot unavailable; continuing through fonts.')
+                else
+                    finish(job, nil, text, state, true)
+                end
+                return
+            end
             local text, state, complete = NS.AcceptFragment(job.assembly, packet)
             if text == nil then finish(job, state); return end
             finish(job, nil, text, state, complete)
@@ -347,9 +358,9 @@ driver:SetScript('OnEvent', function(self)
 end)
 driver:SetScript('OnUpdate', function()
     local now = GetTime()
-    if test then stepTest(now) end
+    if test then NS.Profile('self-test-step', stepTest, now) end
     if paused or not next(jobs) or not session or not NS.S then return end
-    if calib then stepReceiver(now)
+    if calib then NS.Profile('receive-step (includes font/hybrid load)', stepReceiver, now)
     elseif not test and NS.selfTest and not NS.selfTest.ok then
         NS.Pause()
         NS.SetStatus('Font self-test failed, so replies cannot be decoded here. Type /ab test for details.')

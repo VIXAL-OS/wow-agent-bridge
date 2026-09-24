@@ -253,7 +253,7 @@ local function noteFor(item)
 end
 
 -- Redraw the chat you are reading: finished exchanges, then those under way.
-function NS.RefreshTranscript(focus)
+local function refreshTranscript(focus)
     if not NS.S then return end
     local chat, columns, blocks = NS.S.chat, NS.BodyColumns(), {}
     for _, exchange in ipairs(history()) do
@@ -264,6 +264,12 @@ function NS.RefreshTranscript(focus)
     end
     if #blocks == 0 then blocks[1] = {rows = {}, note = '(new conversation)'} end
     NS.RenderTranscript(blocks, focus)
+end
+function NS.RefreshTranscript(focus, force)
+    -- Rebuild from current history on OnShow, rather than laying out a hidden
+    -- document on every incoming fragment.
+    if not force and not panel:IsShown() then return end
+    NS.Profile('transcript', refreshTranscript, focus)
 end
 local function refreshChats() if NS.RefreshChats then NS.RefreshChats() end end
 
@@ -318,6 +324,7 @@ function NS.ShowReply(request, text, state, complete)
         refreshChats()
         return
     end
+    if item.text == text and item.state == state then return end
     item.text, item.state = text, state
     if state >= 3 then
         local _, missing, _, rows = NS.RenderReply(text)

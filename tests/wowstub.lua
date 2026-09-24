@@ -114,6 +114,11 @@ UISpecialFrames = {}
 tinsert = table.insert
 SlashCmdList = {}
 function GetTime() return py.now() end
+function GetAddOnInfo(name)
+    if py.addon_info(name) then return name, name, '', true, true end
+end
+function IsAddOnLoaded(name) return py.addon_loaded(name) end
+function LoadAddOn(name) return py.load_addon(name) end
 function time() return 1758000000 + math.floor(py.now()) end
 function GetCVar(name) if name == 'gxResolution' then return '1920x1080' end end
 function GetItemInfo() return nil end
