@@ -33,7 +33,7 @@ The integrated hybrid keeps readiness checks, progress and short replies on font
 
 Only one fixed Lua assignment is generated: `AgentBridgeHybridData = "<lowercase hex>"`. The writer validates the entire source template immediately before publication. Reply text never enters Lua source directly. The receiver clears the global before and after loading, decodes hex, and checks the session, request, slot, final state, exact length and checksum against the font descriptor before displaying anything. The payload limit remains 60,000 bytes including metadata. There is no `loadstring` or reply-driven function call. This protects against reply text becoming code; it is not a sandbox for someone who can independently replace local addon files.
 
-The 16 slots appear as `AgentBridgeReply01` through `AgentBridgeReply16` in AddOns. Run the updated installer and fully exit/relaunch WoW once so it discovers these new folders; restart the companion to load the updated publisher too. Until the slots are discovered, normal font replies continue working. Subsequent code updates only need `/reload`; font paths still cannot be reused until a full game restart.
+The 16 slots appear as `AgentBridgeReply01` through `AgentBridgeReply16` in AddOns. Run the updated installer and fully exit/relaunch WoW once so it discovers these new folders; restart the companion to load the updated publisher too. Until the slots are discovered, normal font replies continue working. Subsequent edits to existing code files only need `/reload`; new filenames require a full client restart; font paths still cannot be reused until a full game restart.
 
 **Performance.** Published fonts now map the 8,192 data codepoints onto 16 shared glyph shapes with exactly the same widths and outlines as before. This reduces file size and glyph loading work without changing the font protocol or rebuilding the installed bank. Existing cached fonts and the self-test remain valid. Glyph measurement uses a 1 ms frame budget (up to 256 measurements when the profiling clock is unavailable). The strip repaints only changed bits, and the transcript defers layout while hidden and reuses unchanged line properties.
 
@@ -77,7 +77,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m tools.install_addon 'E:\Games\ChromieCraft_3.3.5a\Interface\AddOns\AgentBridge'
 ```
 
-The installer copies the Lua, creates `selftest.ttf` and `Epoch.lua`, and builds the bank (about 3 minutes, resumable). It records the addon path for the companion. Rerunning it never overwrites existing slots. After the first install, **restart WoW** so the client lists the addon. After later updates, `/reload` is enough.
+The installer copies the Lua, creates `selftest.ttf` and `Epoch.lua`, and builds the bank (about 3 minutes, resumable). It records the addon path for the companion. Rerunning it never overwrites existing slots. After the first install, **restart WoW** so the client lists the addon. For updates to existing Lua files, `/reload` is enough. If an update adds new filenames, fully restart the 3.3.5a client so it discovers them.
 
 If the font format ever changes, the installer rebuilds the bank — but only while WoW is closed, because the client keeps serving any font it has already loaded until it restarts. `python -m tools.reset_bank '<addon path>'` forces that rebuild on demand.
 
@@ -135,7 +135,9 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Switch chats | Click one in the list, or `/ab chat <number or name>`; `/ab chats` lists them |
 | Rename or delete a chat | Right-click it in the list, or `/ab rename <name>` and `/ab delete` |
 | Choose a chat's agent or model | Right-click it in the list, or `/ab agent claude\|codex` and `/ab model <name>\|default`; with no name, they show the current choice |
-| Copy a reply out of the game | **Copy** or `/ab copy` (last reply), `/ab copy all` (whole chat); then Ctrl+C |
+| Copy text inside the panel | **Select text**, then drag to highlight a passage and press Ctrl+C. **Last reply** / **Whole chat** choose the scope; **Done** or Escape returns to the formatted view. `/ab copy` and `/ab copy all` also open this view |
+| Open a web source | Click its blue row under **Sources**. The running companion opens it in your default browser; hover to see the full URL |
+| Inspect an item or spell in a reply | Hover its coloured link for the tooltip; click to open its detail popup. With the prompt box focused, Shift-click inserts the link into your prompt |
 | Replies in the chat frame | `/ab echo short` (default, 800 characters), `full`, `off`, or a number |
 | Game context | `/ab context on` (default), `off`, or `show` to see exactly what is sent |
 | Continue an existing chat | In the companion: **Continue a conversation…**, pick one, then send from the game |
@@ -157,24 +159,29 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 
 Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes the game state to Claude Code as part of the system prompt, and to Codex ahead of your message, marked as data about your character rather than instructions. Only your own character's state is read, and only when you send.
 
-Replies render as plain text. `[Name](item:ID)` references become item links; everything else is escaped. Nothing in a reply can run as code or perform a game action.
+Replies render as plain text. `[Name](item:ID)` references become item links; the same notation with `spell:ID` produces spell links. Markdown web links and bare HTTP/HTTPS URLs also appear as clickable source rows below the reply, up to 32 distinct sources. The full destination appears on hover. Clicking sends a separate browser request to the companion and uses no agent tokens. The status line reports the browser result; if the companion does not acknowledge within 45 seconds, start it and click again. Repeated captures of one click do not open duplicate tabs, including after a companion restart. Only HTTP/HTTPS URLs without embedded credentials are accepted.
+
+**Select text** shows a selectable snapshot inside the panel, including any reply still streaming. New text does not disturb your selection. The snapshot preserves the original reply and source URLs; typing into it does not edit the chat. Close and reopen it to include newer text.
+
+Reply text is escaped and cannot run as code or perform a game action. A web source opens only after a user clicks its source row.
 
 ## What has been verified, and what has not
 
-**Verified in the live client** (ChromieCraft, 3.3.5a, 1920×1080 windowed, 2026-09-22 and 23):
+**Verified in the live client** (ChromieCraft, 3.3.5a, 1920×1080 windowed, 2026-09-22 through 24):
 
 - **The whole round trip.** Real Claude Code replies were sent from the game, answered, and delivered back into the panel. That proves the channel's central assumption: a pre-created font file loads fresh from disk on its first use.
 - **The font self-test** passes at every size, with byte values ~4 px apart and 0 of 2,032 check glyphs misread. The original byte-per-glyph encoding failed here — sizes 128, 192 and 256 returned identical widths — which is how the capped em was found.
 - **Reading the strip at 20% opacity** over the game scene, and **through the window** while WoW was covered by another app.
 - **Latency:** Claude answered in ~4 s, and the reply was in the panel ~10 s after the companion picked the prompt up.
 - **The scrolling reply panel and web search**, in real WoW questions answered through the game.
+- **Source links opening the default browser, reply rendering after reload, and item/spell link interaction**, confirmed by the user on 2026-09-24.
 
 **Not yet exercised live** (covered by simulation and unit tests only):
 
-- Parallel chats and the chat list, per-chat agents and models, the game context, linked tooltips, the progress line, `/ai`, the copy box and chat-frame echo, all added after the last live session.
+- Parallel chats and the chat list, per-chat agents and models, the game context, linked tooltips, the progress line, `/ai`, the copy box and chat-frame echo.
 - The multi-prompt transcript, beyond the scroll-on-open fix.
 - Replies longer than one 4,060-byte packet, and streaming previews.
-- Aligned tables in the fixed-width font, and item-link tooltips. The panel is now a plain frame, and 3.3.5a may not send hover events there; if not, item links show as coloured names without tooltips.
+- Aligned tables in the fixed-width font.
 - Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
 
 In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
@@ -201,6 +208,9 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - hybrid slot reuse after reload, exhaustion and concurrent-chat isolation
 - compact-font widths, fixed source validation and locked-file recovery
 - hidden transcript deferral, incremental strip painting and performance reporting
+- explicit browser-click delivery and acknowledgement, duplicate suppression, URL validation and offline timeout
+- selectable transcript snapshots, streaming selection stability and clickable source rows
+- native item/spell hyperlink events, Shift-click insertion, uncached items and link-row resizing
 
 Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.
 

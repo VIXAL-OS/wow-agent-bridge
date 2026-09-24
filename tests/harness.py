@@ -8,6 +8,8 @@ from io import BytesIO
 import os
 from pathlib import Path
 import shutil
+import sqlite3
+import weakref
 
 from fontTools.ttLib import TTFont
 from lupa.lua51 import LuaRuntime
@@ -16,6 +18,8 @@ from companion.native import BANK_FORMAT, NativeBridge, copy_mono_font, make_fon
 from companion.protocol import Assembler, BANK_SIZE, frame_kind, parse_control, parse_envelope
 from companion.wow import write_epoch
 from companion.hybrid import install_slots, slot_name
+from companion.browser import BrowserRequests
+from companion.protocol import parse_url_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'addon' / 'AgentBridge'
@@ -98,12 +102,20 @@ class Sim:
 
     def __init__(self, game, agent, saved=None, scale=1080 / 768, rounding=True, slots=96, hybrid=False):
         self.addon = install_small(game, slots)
+        # Loose filenames are indexed at process startup in the 3.3.5 client.
+        # Reloads reread existing files but may not discover newly added ones.
+        self.known_files = {path.name for path in self.addon.iterdir() if path.is_file()}
+        self.load_errors = []
         if hybrid:
             install_slots(self.addon)
         self.hybrid_installed = {slot_name(i).encode() for i in range(1, 17)
                                  if (self.addon.parent / slot_name(i) / 'Inbox.lua').is_file()}
         self.hybrid_loads, self.hybrid_transform = [], lambda source: source
         self.t, self.agent = 1000.0, agent
+        self.opened_urls = []
+        self.browser = BrowserRequests(sqlite3.connect(':memory:'), opener=self.open_url)
+        self._close_browser = weakref.finalize(self, self.browser.db.close)
+        self.url_assembler = Assembler(clock=lambda: self.t, parser=parse_url_frame)
         self.client = Client(self.addon, scale, rounding)
         self.native = NativeBridge(self.addon, clock=lambda: self.t)
         self.assembler = Assembler(clock=lambda: self.t)
@@ -124,6 +136,9 @@ class Sim:
             self.lua.globals().AgentBridgeState = self.to_lua(saved)
         toc = (self.addon / 'AgentBridge.toc').read_text().splitlines()
         for name in [line.strip() for line in toc if line.strip() and not line.startswith('#')]:
+            if name not in self.known_files:
+                self.load_errors.append(name)
+                continue
             self.lua.execute((self.addon / name).read_bytes())
         self.g = self.lua.globals()
         self.g.STUB.fire(b'ADDON_LOADED', b'AgentBridge')
@@ -160,7 +175,14 @@ class Sim:
         box.text = text.encode()
         box.scripts[b'OnEnterPressed'](box)
 
+    def open_url(self, url):
+        self.opened_urls.append(url)
+        return True
+
     def snapshot(self, key):
+        browser = self.browser.get(key)
+        if browser:
+            return browser
         job = self.jobs.get(key)
         if not job:
             return {'id': key, 'state': 'waiting', 'reply': ''}
@@ -179,6 +201,10 @@ class Sim:
         if frame_kind(data) == 'control':
             if self.native.accept(parse_control(data), self.snapshot(parse_control(data).key)):
                 self.writes += 1
+        elif frame_kind(data) == 'browser':
+            result = self.url_assembler.accept(data)
+            if result:
+                self.browser.accept(*result)
         elif frame_kind(data) == 'prompt':
             result = self.assembler.accept(data)
             if result and result[0] not in self.jobs:

@@ -27,7 +27,12 @@ local function new(kind, name, parent)
     allFrames[#allFrames+1] = o
     return o
 end
-function Object:SetScript(event, fn) self.scripts[event] = fn end
+function Object:SetScript(event, fn)
+    if event:match('^OnHyperlink') and self.kind == 'Frame' then
+        error('Plain Frame does not support hyperlink scripts in 3.3.5')
+    end
+    self.scripts[event] = fn
+end
 function Object:GetScript(event) return self.scripts[event] end
 function Object:HookScript(event, fn)
     local old = self.scripts[event]
@@ -46,6 +51,11 @@ function Object:GetHeight() return self.height or 400 end
 function Object:SetWidth(w) self.width = w end
 function Object:SetHeight(h) self.height = h end
 function Object:GetPoint() return 'CENTER', nil, 'CENTER', 0, 0 end
+function Object:GetFrameLevel() return 1 end
+function Object:GetHighlightTexture()
+    if not rawget(self, 'highlight') then self.highlight = new('Texture') end
+    return self.highlight
+end
 function Object:GetEffectiveScale() return 1 end
 function Object:GetCenter() return 0, 0 end
 -- ScrollingMessageFrame
@@ -121,7 +131,12 @@ function IsAddOnLoaded(name) return py.addon_loaded(name) end
 function LoadAddOn(name) return py.load_addon(name) end
 function time() return 1758000000 + math.floor(py.now()) end
 function GetCVar(name) if name == 'gxResolution' then return '1920x1080' end end
-function GetItemInfo() return nil end
+STUB.items, STUB.spells, STUB.itemRefs = {}, {}, {}
+function GetItemInfo(data)
+    local info = STUB.items[data]
+    if info then return unpack(info) end
+end
+function GetSpellInfo(id) return STUB.spells[id] end
 function GetCursorInfo() return nil end
 function IsShiftKeyDown() return false end
 function IsModifiedClick() return false end
@@ -129,7 +144,7 @@ function GetCursorPosition() return 0, 0 end
 function PlaySound(s) STUB.sounds[#STUB.sounds+1] = s end
 function hooksecurefunc() end
 function ClearCursor() end
-function SetItemRef() end
+function SetItemRef(data, link, button) STUB.itemRefs[#STUB.itemRefs+1] = {data, link, button} end
 ChatEdit_InsertLink = function() return false end
 OpenStackSplitFrame = function() end
 
@@ -139,6 +154,7 @@ STUB.tooltips = {}
 function Object:ClearLines() rawset(self, 'count', 0) end
 function Object:NumLines() return rawget(self, 'count') or 0 end
 function Object:SetHyperlink(data)
+    self.lastHyperlink = data
     local lines = STUB.tooltips[data]
     if not lines then error('Unknown link type') end
     for i, text in ipairs(lines) do

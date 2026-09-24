@@ -5,6 +5,7 @@ WoW -> companion: 64-byte frames drawn as a 128 x 8 cell strip. Each bit is a
 two. Reading a difference rather than an absolute level means the strip stays
 readable at any opacity, so it can be drawn semi-transparently over the UI.
   CPB1  prompt fragment   20-byte header + 40-byte padded chunk + Adler-32
+  CPBU  clicked web URL   same framing, separate parser/handler, max 2,048 bytes
   CPBN  receive control   20-byte header + 20-byte control + padding + Adler-32
 Companion -> WoW: 4096-byte packets carried by font glyph advance widths.
   CFN2  reply fragment    32-byte header + 4060-byte padded chunk + Adler-32
@@ -43,6 +44,16 @@ def adler(data):
 
 
 def encode_prompt(text, session=b'12345678', request=1):
+    return _encode_message(text, session, request, b'CPB1')
+
+
+def encode_url(url, session=b'12345678', request=1):
+    from .browser import validate_url
+    validate_url(url)
+    return _encode_message(url, session, request, b'CPBU')
+
+
+def _encode_message(text, session, request, magic):
     data = text.encode('utf-8')
     if not 1 <= len(data) <= MAX_PROMPT:
         raise ValueError(f'Prompt must contain 1..{MAX_PROMPT} UTF-8 bytes')
@@ -50,7 +61,7 @@ def encode_prompt(text, session=b'12345678', request=1):
     frames = []
     for part in range(total):
         chunk = data[part * PROMPT_CHUNK:(part + 1) * PROMPT_CHUNK]
-        body = FRAME_HEADER.pack(b'CPB1', 1, len(chunk), part, total, session, request)
+        body = FRAME_HEADER.pack(magic, 1, len(chunk), part, total, session, request)
         body += chunk.ljust(PROMPT_CHUNK, b'\0')
         frames.append(body + adler(body))
     return frames
@@ -61,16 +72,23 @@ def _check_frame(frame):
         raise ValueError('Invalid frame length/checksum')
 
 
-def parse_prompt(frame):
+def parse_prompt(frame, expected_magic=b'CPB1', max_parts=PROMPT_PARTS):
     _check_frame(frame)
     magic, version, length, part, total, session, request = FRAME_HEADER.unpack(frame[:20])
-    if magic != b'CPB1' or version != 1 or not 1 <= total <= PROMPT_PARTS or not 0 <= part < total:
+    if magic != expected_magic or version != 1 or not 1 <= total <= max_parts or not 0 <= part < total:
         raise ValueError('Invalid prompt header')
     if not 1 <= length <= PROMPT_CHUNK or (part < total - 1 and length != PROMPT_CHUNK) or request == 0:
         raise ValueError('Invalid prompt payload')
     if any(frame[20 + length:60]):
         raise ValueError('Nonzero padding')
     return f'{session.hex()}:{request}', part, total, frame[20:20 + length]
+
+
+def parse_url_frame(frame):
+    key, part, total, chunk = parse_prompt(frame, b'CPBU', 52)
+    if part * PROMPT_CHUNK + len(chunk) > 2048:
+        raise ValueError('Source URL is too long')
+    return key, part, total, chunk
 
 
 @dataclass(frozen=True)
@@ -146,7 +164,7 @@ def parse_envelope(blob):
 
 
 def frame_kind(frame):
-    return {b'CPB1': 'prompt', b'CPBN': 'control'}.get(bytes(frame[:4]))
+    return {b'CPB1': 'prompt', b'CPBN': 'control', b'CPBU': 'browser'}.get(bytes(frame[:4]))
 
 
 def reply_meta(agent, model=''):
@@ -242,6 +260,8 @@ def decode_image(image):
         parse_control(frame)
     elif kind == 'prompt':
         parse_prompt(frame)
+    elif kind == 'browser':
+        parse_url_frame(frame)
     else:
         raise ValueError('Unknown frame')
     return frame
@@ -263,14 +283,15 @@ def render_frame(frame, cell=4, alpha=1.0, background=None):
 
 
 class Assembler:
-    """Collect prompt fragments; repeated optical frames are expected and harmless."""
+    """Collect typed fragments; repeated optical frames are expected and harmless."""
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, parser=parse_prompt):
+        self.parser = parser
         self.pending = {}
         self.clock = clock
 
     def accept(self, frame):
-        key, part, total, chunk = parse_prompt(frame)
+        key, part, total, chunk = self.parser(frame)
         now = self.clock()
         self.pending = {k: v for k, v in self.pending.items() if now - v[0] < 180}
         if key not in self.pending:

@@ -1,5 +1,102 @@
+-- Keep web helpers in an existing file: 3.3.5 may not discover new files on /reload.
+do
+-- Web sources are data until the user clicks a source button.
+local NS = AgentBridge
+local MAX_URL, MAX_SOURCES, BT = 2048, 32, string.char(96)
+
+function NS.ValidURL(url)
+    if type(url) ~= 'string' or #url > MAX_URL or url:find('[%c%s\\<>"|]') then return false end
+    local scheme, host = url:match('^(%a+)://([^/?#]+)')
+    return scheme ~= nil and (scheme:lower() == 'http' or scheme:lower() == 'https')
+        and host ~= '' and not host:find('@', 1, true)
+end
+
+-- Keep Markdown labels readable and collect sources once per reply.
+-- Balanced parentheses preserve URLs such as Wikipedia's Foo_(bar).
+function NS.WebReferences(text)
+    local sources, byURL = {}, {}
+    local function source(url, label)
+        if not NS.ValidURL(url) then return end
+        if byURL[url] then return byURL[url] end
+        if #sources >= MAX_SOURCES then return end
+        local index = #sources + 1
+        byURL[url] = index
+        sources[index] = {url = url, label = label or url}
+        return index
+    end
+    local function bare(part)
+        return (part:gsub('[hH][tT][tT][pP][sS]?://[^%s<>"'..BT..'|]+', function(url)
+            url = url:gsub('[%.,;!]+$', '')
+            for _, pair in ipairs({{'(', ')'}, {'[', ']'}, {'{', '}'}}) do
+                while url:sub(-1) == pair[2] do
+                    local _, opens = url:gsub('%'..pair[1], '')
+                    local _, closes = url:gsub('%'..pair[2], '')
+                    if closes <= opens then break end
+                    url = url:sub(1, -2)
+                end
+            end
+            source(url)
+            return nil  -- collect, but leave the original visible text untouched
+        end))
+    end
+    local function prose(part)
+        local out, cursor = {}, 1
+        while true do
+            local first, last, label, target = part:find('%[([^%[%]\r\n]+)%](%b())', cursor)
+            if not first then break end
+            out[#out+1] = bare(part:sub(cursor, first-1))
+            target = target:sub(2, -2)
+            local url = target:match('^<([^>]+)>') or target:match('^(%S+)')
+            local index = source(url, label)
+            out[#out+1] = index and (label..' ['..index..']') or part:sub(first, last)
+            cursor = last + 1
+        end
+        out[#out+1] = bare(part:sub(cursor))
+        return table.concat(out)
+    end
+    local out, fenced = {}, false
+    for line in (text..'\n'):gmatch('(.-)\r?\n') do
+        if line:match('^%s*'..BT..BT..BT) or line:match('^%s*~~~') then
+            fenced = not fenced
+            out[#out+1] = line
+        elseif fenced then
+            out[#out+1] = line
+        else
+            local parts, cursor = {}, 1
+            while true do
+                local first, last = line:find(BT..'[^'..BT..']*'..BT, cursor)
+                if not first then break end
+                parts[#parts+1] = prose(line:sub(cursor, first-1))
+                parts[#parts+1] = line:sub(first, last)
+                cursor = last + 1
+            end
+            parts[#parts+1] = prose(line:sub(cursor))
+            out[#out+1] = table.concat(parts)
+        end
+    end
+    return table.concat(out, '\n'), sources
+end
+
+local sending = false
+function NS.OpenURL(url)
+    if not NS.ValidURL(url) then NS.SetStatus('Only valid HTTP and HTTPS sources can be opened.'); return false end
+    if sending then NS.SetStatus('Still sending the previous source. Please wait a moment.'); return false end
+    local request = NS.NextRequest()
+    local ok = NS.BeginRequest(request, nil, function(text)
+        sending = false
+        NS.SetStatus(NS.Escape(text))
+    end, 45)
+    if not ok then return false end
+    sending = true
+    NS.QueuePrompt(request, NS.EncodeURL(url, NS.session, request))
+    NS.SetStatus('Sending source to your browser through the companion...')
+    return true
+end
+
+end
+
 -- Hyperlinks in both directions. Outgoing links become readable text with IDs;
--- only explicit [label](item:ID[:fields]) references in replies become links.
+-- explicit [label](item:ID[:fields]) and [label](spell:ID) references become links.
 -- Blizzard functions are only post-hooked, never replaced.
 local NS = AgentBridge
 local edit, panel, body = NS.Input, NS.Panel, NS.Body
@@ -114,52 +211,74 @@ local function query(id)
     retryUntil = GetTime() + 10
 end
 
--- Links only become interactive where the client dispatches hyperlink events
--- for this frame type; elsewhere they still show as coloured names.
-local function hook(script, handler) pcall(body.SetScript, body, script, handler) end
+local function spellID(data)
+    if type(data) ~= 'string' then return end
+    local digits = data:match('^spell:(%d+)$')
+    local id = digits and #digits <= 10 and tonumber(digits)
+    if id and id >= 1 and id <= 2147483647 then return id end
+end
+local function spellLink(data, id)
+    local name = GetSpellInfo(id)
+    if type(name) ~= 'string' or name == '' then return end
+    return '|cff71d5ff|H'..data..'|h['..NS.Escape(name:gsub('[%c%[%]]', ''))..']|h|r'
+end
 
 local STYLE = {heading = 'ffffd100', label = 'ff8dbdff', dim = 'ff909090', code = 'ffb7e4c7'}
 local links = 0
 
--- One line: escape everything, then turn validated item references into links.
+-- One line: escape everything, then turn validated item/spell references into links.
 local function renderInline(text)
-    local chunks, cursor, missing = {}, 1, false
+    local chunks, cursor, missing, interactive = {}, 1, false, false
     while links < MAX_LINKS do
-        local first, last, label, data = text:find('%[([^%[%]\r\n]+)%]%((item:[^%s%(%)]+)%)', cursor)
+        local first, last, label, data = text:find('%[([^%[%]\r\n]+)%]%((%a+:[^%s%(%)]+)%)', cursor)
         if not first then break end
         chunks[#chunks+1] = NS.Escape(text:sub(cursor, first-1))
-        local id = itemID(data)
-        local link = id and itemLink(data, id)
+        local id, spell = itemID(data), spellID(data)
+        local link = id and itemLink(data, id) or spell and spellLink(data, spell)
         if link then
-            allowed[data] = true; chunks[#chunks+1] = link
+            allowed[data] = link; chunks[#chunks+1] = link; interactive = true
         elseif id then
             chunks[#chunks+1] = NS.Escape(label)..' (item '..id..')'
             missing = true; query(id)
+        elseif spell then
+            chunks[#chunks+1] = NS.Escape(label)..' (spell '..spell..')'
         else
             chunks[#chunks+1] = NS.Escape(text:sub(first, last))
         end
         cursor, links = last + 1, links + 1
     end
     chunks[#chunks+1] = NS.Escape(text:sub(cursor))
-    return table.concat(chunks), missing
+    return table.concat(chunks), missing, interactive
 end
 
 -- Returns the joined markup, whether an item is still loading, whether any
 -- line needs the fixed-width font, and the rows for the panel. columns = 0
 -- lays tables out for a proportional font (the chat frame).
 function NS.RenderReply(text, columns)
-    local entries, mono = NS.FormatLines(text, columns or NS.BodyColumns())
+    local readable, sources = NS.WebReferences(text)
+    local entries, mono = NS.FormatLines(readable, columns or NS.BodyColumns())
     local out, rows, missing = {}, {}, false
     -- Links accumulate across the whole transcript, so older replies keep
     -- their tooltips; the per-reply cap still applies.
     links = 0
     for _, entry in ipairs(entries) do
-        local line, gap = renderInline(entry.text)
+        local line, gap, interactive = renderInline(entry.text)
         missing = missing or gap
         local color = entry.style and STYLE[entry.style]
         line = color and ('|c'..color..line..'|r') or line
         out[#out+1] = line
-        rows[#rows+1] = {text = line, mono = entry.mono}
+        rows[#rows+1] = {text = line, mono = entry.mono, interactive = interactive}
+    end
+    if #sources > 0 then
+        rows[#rows+1] = {text = ''}
+        rows[#rows+1] = {text = '|cff999999Sources - click to open in your browser:|r'}
+        for index, source in ipairs(sources) do
+            local host = source.url:match('^%a+://([^/?#]+)') or ''
+            local label = NS.Transliterate(source.label)
+            if #label > 120 then label = NS.TrimUTF8(label:sub(1, 117))..'...' end
+            rows[#rows+1] = {text = '|cff66bbff['..index..'] '..NS.Escape(label)
+                ..(source.label ~= source.url and (' ('..NS.Escape(host)..')') or '')..'|r', url = source.url}
+        end
     end
     return table.concat(out, '\n'), missing, mono, rows
 end
@@ -372,6 +491,10 @@ function NS.CopyText(all)
             out[#out+1] = 'You: '..(exchange.p or '')..'\n\n'..last
         end
     end
+    for _, item in ipairs(pending(NS.S.chat)) do
+        last = item.text or ''
+        out[#out+1] = 'You: '..(item.prompt or '')..'\n\n'..last
+    end
     if all then return table.concat(out, '\n\n----\n\n') end
     return last or ''
 end
@@ -403,14 +526,15 @@ poll:SetScript('OnUpdate', function(_, dt)
     end
 end)
 
-hook('OnHyperlinkEnter', function(self, data)
+function NS.EnterReplyLink(self, data)
     if not allowed[data] then return end
     GameTooltip:SetOwner(self, 'ANCHOR_CURSOR')
     if pcall(GameTooltip.SetHyperlink, GameTooltip, data) then GameTooltip:Show() else GameTooltip:Hide() end
-end)
-hook('OnHyperlinkLeave', function() GameTooltip:Hide() end)
-hook('OnHyperlinkClick', function(self, data, link, button)
-    if not allowed[data] then return end
-    if IsModifiedClick('CHATLINK') and edit:HasFocus() then NS.InsertLink(link); return end
-    SetItemRef(data, link, button)
-end)
+end
+function NS.LeaveReplyLink() GameTooltip:Hide() end
+function NS.ClickReplyLink(self, data, link, button)
+    local canonical = allowed[data]
+    if not canonical then return end
+    if IsModifiedClick('CHATLINK') and edit:HasFocus() then NS.InsertLink(canonical); return end
+    SetItemRef(data, canonical, button)
+end

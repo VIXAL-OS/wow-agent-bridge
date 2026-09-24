@@ -27,6 +27,7 @@ end
 function NS.SelectChat(id)
     local chat = NS.FindChat(id)
     if not chat then return false end
+    if NS.CloseCopy then NS.CloseCopy() end
     NS.S.chat, chat.unread = id, nil
     NS.RefreshTranscript()
     NS.ScrollToEnd()

@@ -1,7 +1,6 @@
 -- Sending prompts, completion alerts and slash commands.
 local NS = AgentBridge
 local edit = NS.Input
-local sequence = 0
 
 -- Send a prompt to the chat you are reading. The companion gets an envelope:
 -- which chat it belongs to, its name, the agent and model if you chose them for
@@ -27,7 +26,7 @@ function NS.Send(raw)
     if #text > NS.MAX_PROMPT then
         return false, 'Message plus link details is too long ('..#text..'/'..NS.MAX_PROMPT..' bytes). Shorten it.'
     end
-    sequence = sequence + 1
+    local sequence = NS.NextRequest()
     NS.QueuePrompt(sequence, NS.EncodePrompt(text, NS.session, sequence))
     NS.BeginRequest(sequence, chat.id)
     NS.SetBadge(nil)

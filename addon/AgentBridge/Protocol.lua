@@ -19,16 +19,24 @@ function NS.Envelope(fields, body)
 end
 
 -- CPB1: prompt fragments of 40 bytes, at most 200 per prompt.
-function NS.EncodePrompt(text, session, request)
+local function encodeMessage(text, session, request, magic)
     assert(#text > 0 and #text <= NS.MAX_PROMPT and #session == 8)
     local frames, total = {}, math.ceil(#text/40)
     for part = 0, total-1 do
         local chunk = text:sub(part*40+1, part*40+40)
-        local body = 'CPB1'..string.char(1, #chunk, part, total)..session..U32(request)
+        local body = magic..string.char(1, #chunk, part, total)..session..U32(request)
             ..chunk..string.rep(ZERO, 40-#chunk)
         frames[#frames+1] = body..Adler(body)
     end
     return frames
+end
+
+function NS.EncodePrompt(text, session, request)
+    return encodeMessage(text, session, request, 'CPB1')
+end
+function NS.EncodeURL(url, session, request)
+    assert(NS.ValidURL(url))
+    return encodeMessage(url, session, request, 'CPBU')
 end
 
 -- CPBN v3: which slot the addon loads next, how long until then, which reply

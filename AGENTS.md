@@ -41,8 +41,11 @@ this repository. Editing docs alone does not authorize reinstalling anything.
    For Claude Code, auth problems show up as `is_error` results mentioning
    authentication; the user fixes them by running `claude` and `/login`. Never
    ask the user to paste tokens into chat.
-5. First install: the user fully restarts WoW so it lists the addon. After an
-   update, `/reload` is enough.
+5. First install: the user fully restarts WoW so it lists the addon. Edits to
+   existing Lua files need only `/reload`; new filenames require a full client
+   restart. For an update during play, keep required helpers in existing files.
+   The client can report "Error loading" for a newly added file even when it
+   exists on disk. Do not assume the test client discovers files on reload.
 
 ## Verify with the user
 

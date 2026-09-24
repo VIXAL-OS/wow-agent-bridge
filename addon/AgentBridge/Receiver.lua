@@ -186,13 +186,14 @@ function NS.Resume()
     for _, job in pairs(jobs) do job.failures, job.missed, job.due = 0, 0, now end
     NS.OnReceiveState(true); NS.SetStatus('Checking for replies...')
 end
-function NS.BeginRequest(sequence, chat)
+function NS.BeginRequest(sequence, chat, callback, timeout)
     if slot > SIZE then exhausted(); return end
     local now = GetTime()
     session, paused = NS.session, false
     jobs[sequence] = {request = sequence, chat = chat, assembly = NS.NewAssembly(), due = now + FIRST_WINDOW,
-        expires = now + WATCH_LIMIT, failures = 0, missed = 0, unchanged = 0}
+        expires = now + (timeout or WATCH_LIMIT), callback = callback, failures = 0, missed = 0, unchanged = 0}
     NS.OnReceiveState(true)
+    return true
 end
 -- Stop watching a request (its chat was deleted); the companion keeps the reply.
 function NS.ForgetRequest(sequence)
@@ -251,6 +252,16 @@ local function finish(job, reason, text, state, complete)
     job.failures, job.missed = 0, 0
     if not text then job.due = now + FRAGMENT_WINDOW; return end
     if state >= 1 then NS.AckPrompt(job.request) end
+    if job.callback then
+        if complete and state >= 4 then
+            jobs[job.request] = nil
+            if not next(jobs) then NS.OnReceiveState(false) end
+            job.callback(text, state)
+        else
+            job.due = now + POLL_WINDOW
+        end
+        return
+    end
     local assembly = job.assembly
     if state == 3 and not complete then
         -- While the agent is still writing, preview the first part only; the
@@ -277,7 +288,13 @@ local function stepReceiver(now)
     for request, job in pairs(jobs) do
         if now >= job.expires and not (reading and reading.job == job) then
             jobs[request] = nil
-            NS.ShowReply(request, 'Stopped checking after an hour. The reply is safe in the companion.', 6, true)
+            if job.callback then
+                NS.AckPrompt(request)
+                job.callback('No browser acknowledgement. Start the companion and click the source again.', 6)
+                if not next(jobs) then NS.OnReceiveState(false) end
+            else
+                NS.ShowReply(request, 'Stopped checking after an hour. The reply is safe in the companion.', 6, true)
+            end
         end
     end
     if not reading then

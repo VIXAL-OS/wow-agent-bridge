@@ -19,6 +19,12 @@ function NS.PixelsPerUnit()
     return (height or 768) / 768
 end
 
+local sequence = 0
+function NS.NextRequest()
+    sequence = sequence + 1
+    return sequence
+end
+
 function NS.U16(n) return string.char(math.floor(n/256)%256, n%256) end
 function NS.U32(n)
     return string.char(math.floor(n/16777216)%256, math.floor(n/65536)%256, math.floor(n/256)%256, n%256)

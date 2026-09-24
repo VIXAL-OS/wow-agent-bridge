@@ -19,11 +19,12 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
 from .agents import BACKENDS, GUIDANCE, AgentConfig, Job, run_agent
+from .browser import BrowserRequests
 from .capture import grab, grab_window
 from .launching import claude_models, codex_models, find_claude, find_codex
 from .native import NativeBridge, validate_addon
 from .notifications import ReplyBanner
-from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope
+from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope, parse_url_frame
 from .sessions import list_sessions
 from .wow import EpochKeeper, StripLocator, game_dir_for
 
@@ -250,6 +251,8 @@ class App:
         self.guidance.write_text(GUIDANCE, encoding='utf-8')
         self.inbox = Inbox(args.state / 'inbox.sqlite3')
         self.assembler = Assembler()
+        self.url_assembler = Assembler(parser=parse_url_frame)
+        self.browser = BrowserRequests(self.inbox.db)
         self.scheduler, self.context, self.events = Scheduler(), Context(self.inbox.path), queue.Queue()
         self.activity, self.names, self.capturing, self.closed = {}, {}, False, False
         # (session id, agent, branch): continues on the next prompt that agent answers.
@@ -533,6 +536,9 @@ class App:
 
     # ---- main loop ------------------------------------------------------
     def snapshot(self, key):
+        browser = self.browser.get(key)
+        if browser:
+            return browser
         row = self.inbox.get(key) or {'id': key, 'state': 'waiting', 'reply': ''}
         if row['state'] == 'working' and key in self.activity:
             row['reply'] = self.activity[key]
@@ -713,6 +719,15 @@ class App:
         self.capture_status.set(f'Strip at {where}, {how}; {self.frames} frames. {self.last_status or ""}')
         if frame_kind(frame) == 'control':
             self.publish(parse_control(frame))
+            return
+        if frame_kind(frame) == 'browser':
+            result = self.url_assembler.accept(frame)
+            if result:
+                key, url = result
+                previous = self.browser.get(key)
+                outcome = self.browser.accept(key, url)
+                if not previous:
+                    self.write(outcome['reply'])
             return
         result = self.assembler.accept(frame)
         # When full, the prompt is not taken: the addon repeats it until acknowledged.

@@ -53,7 +53,6 @@ local body = CreateFrame('Frame', 'AgentBridgeBody', scroll)
 NS.Body = body
 Size(body, 10, 10)
 scroll:SetScrollChild(body)
-if body.SetHyperlinksEnabled then body:SetHyperlinksEnabled(true) end
 local bar = _G.AgentBridgeScrollScrollBar
 
 local function bodySize()
@@ -117,7 +116,7 @@ function NS.BodyColumns()
 end
 
 local lines, shown, blocks, lastPrompt, liveLine = {}, 0, {}, nil, nil
-local lineState = {}
+local lineState, sourceButtons, linkRows = {}, {}, {}
 local function line(i)
     if not lines[i] then
         local fs = body:CreateFontString(nil, 'ARTWORK')
@@ -134,7 +133,7 @@ end
 local function layout(focus)
     local width, y, n, lastTop = textWidth(), 0, 0, 0
     Size(body, width, 10)
-    local function add(text, mono)
+    local function add(text, mono, url, interactive)
         n = n + 1
         local fs = line(n)
         local previous = lineState[n] or {}
@@ -150,7 +149,69 @@ local function layout(focus)
         lineState[n] = {mono = mono, size = size, width = width, y = y}
         fs:Show()
         local height = fs.GetStringHeight and tonumber((fs:GetStringHeight()))
-        y = y + math.max(height or 0, bodySize()) + 2
+        height = math.max(height or 0, bodySize())
+        -- Plain frames do not dispatch hyperlink events in 3.3.5. Give rows
+        -- with verified game links their own native chat widget; keep the
+        -- FontString for measurement and copying the full document.
+        local linked = linkRows[n]
+        if interactive then
+            local created = not linked
+            if created then
+                linked = CreateFrame('ScrollingMessageFrame', nil, body)
+                linked:SetFontObject(ChatFontNormal); linked:SetJustifyH('LEFT')
+                linked:SetFading(false); linked:SetMaxLines(128); linked:SetSpacing(0)
+                if linked.SetInsertMode then linked:SetInsertMode('TOP') end
+                if linked.SetNonSpaceWrap then linked:SetNonSpaceWrap(true) end
+                linked:EnableMouse(true); linked:EnableMouseWheel(true)
+                linked:SetScript('OnHyperlinkEnter', function(...) NS.EnterReplyLink(...) end)
+                linked:SetScript('OnHyperlinkLeave', function(...) NS.LeaveReplyLink(...) end)
+                linked:SetScript('OnHyperlinkClick', function(...) NS.ClickReplyLink(...) end)
+                linked:SetScript('OnHide', function() GameTooltip:Hide() end)
+                linked:SetScript('OnMouseWheel', function(_, delta)
+                    scroll:GetScript('OnMouseWheel')(scroll, delta)
+                end)
+                linkRows[n] = linked
+            end
+            local fontChanged = created or previous.mono ~= mono or previous.size ~= size
+            if fontChanged then
+                local font, fontSize, flags = fs:GetFont()
+                if font then linked:SetFont(font, fontSize, flags or '')
+                else linked:SetFontObject(ChatFontNormal) end
+            end
+            linked:ClearAllPoints(); linked:SetPoint('TOPLEFT', body, 'TOPLEFT', 0, -y)
+            Size(linked, width, height + 2)
+            if linked.value ~= value or previous.width ~= width or fontChanged then
+                linked:Clear(); linked:AddMessage(value, .95, .95, .95)
+                linked.value = value
+            end
+            fs:Hide(); linked:Show()
+        elseif linked then linked:Hide() end
+        local source = sourceButtons[n]
+        if url then
+            if not source then
+                source = CreateFrame('Button', nil, body)
+                source:RegisterForClicks('LeftButtonUp')
+                source:SetHighlightTexture('Interface\\Buttons\\WHITE8X8')
+                source:GetHighlightTexture():SetVertexColor(.3, .6, 1, .15)
+                source:SetScript('OnClick', function(self) NS.OpenURL(self.url) end)
+                source:SetScript('OnEnter', function(self)
+                    GameTooltip:SetOwner(self, 'ANCHOR_CURSOR')
+                    GameTooltip:SetText('Open in your default browser')
+                    GameTooltip:AddLine(NS.Escape(self.url), .6, .8, 1, true)
+                    GameTooltip:Show()
+                end)
+                source:SetScript('OnLeave', function() GameTooltip:Hide() end)
+                source:EnableMouseWheel(true)
+                source:SetScript('OnMouseWheel', function(_, delta)
+                    scroll:GetScript('OnMouseWheel')(scroll, delta)
+                end)
+                sourceButtons[n] = source
+            end
+            source.url = url
+            source:ClearAllPoints(); source:SetPoint('TOPLEFT', body, 'TOPLEFT', 0, -y)
+            Size(source, width, height); source:Show()
+        elseif source then source:Hide() end
+        y = y + height + 2
     end
     for index, block in ipairs(blocks) do
         if index > 1 then add(''); add('|cff505050'..string.rep('-', 48)..'|r'); add('') end
@@ -158,13 +219,17 @@ local function layout(focus)
         if block.prompt and block.prompt ~= '' then
             add('|cff88bbffYou:|r '..NS.Escape(block.prompt)); add('')
         end
-        for _, row in ipairs(block.rows or {}) do add(row.text, row.mono) end
+        for _, row in ipairs(block.rows or {}) do add(row.text, row.mono, row.url, row.interactive) end
         if block.note then add('|cff999999'..block.note..'|r') end
     end
     -- The note under a prompt still under way is updated in place each second.
     local last = blocks[#blocks]
     liveLine = last and last.live and last.note and lines[n] or nil
-    for i = n + 1, #lines do lines[i]:Hide() end
+    for i = n + 1, #lines do
+        lines[i]:Hide()
+        if sourceButtons[i] then sourceButtons[i]:Hide() end
+        if linkRows[i] then linkRows[i]:Hide() end
+    end
     shown = n
     body:SetHeight(math.max(1, y))
     if scroll.UpdateScrollChildRect then scroll:UpdateScrollChildRect() end
@@ -235,13 +300,13 @@ local function button(label, width, ...)
 end
 local send = button('Send', 84, 'LEFT', edit, 'RIGHT', 8, 0)
 local pause = button('Pause', 90, 'BOTTOMLEFT', 20, 18)
-local copy = button('Copy', 90, 'LEFT', pause, 'RIGHT', 6, 0)
+local copy = button('Select text', 90, 'LEFT', pause, 'RIGHT', 6, 0)
 local test = button('Self-test', 90, 'LEFT', copy, 'RIGHT', 6, 0)
 local hide = button('Hide', 70, 'BOTTOMRIGHT', -94, 18)
 NS.SendButton = send
 hide:SetScript('OnClick', function() panel:Hide() end)
 pause:SetScript('OnClick', function() if NS.IsReceiving() then NS.Pause() else NS.Resume() end end)
-copy:SetScript('OnClick', function() NS.ShowCopy(false) end)
+copy:SetScript('OnClick', function() NS.ShowCopy(true) end)
 test:SetScript('OnClick', function() NS.RunSelfTest(true) end)
 function NS.OnReceiveState(active) pause:SetText(active and 'Pause' or 'Resume') end
 
