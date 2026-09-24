@@ -148,6 +148,19 @@ class Transcript(unittest.TestCase):
         self.assertEqual(bytes(history[1].p), b'q5')
         self.assertEqual(bytes(history[40].r), b'a44')
 
+    def test_opening_the_panel_lands_on_the_newest_line(self):
+        for n in range(30):
+            self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))
+        panel, scroll = self.sim.g.AgentBridgePanel, self.sim.g.AgentBridgeScroll
+        scroll.SetVerticalScroll(scroll, 0)  # left at the top last time
+        panel.scripts[b'OnShow'](panel)
+        end = scroll.GetVerticalScrollRange(scroll)
+        self.assertGreater(end, 0)
+        self.assertEqual(scroll.GetVerticalScroll(scroll), end)
+        self.sim.run(0.1)  # and still there after the deferred second pass
+        self.assertEqual(scroll.GetVerticalScroll(scroll), end)
+        self.assertTrue(self.sim.body().rstrip().endswith('line 4'))
+
     def test_new_prompt_scrolls_to_itself_and_updates_keep_your_place(self):
         for n in range(30):
             self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))

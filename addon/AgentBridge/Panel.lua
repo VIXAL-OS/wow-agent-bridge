@@ -172,6 +172,25 @@ panel:SetScript('OnSizeChanged', function()
     if NS.RefreshTranscript then NS.RefreshTranscript() else layout() end
 end)
 
+-- Opening the panel lands on the newest line. The layout is redone first: a
+-- frame laid out while hidden may not have known its real width yet. The
+-- scroll is repeated on the next frame, once the scroll range has settled.
+local settle = CreateFrame('Frame', nil, panel)
+local toEnd = false
+function NS.ScrollToEnd()
+    scrollTo(scroll:GetVerticalScrollRange() or 0)
+    toEnd = true
+end
+settle:SetScript('OnUpdate', function()
+    if not toEnd then return end
+    toEnd = false
+    scrollTo(scroll:GetVerticalScrollRange() or 0)
+end)
+panel:HookScript('OnShow', function()
+    if NS.RefreshTranscript then NS.RefreshTranscript() end
+    NS.ScrollToEnd()
+end)
+
 local edit = CreateFrame('EditBox', 'AgentBridgeInput', panel, 'InputBoxTemplate')
 NS.Input = edit
 edit:SetPoint('BOTTOMLEFT', 28, 48); edit:SetPoint('BOTTOMRIGHT', -112, 48); edit:SetHeight(24)
