@@ -9,9 +9,9 @@ local ABSENT = {SetColorTexture = true, SetShown = true, SetSize = true, SetResi
 -- Plain data fields read back as nil when unset, like real widget state;
 -- only missing *methods* fall back to a no-op.
 local DATA = {font = true, size = true, color = true, file = true, focus = true, width = true, height = true,
-    child = true, vscroll = true}
+    child = true, vscroll = true, min = true, max = true, value = true, bar = true, lastRange = true}
 local allFrames = {}
-STUB = {frames = allFrames, events = {}, messages = {}, prints = {}, sounds = {}}
+STUB = {frames = allFrames, events = {}, messages = {}, prints = {}, sounds = {}, scrollframes = {}}
 
 local Object = {}
 Object.__index = function(self, key)
@@ -83,11 +83,29 @@ function Object:GetStringWidth()
     return py.measure(self.font, self.size, self.text)
 end
 
-function CreateFrame(kind, name, parent)
+function CreateFrame(kind, name, parent, template)
     local f = new(kind, name, parent)
     if kind == 'ScrollingMessageFrame' or kind == 'EditBox' then f.lines = {} end
+    if template == 'UIPanelScrollFrameTemplate' then
+        -- Like the real template: a slider named <name>ScrollBar whose limits
+        -- start at 0 and are only updated a frame later, after OnUpdate.
+        local bar = new('Slider', name..'ScrollBar', f)
+        bar.min, bar.max, bar.value = 0, 0, 0
+        f.bar, f.lastRange = bar, 0
+        STUB.scrollframes[#STUB.scrollframes+1] = f
+    end
     return f
 end
+-- Slider: SetValue clamps to the current limits and moves its scroll frame.
+function Object:SetMinMaxValues(low, high)
+    self.min, self.max = low, high
+    self.value = math.max(low, math.min(high, self.value or 0))
+end
+function Object:SetValue(value)
+    self.value = math.max(self.min or 0, math.min(self.max or 0, value))
+    self.parent:SetVerticalScroll(self.value)
+end
+function Object:GetValue() return self.value or 0 end
 UIParent, Minimap, WorldFrame = new('Frame', 'UIParent'), new('Frame', 'Minimap'), new('Frame', 'WorldFrame')
 DEFAULT_CHAT_FRAME = {AddMessage = function(_, text) STUB.prints[#STUB.prints+1] = text end}
 GameTooltip = new('GameTooltip', 'GameTooltip')
@@ -120,6 +138,18 @@ function STUB.update(dt)
     for _, f in ipairs(allFrames) do
         local fn = f.scripts.OnUpdate
         if fn and f.shown then fn(f, dt) end
+    end
+    -- After OnUpdate, as in the client: a changed scroll range resets the
+    -- slider's limits and re-applies its (clamped) value, which is what
+    -- ScrollFrame_OnScrollRangeChanged does in the real template.
+    for _, f in ipairs(STUB.scrollframes) do
+        local range = f:GetVerticalScrollRange()
+        if range ~= f.lastRange then
+            f.lastRange = range
+            local value = math.min(f.bar:GetValue(), range)
+            f.bar:SetMinMaxValues(0, range)
+            f.bar:SetValue(value)
+        end
     end
 end
 -- Read the strip back as a 64-byte string (nil while hidden). Each bit is a

@@ -59,13 +59,23 @@ local function bodySize()
     return ok and tonumber(size) or 12
 end
 -- Move through the slider when the template provides one, so it stays in step.
+-- The template only updates the slider's limits a frame after the content
+-- changes, and SetValue clamps to them: without setting them here first, a
+-- scroll to the end of a panel that was just opened lands at 0, the top.
+local pin = 0
 local function scrollTo(offset)
     local range = scroll:GetVerticalScrollRange() or 0
     offset = math.max(0, math.min(range, offset))
-    if bar and bar.SetValue then bar:SetValue(offset) else scroll:SetVerticalScroll(offset) end
+    if bar and bar.SetMinMaxValues then
+        bar:SetMinMaxValues(0, range)
+        bar:SetValue(offset)
+    else
+        scroll:SetVerticalScroll(offset)
+    end
 end
 scroll:EnableMouseWheel(true)
 scroll:SetScript('OnMouseWheel', function(self, delta)
+    pin = 0  -- you are scrolling; stop holding the view at the end
     local step = IsShiftKeyDown() and self:GetHeight() * .9 or (bodySize() + 2) * 3
     scrollTo((self:GetVerticalScroll() or 0) - delta * step)
 end)
@@ -173,17 +183,17 @@ panel:SetScript('OnSizeChanged', function()
 end)
 
 -- Opening the panel lands on the newest line. The layout is redone first: a
--- frame laid out while hidden may not have known its real width yet. The
--- scroll is repeated on the next frame, once the scroll range has settled.
+-- frame laid out while hidden may not have known its real width yet. The view
+-- is then held at the end for a few frames, in case the scroll range itself
+-- settles late; scrolling the wheel lets go at once.
 local settle = CreateFrame('Frame', nil, panel)
-local toEnd = false
 function NS.ScrollToEnd()
     scrollTo(scroll:GetVerticalScrollRange() or 0)
-    toEnd = true
+    pin = 10
 end
 settle:SetScript('OnUpdate', function()
-    if not toEnd then return end
-    toEnd = false
+    if pin <= 0 then return end
+    pin = pin - 1
     scrollTo(scroll:GetVerticalScrollRange() or 0)
 end)
 panel:HookScript('OnShow', function()
