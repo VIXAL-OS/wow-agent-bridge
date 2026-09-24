@@ -44,15 +44,70 @@ function NS.TrimUTF8(s)
     return s
 end
 
-local DEFAULTS = {nextSlot = 1, strip = 'TOP', sound = true, minimapAngle = 215}
+-- A chat's title when you have not named it: the start of its first message.
+function NS.ShortTitle(text)
+    local line = tostring(text or ''):gsub('%s+', ' '):gsub('^ ', '')
+    if #line <= 28 then return line end
+    return NS.TrimUTF8(line:sub(1, 26))..'...'
+end
+
+-- echo: characters of each reply copied into the chat frame (0 = off).
+local DEFAULTS = {nextSlot = 1, strip = 'TOP', sound = true, minimapAngle = 215, context = true, echo = 800}
 local listeners = {}
 function NS.OnLoad(fn) listeners[#listeners+1] = fn end
 
--- The session identifies one UI load (stale-packet protection); its first four
--- bytes are the conversation, which survives /reload until "New chat".
+-- The session identifies one UI load (stale-packet protection). Which chat a
+-- prompt belongs to travels in the prompt itself, so every chat shares it.
 function NS.NewSession()
-    NS.session = NS.U32(NS.S.conversation)..NS.U32(math.floor(GetTime()*1000) % 4294967296)
+    NS.session = NS.U32(time() % 4294967296)..NS.U32(math.floor(GetTime()*1000) % 4294967296)
     return NS.session
+end
+
+-- Chats, newest first: {id, name, auto (title from the first message), unread}.
+-- Earlier versions had one conversation number with the transcript tagged by
+-- it (and before that only the last reply); each conversation becomes a chat
+-- with the same number, so the companion carries on with the same session.
+local function migrate(S)
+    if type(S.history) ~= 'table' then
+        local last = S.last
+        S.history = {}
+        if type(last) == 'table' and type(last.reply) == 'string' then
+            S.history[1] = {c = tonumber(S.conversation), p = last.prompt, r = last.reply, s = last.state or 4}
+        end
+    end
+    S.last = nil
+    if type(S.chats) ~= 'table' then
+        local ids, seen = {}, {}
+        local function add(id)
+            id = tonumber(id)
+            if id and not seen[id] then seen[id] = true; ids[#ids+1] = id end
+        end
+        add(S.conversation)
+        for _, exchange in ipairs(S.history) do add(type(exchange) == 'table' and exchange.c) end
+        table.sort(ids, function(a, b) return a > b end)
+        S.chats = {}
+        for _, id in ipairs(ids) do S.chats[#S.chats+1] = {id = id} end
+        S.chat = tonumber(S.conversation)
+    end
+    S.conversation = nil
+    local chats, byID = {}, {}
+    for _, chat in ipairs(S.chats) do
+        local id = type(chat) == 'table' and tonumber(chat.id)
+        if id and not byID[id] then chat.id = id; chats[#chats+1] = chat; byID[id] = chat end
+    end
+    if #chats == 0 then chats[1] = {id = time()}; byID[chats[1].id] = chats[1] end
+    S.chats = chats
+    if not byID[tonumber(S.chat)] then S.chat = chats[1].id end
+    -- Drop exchanges whose chat is gone; title unnamed chats from their first message.
+    local kept = {}
+    for _, exchange in ipairs(S.history) do
+        local chat = type(exchange) == 'table' and byID[tonumber(exchange.c)]
+        if chat then
+            kept[#kept+1] = exchange
+            if not chat.name and not chat.auto and type(exchange.p) == 'string' then chat.auto = NS.ShortTitle(exchange.p) end
+        end
+    end
+    S.history = kept
 end
 
 local loader = CreateFrame('Frame')
@@ -74,7 +129,7 @@ loader:SetScript('OnEvent', function(self, _, name)
         S.epoch = epoch
         if S.nextSlot > 1 then NS.recycledFrom = S.nextSlot; S.nextSlot = 1 end
     end
-    S.conversation = tonumber(S.conversation) or time()
+    migrate(S)
     NS.S = S
     NS.NewSession()
     for _, fn in ipairs(listeners) do fn(S) end

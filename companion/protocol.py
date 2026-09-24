@@ -23,7 +23,7 @@ BITS = FRAME_SIZE * 8
 PAIRS_PER_ROW = COLS // 2
 MIN_CONTRAST = 10  # median pair difference of 255; below this there is no strip
 FRAME_HEADER = struct.Struct('>4sBBBB8sI')  # magic, version, length, part, total, session, request
-PROMPT_CHUNK, PROMPT_PARTS = 40, 32
+PROMPT_CHUNK, PROMPT_PARTS = 40, 200  # up to 8,000 bytes: text, links' tooltips, game context
 MAX_PROMPT = PROMPT_CHUNK * PROMPT_PARTS
 CONTROL = struct.Struct('>IIHHII')  # slot, remaining_ms, part, flags, request, loaded
 CONTROL_VERSION = 3
@@ -112,6 +112,29 @@ def parse_control(frame):
     if flags and (slot > BANK_SIZE or request == 0):
         raise ValueError('Invalid active control')
     return Control(session.hex(), slot, remaining, fragment, bool(flags), request, loaded)
+
+
+ENVELOPE = '\x01AB1\n'
+
+
+def parse_envelope(blob):
+    """Split a prompt into its header fields and the text to answer.
+
+    The addon sends `\\x01AB1\\n`, then key=value lines, then `\\x02` and the
+    body. Repeated keys collect in order (context arrives one line per `ctx=`).
+    A prompt without the header is all body, as older addons send it.
+    """
+    if not blob.startswith(ENVELOPE):
+        return {}, blob
+    head, marker, body = blob[len(ENVELOPE):].partition('\x02')
+    if not marker:
+        return {}, blob
+    fields = {}
+    for line in head.split('\n'):
+        key, equals, value = line.partition('=')
+        if equals and key:
+            fields.setdefault(key, []).append(value)
+    return fields, body.lstrip('\n')
 
 
 def frame_kind(frame):

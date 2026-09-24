@@ -36,7 +36,7 @@ end)
 -- Prompts repeat until the companion acknowledges them (any reply state past
 -- "waiting"), so a missed capture is recovered without resending by hand.
 local pending, frames, cursor = {}, {}, 1
-local lastSubmit, lastData, lastAlpha, elapsed, controlTurn = -1000, nil, nil, 0, false
+local lastSubmit, lastData, lastAlpha, elapsed, tick = -1000, nil, nil, 0, 0
 local function rebuild()
     frames, cursor = {}, 1
     for _, item in ipairs(pending) do
@@ -69,9 +69,12 @@ driver:SetScript('OnUpdate', function(_, dt)
         return
     end
     if not strip:IsShown() then strip:Show() end
-    controlTurn = not controlTurn
+    -- While a prompt is being sent, three of every four frames carry it: a long
+    -- prompt with tooltips and context gets through sooner, and the control
+    -- frame still comes round often enough to keep replies on schedule.
+    tick = tick + 1
     local data
-    if controlTurn or #frames == 0 then
+    if #frames == 0 or tick % 4 == 0 then
         data = NS.ControlFrame()
     else
         data = frames[cursor]; cursor = cursor % #frames + 1

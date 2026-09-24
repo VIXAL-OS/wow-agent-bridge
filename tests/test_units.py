@@ -32,8 +32,9 @@ class Protocol(unittest.TestCase):
         self.assertEqual(assembler.accept(frames[-1]), ('6162636465666768:7', text))
 
     def test_prompt_limits(self):
+        self.assertEqual(len(encode_prompt('x' * 8000)), 200)
         with self.assertRaises(ValueError):
-            encode_prompt('x' * 1281)
+            encode_prompt('x' * 8001)
         corrupted = bytearray(encode_prompt('hi')[0]); corrupted[25] ^= 1
         with self.assertRaises(ValueError):
             protocol.parse_prompt(bytes(corrupted))
@@ -463,3 +464,89 @@ class WebAndModels(unittest.TestCase):
                                                     {'slug': 'gpt-5.5', 'visibility': 'list'}]}), encoding='utf-8')
             self.assertEqual(codex_models(cache), ['gpt-6-astra', 'gpt-5.5'])
             self.assertEqual(codex_models(Path(tmp) / 'missing.json'), [])
+
+
+class ChatsAndContext(unittest.TestCase):
+    """Parallel chats in the companion, and the envelope that routes prompts to them."""
+
+    def test_envelope_built_in_lua_parses_in_python(self):
+        lua = LuaRuntime(encoding=None, unpack_returned_tuples=True)
+        lua.execute(b'AgentBridge = {}; CreateFrame = function() return setmetatable({}, {__index = function() return function() end end}) end')
+        for name in ('Core.lua', 'Protocol.lua'):
+            lua.execute((ROOT / 'addon' / 'AgentBridge' / name).read_bytes())
+        fields = lua.eval('{{"chat", 1758000123}, {"name", "Raid\\nprep"}, {"ctx", "Location: Dalaran"}, {"ctx", "Money: 5g"}}')
+        blob = bytes(lua.globals().AgentBridge.Envelope(fields, 'What next?\n\2 stays in the body'.encode())).decode()
+        head, body = protocol.parse_envelope(blob)
+        self.assertEqual(head, {'chat': ['1758000123'], 'name': ['Raid prep'],
+                                'ctx': ['Location: Dalaran', 'Money: 5g']})
+        self.assertEqual(body, 'What next?\n\2 stays in the body')
+        self.assertEqual(protocol.parse_envelope('plain prompt from an older addon'),
+                         ({}, 'plain prompt from an older addon'))
+
+    def test_chat_ids(self):
+        from companion.app import chat_of
+        self.assertEqual(chat_of('68c0b8d0aabbccdd:3', {'chat': ['1758000123']}), f'{1758000123:08x}')
+        # Older addons: the conversation number starts the session.
+        self.assertEqual(chat_of('68c0b8d0aabbccdd:3', {}), '68c0b8d0')
+        self.assertEqual(chat_of('68c0b8d0aabbccdd:3', {'chat': ['../etc']}), '68c0b8d0')
+
+    def test_scheduler_runs_chats_side_by_side_but_each_in_order(self):
+        from companion.app import Request, Scheduler
+        s = Scheduler()
+        for key, chat in (('a1', 'A'), ('a2', 'A'), ('b1', 'B'), ('c1', 'C')):
+            self.assertTrue(s.put(Request(key, 'p', chat)))
+        self.assertEqual([s.take().key for _ in range(3)], ['a1', 'b1', 'c1'])
+        self.assertEqual(s.describe('a2'), 'Queued behind the previous prompt in this chat.')
+        s.done('a1')
+        self.assertEqual(s.take().key, 'a2')
+        self.assertEqual(s.open(), 3)
+
+    def test_inbox_from_before_chats_keeps_each_conversation(self):
+        import sqlite3
+        from companion.app import Context, Inbox, Request
+        from companion.agents import Result
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'inbox.sqlite3'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE jobs (id TEXT PRIMARY KEY, prompt TEXT, state TEXT, reply TEXT, '
+                       'backend TEXT, agent_session TEXT, created REAL)')
+            db.execute("INSERT INTO jobs VALUES ('68c0b8d0aaaaaaaa:1', 'old q', 'done', 'old a', 'claude', 'S1', 1)")
+            db.execute("INSERT INTO jobs VALUES ('11111111bbbbbbbb:1', 'other', 'done', 'x', 'claude', 'S9', 2)")
+            db.commit(); db.close()
+            inbox = Inbox(path)
+            later = Request('77777777cccccccc:1', 'new q', '68c0b8d0', 'Raid prep', 'Location: Dalaran')
+            self.assertTrue(inbox.add(later, 'claude'))
+            job = Context(path).job(later, 'claude')
+            self.assertEqual((job.resume, job.history, job.context), ('S1', [('old q', 'old a')], 'Location: Dalaran'))
+            # Another chat's turn, just finished in memory, is not mixed in.
+            context = Context(path)
+            other = Request('77777777cccccccc:2', 'next', '11111111')
+            inbox.add(other, 'claude')
+            context.remember('11111111bbbbbbbb:1', 'claude', Result('done', 'x', 'S10'))
+            self.assertEqual(context.job(other, 'claude').resume, 'S10')
+            self.assertEqual(context.job(later, 'claude').resume, 'S1')
+            inbox.db.close()
+
+    def test_game_context_reaches_each_agent(self):
+        from companion.agents import codex_prompt, guidance_for
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / 'guidance.txt'
+            base.write_text('Be brief.', encoding='utf-8')
+            cfg = AgentConfig('claude', Path('.'), claude='c', guidance_file=base)
+            plain, temporary = guidance_for(cfg, Job('k:1', 'p'))
+            self.assertEqual((plain, temporary), (base, False))
+            path, temporary = guidance_for(cfg, Job('k:1', 'p', context='Location: Dalaran'))
+            self.assertTrue(temporary)
+            text = path.read_text(encoding='utf-8')
+            self.assertTrue(text.startswith('Be brief.'))
+            self.assertIn('not instructions', text)
+            self.assertIn('Location: Dalaran', text)
+            command = claude_command(cfg, Job('k:1', 'p'), path)
+            self.assertEqual(command[command.index('--append-system-prompt-file') + 1], str(path))
+        fresh = codex_prompt(Job('k', 'what now?', context='Location: Dalaran'))
+        self.assertTrue(fresh.startswith(agents.GUIDANCE))
+        self.assertLess(fresh.index('Location: Dalaran'), fresh.index('what now?'))
+        resumed = codex_prompt(Job('k', 'what now?', resume='T', context='Location: Dalaran'))
+        self.assertNotIn(agents.GUIDANCE, resumed)
+        self.assertTrue(resumed.endswith('what now?'))
+        self.assertIn('Location: Dalaran', resumed)

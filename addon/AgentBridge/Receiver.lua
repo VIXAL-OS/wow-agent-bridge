@@ -154,116 +154,143 @@ end
 ---------------------------------------------------------------------------
 -- Receiver: one unused bank slot per attempt. A slot is reserved in saved
 -- settings before its first load and is never loaded twice in one process.
+-- Several requests can be in flight at once (parallel chats); each keeps its
+-- own assembly and schedule, and each slot goes to whichever is due first.
 ---------------------------------------------------------------------------
-local slot, request, session = 1, 0, nil
-local active, deadline, watchUntil = false, 0, 0
+local slot, session, paused = 1, nil, false
 local reading
-local failures, missed, unchanged, lastRevision = 0, 0, 0, nil
-local assembly = NS.NewAssembly()
+local jobs = {}  -- [request] = {request, chat, assembly, due, expires, failures, missed, unchanged, lastRevision}
 
-function NS.IsReceiving() return active end
 local function exhausted()
     NS.SetStatus('Reply channel used up for this game session. Restart WoW while the companion runs to recycle it.')
 end
-local function watch()
-    if slot > SIZE then exhausted(); return end
-    if not active then deadline = GetTime() + FIRST_WINDOW end
-    active, watchUntil = true, GetTime() + WATCH_LIMIT
-    NS.OnReceiveState(true)
-end
 local function consume() slot = slot + 1; reading = nil end
+local function nextJob()
+    local best
+    for _, job in pairs(jobs) do
+        if not best or job.due < best.due then best = job end
+    end
+    return best
+end
 
+function NS.IsReceiving() return not paused and next(jobs) ~= nil end
+function NS.IsWaiting(request) return jobs[request] ~= nil end
 function NS.Pause()
     if reading then consume() end
-    active = false; NS.OnReceiveState(false)
+    paused = true; NS.OnReceiveState(false)
 end
 function NS.Resume()
-    if request > 0 then failures, missed = 0, 0; watch(); NS.SetStatus('Checking for replies...') end
+    if not next(jobs) then return end
+    paused = false
+    local now = GetTime()
+    for _, job in pairs(jobs) do job.failures, job.missed, job.due = 0, 0, now end
+    NS.OnReceiveState(true); NS.SetStatus('Checking for replies...')
 end
-function NS.BeginRequest(sequence)
-    if reading then consume() end
-    request, session = sequence, NS.session
-    assembly = NS.NewAssembly()
-    failures, missed, unchanged, lastRevision = 0, 0, 0, nil
-    watch()
+function NS.BeginRequest(sequence, chat)
+    if slot > SIZE then exhausted(); return end
+    local now = GetTime()
+    session, paused = NS.session, false
+    jobs[sequence] = {request = sequence, chat = chat, assembly = NS.NewAssembly(), due = now + FIRST_WINDOW,
+        expires = now + WATCH_LIMIT, failures = 0, missed = 0, unchanged = 0}
+    NS.OnReceiveState(true)
+end
+-- Stop watching a request (its chat was deleted); the companion keeps the reply.
+function NS.ForgetRequest(sequence)
+    if reading and reading.job.request == sequence then consume() end
+    jobs[sequence] = nil
 end
 function NS.ControlFrame()
+    -- While a slot is being read, keep naming its request so nothing else is
+    -- written into it; otherwise announce whichever request is due next.
+    local job = reading and reading.job or (not paused and nextJob()) or nil
     local remaining = 0
-    if active and not reading then
-        remaining = math.max(0, math.min(30000, math.floor((deadline - GetTime())*1000)))
+    if job and not reading then
+        remaining = math.max(0, math.min(30000, math.floor((job.due - GetTime())*1000)))
     end
     return NS.EncodeControl(session or NS.session, math.min(slot, SIZE + 1), remaining,
-        assembly.nextPart, active and slot <= SIZE and request > 0, request)
+        job and job.assembly.nextPart or 1, job ~= nil and slot <= SIZE, job and job.request or 0)
 end
 function NS.ReceiverInfo()
-    return {slot = slot, request = request, active = active, calib = calib and calib.size, reading = reading ~= nil}
+    local count = 0
+    for _ in pairs(jobs) do count = count + 1 end
+    return {slot = slot, active = NS.IsReceiving(), pending = count, calib = calib and calib.size,
+        reading = reading ~= nil}
 end
 
-local function finish(reason, text, state, complete)
+local function finish(job, reason, text, state, complete)
     consume()
     local now = GetTime()
     if reason == 'Empty reply slot' then
         -- Nobody wrote this slot before it loaded (companion stopped, strip hidden).
-        missed, failures = missed + 1, 0
-        deadline = now + math.min(30, 5 * 2^math.min(missed, 3))
+        job.missed, job.failures = job.missed + 1, 0
+        job.due = now + math.min(30, 5 * 2^math.min(job.missed, 3))
         NS.SetStatus('Waiting for the companion. Is it running and capturing the strip? Retrying...')
         return
     end
     if reason == 'Unchanged' then
         -- Nothing new since the last slot: poll again, a little less eagerly.
-        failures, missed = 0, 0
-        unchanged = unchanged + 1
-        deadline = now + math.min(MAX_POLL, POLL_WINDOW + unchanged * 1.5)
+        job.failures, job.missed, job.unchanged = 0, 0, job.unchanged + 1
+        job.due = now + math.min(MAX_POLL, POLL_WINDOW + job.unchanged * 1.5)
         return
     end
     if reason == 'Stale reply packet' then
-        failures = 0; deadline = now + FRAGMENT_WINDOW
+        job.failures = 0; job.due = now + FRAGMENT_WINDOW
         return
     end
     if reason then
-        failures = failures + 1
-        if failures >= 3 then
+        job.failures = job.failures + 1
+        if job.failures >= 3 then
             NS.Pause()
             NS.SetStatus('Reply reception paused after repeated errors ('..reason..'). The reply is safe in the companion; Resume to retry.')
             return
         end
-        deadline = now + POLL_WINDOW
+        job.due = now + POLL_WINDOW
         NS.SetStatus('Retrying reply reception: '..reason)
         return
     end
-    failures, missed = 0, 0
-    if not text then deadline = now + FRAGMENT_WINDOW; return end
-    if state >= 1 then NS.AckPrompt(request) end
+    job.failures, job.missed = 0, 0
+    if not text then job.due = now + FRAGMENT_WINDOW; return end
+    if state >= 1 then NS.AckPrompt(job.request) end
+    local assembly = job.assembly
     if state == 3 and not complete then
         -- While the agent is still writing, preview the first part only; the
         -- full text is fetched once it is final. This bounds slot usage.
         assembly.nextPart, assembly.parts = 1, {}
-        NS.ShowReply(NS.TrimUTF8(text), state, false)
-        deadline = now + 4
+        NS.ShowReply(job.request, NS.TrimUTF8(text), state, false)
+        job.due = now + 4
         return
     end
-    NS.ShowReply(complete and text or NS.TrimUTF8(text), state, complete)
-    if not complete then deadline = now + FRAGMENT_WINDOW; return end
-    if state >= 4 then NS.Pause(); NS.OnReplyFinished(state); return end
-    unchanged = assembly.revision == lastRevision and unchanged + 1 or 0
-    lastRevision = assembly.revision
-    deadline = now + (state == 3 and 4 or math.min(MAX_POLL, POLL_WINDOW + unchanged * 2.5))
+    NS.ShowReply(job.request, complete and text or NS.TrimUTF8(text), state, complete)
+    if not complete then job.due = now + FRAGMENT_WINDOW; return end
+    if state >= 4 then
+        jobs[job.request] = nil
+        if not next(jobs) then NS.OnReceiveState(false) end
+        NS.OnReplyFinished(job.chat, state)
+        return
+    end
+    job.unchanged = assembly.revision == job.lastRevision and job.unchanged + 1 or 0
+    job.lastRevision = assembly.revision
+    job.due = now + (state == 3 and 4 or math.min(MAX_POLL, POLL_WINDOW + job.unchanged * 2.5))
 end
 
 local function stepReceiver(now)
-    if now >= watchUntil then
-        NS.Pause(); NS.SetStatus('Stopped checking after an hour. Resume to check again.')
-        return
+    for request, job in pairs(jobs) do
+        if now >= job.expires and not (reading and reading.job == job) then
+            jobs[request] = nil
+            NS.ShowReply(request, 'Stopped checking after an hour. The reply is safe in the companion.', 6, true)
+        end
     end
     if not reading then
-        if now < deadline then return end
+        local job = nextJob()
+        if not job or now < job.due then return end
         if slot > SIZE then NS.Pause(); exhausted(); return end
         -- Reserve before the first load: /reload must never reuse a cached path.
         NS.S.nextSlot = math.max(NS.S.nextSlot or 1, slot + 1)
-        reading = {start = now, nextTry = 0, bytes = {}, index = 0}
+        reading = {job = job, start = now, nextTry = 0, bytes = {}, index = 0}
     end
+    local job = reading.job
     if now - reading.start > READ_TIMEOUT then
-        finish('Slot '..slot..': '..(reading.reason or 'font did not load'))
+        finish(job, 'Slot '..slot..': '..(reading.reason or 'font did not load'))
         return
     end
     if not reading.ready then
@@ -274,7 +301,7 @@ local function stepReceiver(now)
         if not ok then return end
         local low, high = width(meter, '!'), width(meter, '"')
         if math.abs(low - calib.widths[0]) > calib.tol or math.abs(high - calib.widths[VALUES-1]) > calib.tol then
-            if reading.recalibrated then finish('Calibration mismatch'); return end
+            if reading.recalibrated then finish(job, 'Calibration mismatch'); return end
             -- Rendering scale changed since the self-test (window resized?).
             reading.recalibrated, reading.start, reading.nextTry = true, now, 0
             calib = nil; NS.RunSelfTest(false)
@@ -286,7 +313,7 @@ local function stepReceiver(now)
     for measured = 1, MAX_PER_FRAME do
         if measured > MIN_PER_FRAME and profile and debugprofilestop() > FRAME_BUDGET then return end
         local v = lookup(calib, width(meter, GLYPH[reading.index]))
-        if not v then finish('Font byte measurement'); return end
+        if not v then finish(job, 'Font byte measurement'); return end
         if reading.index % 2 == 0 then
             reading.high = v
         else
@@ -295,18 +322,18 @@ local function stepReceiver(now)
         reading.index = reading.index + 1
         -- Peek at the header before paying for the rest of the packet.
         if reading.index == 64 then
-            local info, why = NS.PeekReply(table.concat(reading.bytes), session, request, slot)
-            if not info then finish(why); return end
-            if info.part == 1 and assembly.nextPart == 1 and info.revision == lastRevision then
-                finish('Unchanged'); return
+            local info, why = NS.PeekReply(table.concat(reading.bytes), session, job.request, slot)
+            if not info then finish(job, why); return end
+            if info.part == 1 and job.assembly.nextPart == 1 and info.revision == job.lastRevision then
+                finish(job, 'Unchanged'); return
             end
         end
         if reading.index == GLYPHS then
-            local packet, why = NS.ParseReply(table.concat(reading.bytes), session, request, slot)
-            if not packet then finish(why); return end
-            local text, state, complete = NS.AcceptFragment(assembly, packet)
-            if text == nil then finish(state); return end
-            finish(nil, text, state, complete)
+            local packet, why = NS.ParseReply(table.concat(reading.bytes), session, job.request, slot)
+            if not packet then finish(job, why); return end
+            local text, state, complete = NS.AcceptFragment(job.assembly, packet)
+            if text == nil then finish(job, state); return end
+            finish(job, nil, text, state, complete)
             return
         end
     end
@@ -321,7 +348,7 @@ end)
 driver:SetScript('OnUpdate', function()
     local now = GetTime()
     if test then stepTest(now) end
-    if not (active and session and NS.S) then return end
+    if paused or not next(jobs) or not session or not NS.S then return end
     if calib then stepReceiver(now)
     elseif not test and NS.selfTest and not NS.selfTest.ok then
         NS.Pause()

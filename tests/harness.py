@@ -13,7 +13,7 @@ from fontTools.ttLib import TTFont
 from lupa.lua51 import LuaRuntime
 
 from companion.native import BANK_FORMAT, NativeBridge, copy_mono_font, make_font, prepare_bank, selftest_data
-from companion.protocol import Assembler, BANK_SIZE, frame_kind, parse_control
+from companion.protocol import Assembler, BANK_SIZE, frame_kind, parse_control, parse_envelope
 from companion.wow import write_epoch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,7 +159,10 @@ class Sim:
         elif frame_kind(data) == 'prompt':
             result = self.assembler.accept(data)
             if result and result[0] not in self.jobs:
-                self.jobs[result[0]] = {'prompt': result[1], 'start': self.t}
+                # As the companion does: the agent answers the body; the header
+                # says which chat it belongs to and carries the game context.
+                fields, body = parse_envelope(result[1])
+                self.jobs[result[0]] = {'prompt': body, 'fields': fields, 'start': self.t}
 
     def run(self, seconds, until=None):
         end, next_capture = self.t + seconds, self.t
@@ -182,6 +185,11 @@ class Sim:
         if not history or len(history) == 0:
             return None
         return bytes(history[len(history)].r).decode('utf-8')
+
+    def replies(self, chat):
+        """Finished replies recorded for one chat, oldest first."""
+        history = self.g.AgentBridgeState.history
+        return [bytes(e.r).decode('utf-8') for e in history.values() if e.c == chat]
 
     def status(self):
         return self.ns.ReceiverInfo()

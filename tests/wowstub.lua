@@ -128,6 +128,57 @@ function SetItemRef() end
 ChatEdit_InsertLink = function() return false end
 OpenStackSplitFrame = function() end
 
+-- Tooltips: STUB.tooltips[link data] = {lines}. SetHyperlink fills the
+-- <name>TextLeftN font strings the way GameTooltipTemplate lays them out.
+STUB.tooltips = {}
+function Object:ClearLines() rawset(self, 'count', 0) end
+function Object:NumLines() return rawget(self, 'count') or 0 end
+function Object:SetHyperlink(data)
+    local lines = STUB.tooltips[data]
+    if not lines then error('Unknown link type') end
+    for i, text in ipairs(lines) do
+        local left, right = new('FontString', self.name..'TextLeft'..i), new('FontString', self.name..'TextRight'..i)
+        left.text, right.shown = text, false
+    end
+    rawset(self, 'count', #lines)
+end
+
+-- Dialogs: shown ones are recorded; tests accept them by calling OnAccept.
+StaticPopupDialogs, STUB.popups = {}, {}
+function StaticPopup_Show(which, a1)
+    local dialog = new('Frame', 'StaticPopup1')
+    new('EditBox', 'StaticPopup1EditBox', dialog)
+    function dialog.GetName() return 'StaticPopup1' end
+    STUB.popups[#STUB.popups+1] = {which = which, text = a1, dialog = dialog}
+    return dialog
+end
+
+-- Your character, for the game context sent with prompts.
+function GetBuildInfo() return '3.3.5', '12340', 'Jun 24 2010', 30300 end
+function GetRealmName() return 'ChromieCraft' end
+function UnitName() return 'Testbrew' end
+function UnitLevel() return 42 end
+function UnitRace() return 'Tauren' end
+function UnitClass() return 'Druid' end
+function UnitFactionGroup() return 'Horde' end
+function GetGuildInfo() return nil end
+function GetRealZoneText() return 'Stranglethorn Vale' end
+function GetSubZoneText() return 'Booty Bay' end
+function SetMapToCurrentZone() end
+function GetPlayerMapPosition() return .273, .771 end
+function IsInInstance() return nil end
+function GetMoney() return 1234567 end
+local TALENTS = {{'Balance', 0}, {'Feral Combat', 31}, {'Restoration', 8}}
+function GetNumTalentTabs() return #TALENTS end
+function GetTalentTabInfo(i) return TALENTS[i][1], '', TALENTS[i][2] end
+local SKILLS = {{'Professions', true}, {'Herbalism', false, 300, 375}, {'Alchemy', false, 280, 300},
+    {'Secondary Skills', true}, {'Fishing', false, 150, 225}, {'Weapon Skills', true}, {'Staves', false, 210, 210}}
+function GetNumSkillLines() return #SKILLS end
+function GetSkillLineInfo(i)
+    local s = SKILLS[i]
+    return s[1], s[2], nil, s[3], nil, nil, s[4]
+end
+
 function STUB.fire(event, ...)
     for frame in pairs(STUB.events[event] or {}) do
         local fn = frame.scripts.OnEvent

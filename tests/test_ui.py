@@ -1,4 +1,5 @@
 """Exercise in-game entry points that the transport tests never reach."""
+import re
 import tempfile
 import unittest
 
@@ -43,27 +44,50 @@ class InGame(unittest.TestCase):
     def test_new_chat_starts_a_conversation(self):
         self.sim.send('first')
         self.sim.run(30, until=lambda: self.sim.last_reply() is not None)
-        before = bytes(self.ns.session)[:4]
-        self.slash('new')
-        self.assertIsNone(self.g.AgentBridgeState.last)
-        self.assertNotEqual(bytes(self.ns.session)[:4], before)
+        state = self.g.AgentBridgeState
+        before = state.chat
+        self.slash('new Raid prep')
+        self.assertNotEqual(state.chat, before)
+        self.assertEqual(bytes(self.ns.ChatTitle(state.chat)), b'Raid prep')
+        self.assertIn('(new conversation)', self.sim.body())
+        self.assertEqual(len(state.chats), 2, 'the first chat is kept')
+        self.assertEqual(self.sim.replies(before), ['Echo: first'])
         self.assertFalse(self.ns.IsReceiving())
 
     def test_item_links_in_prompts_and_replies(self):
         link = '|cff0070dd|Hitem:36942:0:0:0:0:0:0:0:80|h[Frostmourne]|h|r'
-        text = bytes(self.ns.MakePromptText(link.encode() + b' worth it?')).decode()
-        self.assertEqual(text, '[Frostmourne] (item 36942; link item:36942:0:0:0:0:0:0:0:80) worth it?')
+        agent, display = self.ns.MakePromptText(link.encode() + b' worth it?')
+        self.assertEqual(bytes(agent).decode(), '[Frostmourne] (item 36942; link item:36942:0:0:0:0:0:0:0:80) worth it?')
+        self.assertEqual(bytes(display).decode(), '[Frostmourne] worth it?', 'the transcript shows what you typed')
         # Unknown items stay plain text, and markup in replies is escaped.
         markup, missing, mono, rows = self.ns.RenderReply(b'See [Thunderfury](item:19019) and |cffff0000fake|r')
         markup = bytes(markup).decode()
         self.assertEqual(markup, 'See Thunderfury (item 19019) and ||cffff0000fake||r')
 
+    def test_linked_tooltips_reach_the_agent_within_the_budget(self):
+        tips = self.g.STUB.tooltips
+        tips[b'item:19019:0:0:0:0:0:0:0:80'] = self.sim.lua.table_from(
+            [b'|cffff8000Thunderfury, Blessed Blade of the Windseeker|r', b'Binds when picked up', b'44 - 84 Damage'])
+        tips[b'spell:48441'] = self.sim.lua.table_from([b'Rejuvenation', b'Heals the target over 15 sec.'])
+        raw = (b'|cffff8000|Hitem:19019:0:0:0:0:0:0:0:80|h[Thunderfury]|h|r vs '
+               b'|cff71d5ff|Hspell:48441|h[Rejuvenation]|h|r?')
+        agent, display = self.ns.MakePromptText(raw, 8000)
+        agent = bytes(agent).decode()
+        self.assertEqual(bytes(display).decode(), '[Thunderfury] vs [Rejuvenation]?')
+        self.assertIn('Linked from the game (tooltip text):', agent)
+        self.assertIn('Thunderfury, Blessed Blade of the Windseeker\nBinds when picked up\n44 - 84 Damage', agent)
+        self.assertIn('Rejuvenation\nHeals the target over 15 sec.', agent)
+        self.assertNotIn('|c', agent, 'colour codes never reach the agent')
+        # Without room, the tooltips are left out rather than the message refused.
+        short, _ = self.ns.MakePromptText(raw, 120)
+        self.assertNotIn('Linked from the game', bytes(short).decode())
+
     def test_prompt_too_long_is_refused(self):
         box = self.g.AgentBridgeInput
-        box.text = b'x' * 1400
+        box.text = b'x' * 8500
         box.scripts[b'OnEnterPressed'](box)
         self.assertFalse(self.ns.IsReceiving())
-        self.assertEqual(bytes(box.text), b'x' * 1400, 'the draft is kept so it can be shortened')
+        self.assertEqual(bytes(box.text), b'x' * 8500, 'the draft is kept so it can be shortened')
 
     def test_panel_and_minimap_handlers(self):
         panel, mm = self.g.AgentBridgePanel, self.g.AgentBridgeMinimapButton
@@ -118,10 +142,14 @@ class Transcript(unittest.TestCase):
         self.sim.send(text)
         self.assertTrue(self.sim.run(60, until=lambda: self.sim.last_reply() == 'Echo: ' + text), text)
 
+    request = 1000
+
     def finish(self, prompt, reply):
         """Record a finished exchange directly, without a round trip."""
-        self.sim.ns.currentPrompt = prompt.encode()
-        self.sim.ns.ShowReply(reply.encode(), 4, True)
+        Transcript.request += 1
+        ns = self.sim.ns
+        ns.StartExchange(Transcript.request, self.sim.g.AgentBridgeState.chat, prompt.encode())
+        ns.ShowReply(Transcript.request, reply.encode(), 4, True)
 
     def test_earlier_exchanges_stay_on_the_page_in_order(self):
         self.ask('first question')
@@ -144,9 +172,9 @@ class Transcript(unittest.TestCase):
             self.finish(f'q{n}', f'a{n}')
         self.finish('q44', 'a44')  # the same reply shown again, as item data or a reload would
         history = self.sim.g.AgentBridgeState.history
-        self.assertEqual(len(history), 40)
-        self.assertEqual(bytes(history[1].p), b'q5')
-        self.assertEqual(bytes(history[40].r), b'a44')
+        self.assertEqual(len(history), 30)
+        self.assertEqual(bytes(history[1].p), b'q15')
+        self.assertEqual(bytes(history[30].r), b'a44')
 
     def test_opening_the_panel_lands_on_the_newest_line(self):
         for n in range(30):
@@ -165,13 +193,173 @@ class Transcript(unittest.TestCase):
         for n in range(30):
             self.finish(f'q{n}', '\n'.join(f'line {i}' for i in range(5)))
         scroll = self.sim.g.AgentBridgeScroll
-        self.sim.ns.StartExchange(b'brand new')
+        self.sim.ns.StartExchange(900, self.sim.g.AgentBridgeState.chat, b'brand new')
         bottom = scroll.GetVerticalScroll(scroll)
         self.assertGreater(bottom, 0, 'the new prompt is brought into view')
         scroll.SetVerticalScroll(scroll, 100)  # you scroll back up to reread
-        self.sim.ns.currentPrompt = b'brand new'
-        self.sim.ns.ShowReply(b'partial answer', 3, False)
+        self.sim.ns.ShowReply(900, b'partial answer', 3, False)
         self.assertEqual(scroll.GetVerticalScroll(scroll), 100, 'an update does not drag you back down')
+
+
+class ParallelChats(unittest.TestCase):
+    """Several chats at once, the envelope around each prompt, and the extras."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sim = Sim(self.tmp.name, agent(lambda p: 'Echo: ' + p))
+        self.sim.run(2)
+        self.ns, self.g, self.state = self.sim.ns, self.sim.g, self.sim.g.AgentBridgeState
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def prints(self):
+        return [bytes(line).decode() for line in self.g.STUB.prints.values()]
+
+    def job(self, text):
+        return next(job for job in self.sim.jobs.values() if job['prompt'] == text)
+
+    def test_two_chats_answer_at_once(self):
+        first = self.state.chat
+        self.sim.send('question one')
+        self.ns.NewChat(b'Second')
+        second = self.state.chat
+        self.sim.send('question two')
+        self.assertEqual(self.ns.ReceiverInfo().pending, 2)
+        both = lambda: self.sim.replies(first) and self.sim.replies(second)
+        self.assertTrue(self.sim.run(120, until=both))
+        self.assertEqual(self.sim.replies(first), ['Echo: question one'])
+        self.assertEqual(self.sim.replies(second), ['Echo: question two'])
+        # Each prompt names its chat, so the companion keeps two conversations.
+        self.assertEqual(self.job('question one')['fields']['chat'], [str(first)])
+        self.assertEqual(self.job('question one')['fields']['name'], ['question one'])
+        self.assertEqual(self.job('question two')['fields']['name'], ['Second'])
+        # The panel shows only the chat you are reading.
+        self.assertIn('Echo: question two', self.sim.body())
+        self.assertNotIn('question one', self.sim.body())
+        self.ns.SelectChat(first)
+        self.assertIn('Echo: question one', self.sim.body())
+        loads = [name for name in self.sim.client.loads if name.startswith('reply')]
+        self.assertEqual(len(loads), len(set(loads)), 'no slot is ever loaded twice')
+
+    def test_game_context_travels_with_the_prompt(self):
+        self.sim.send('where am I?')
+        self.assertTrue(self.sim.run(20, until=lambda: self.sim.jobs))
+        context = self.job('where am I?')['fields']['ctx']
+        self.assertIn('Character: Testbrew, level 42 Tauren Druid (Horde)', context)
+        self.assertIn('Location: Stranglethorn Vale - Booty Bay (27.3, 77.1)', context)
+        self.assertIn('Money: 123g 45s 67c', context)
+        self.assertIn('Talents: Balance 0 / Feral Combat 31 / Restoration 8', context)
+        self.assertIn('Professions: Herbalism 300/375, Alchemy 280/300, Fishing 150/225', context)
+        self.g.SlashCmdList.AGENTBRIDGE(b'context off')
+        self.sim.send('and now?')
+        self.assertTrue(self.sim.run(20, until=lambda: len(self.sim.jobs) == 2))
+        self.assertNotIn('ctx', self.job('and now?')['fields'])
+
+    def test_live_progress_under_the_prompt(self):
+        working = 'Mock is working · 3 actions · Read: Core.lua'
+        sim = Sim(self.tmp.name + '2', lambda prompt, elapsed: ('working', working) if elapsed < 60 else ('done', 'ok'))
+        sim.run(2)
+        panel = sim.g.AgentBridgePanel
+        panel.Show(panel)
+        sim.send('go')
+        self.assertTrue(sim.run(30, until=lambda: working in sim.body()))
+        seconds = lambda: int(re.search(r'Read: Core\.lua  0:(\d\d)\)', sim.body()).group(1))
+        before = seconds()
+        sim.run(3)
+        self.assertGreaterEqual(seconds(), before + 2, 'the elapsed time ticks between reply packets')
+        self.assertTrue(sim.run(90, until=lambda: sim.last_reply() == 'ok'))
+        self.assertNotIn(working, sim.body(), 'progress is not kept in the transcript')
+
+    def test_finished_reply_you_are_not_reading_is_echoed_and_marked(self):
+        first = self.state.chat
+        self.sim.send('ping')
+        self.ns.NewChat()
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.replies(first)))
+        self.assertTrue(self.ns.FindChat(first)[0].unread)
+        text = '\n'.join(self.prints())
+        self.assertIn('[ping]', text)
+        self.assertIn('  Echo: ping', text)
+        self.ns.SelectChat(first)
+        self.assertFalse(self.ns.FindChat(first)[0].unread)
+
+    def test_echo_can_be_shortened_or_turned_off(self):
+        self.g.SlashCmdList.AGENTBRIDGE(b'echo 5')
+        self.sim.send('abcdefgh')
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.last_reply()))
+        text = '\n'.join(self.prints())
+        self.assertIn('  Echo:', text)
+        self.assertIn('9 more characters: /ab to read the rest', text)
+        self.g.SlashCmdList.AGENTBRIDGE(b'echo off')
+        self.sim.send('second')
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.last_reply() == 'Echo: second'))
+        self.assertIn('reply ready in "abcdefgh"', '\n'.join(self.prints()))
+
+    def test_ai_command_sends_without_the_panel(self):
+        self.g.SlashCmdList.AGENTBRIDGEAI(b'from the chat box')
+        self.assertTrue(self.sim.run(60, until=lambda: self.sim.last_reply() == 'Echo: from the chat box'))
+        self.assertFalse(self.g.AgentBridgePanel.shown)
+        self.g.SlashCmdList.AGENTBRIDGEAI(b'   ')
+        self.assertIn('Type a message first.', self.prints()[-1])
+
+    def test_copy_box_holds_the_reply_as_sent(self):
+        chat = self.state.chat
+        self.ns.StartExchange(500, chat, b'table please')
+        self.ns.ShowReply(500, b'| a | b |\n|---|---|\n|cffcolour', 4, True)
+        box = self.g.AgentBridgeCopyBox
+        self.ns.ShowCopy(False)
+        self.assertEqual(bytes(box.text), b'| a | b |\n|---|---|\n||cffcolour', 'only markup pipes are doubled')
+        self.ns.ShowCopy(True)
+        self.assertTrue(bytes(box.text).startswith(b'You: table please\n\n| a | b |'))
+        box.text = b'edited'
+        box.scripts[b'OnTextChanged'](box, True)
+        self.assertTrue(bytes(box.text).startswith(b'You: table please'), 'typing into it changes nothing')
+
+    def test_rename_and_delete_through_dialogs(self):
+        first = self.state.chat
+        self.sim.send('keep going')
+        self.sim.run(3)
+        self.ns.NewChat()
+        second = self.state.chat
+        self.ns.AskRename(second)
+        self.g.StaticPopup1EditBox.text = b'Raid prep'
+        self.g.StaticPopupDialogs.AGENTBRIDGE_RENAME.OnAccept(self.g.STUB.popups[1].dialog)
+        self.assertEqual(bytes(self.ns.ChatTitle(second)), b'Raid prep')
+        self.assertEqual(self.ns.ReceiverInfo().pending, 1)
+        self.ns.AskDelete(first)
+        self.g.StaticPopupDialogs.AGENTBRIDGE_DELETE.OnAccept(self.g.STUB.popups[2].dialog)
+        self.assertIsNone(self.ns.FindChat(first))
+        self.assertEqual(self.ns.ReceiverInfo().pending, 0, 'its reply is no longer awaited')
+        self.assertEqual(self.state.chat, second)
+        self.sim.run(30)
+        self.assertEqual(self.sim.replies(first), [])
+
+    def test_sidebar_lists_chats_and_switches_on_click(self):
+        first = self.state.chat
+        self.sim.send('alpha question')
+        self.ns.NewChat(b'Beta')
+        rawget = self.sim.lua.eval('rawget')
+        rows = [f for f in self.g.STUB.frames.values() if f.kind == b'Button' and rawget(f, b'chat') is not None]
+        titles = {rawget(f, b'chat'): bytes(rawget(f, b'label').text).decode() for f in rows if f.shown}
+        self.assertTrue(titles[self.state.chat].endswith('Beta'))
+        self.assertIn('...', titles[first], 'a chat still working is marked')
+        row = next(f for f in rows if rawget(f, b'chat') == first)
+        row.scripts[b'OnClick'](row, b'LeftButton')
+        self.assertEqual(self.state.chat, first)
+        self.assertIn('alpha question', self.sim.body())
+
+    def test_one_conversation_from_an_earlier_version_becomes_chats(self):
+        sim = Sim(self.tmp.name + '3', agent(lambda p: 'x'), saved={
+            'conversation': 1757000000, 'nextSlot': 1,
+            'history': {1: {'c': 1756000000, 'p': 'older', 'r': 'older reply', 's': 4},
+                        2: {'c': 1757000000, 'p': 'latest', 'r': 'latest reply', 's': 4}}})
+        state = sim.g.AgentBridgeState
+        self.assertEqual([chat.id for chat in state.chats.values()], [1757000000, 1756000000])
+        self.assertEqual(state.chat, 1757000000)
+        self.assertIsNone(state.conversation)
+        self.assertIn('latest reply', sim.body())
+        self.assertNotIn('older reply', sim.body())
+        self.assertEqual(bytes(sim.ns.ChatTitle(1756000000)), b'older')
 
 
 class ReplyFormatting(unittest.TestCase):

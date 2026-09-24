@@ -9,12 +9,19 @@ local function linkData(link)
     return link:match('|H([^|]+)|h(.-)|h')
 end
 
--- Outgoing: "[Frostmourne] (item 36942; link item:36942:0:0:0:0:0:0:0:80; Weapon / Two-Handed Swords; item level 284)"
-function NS.MakePromptText(raw)
+-- Outgoing. What the agent reads spells each link out:
+--   [Frostmourne] (item 36942; link item:36942:0:0:0:0:0:0:0:80; Weapon / Two-Handed Swords; item level 284)
+-- then, while it fits in `budget` bytes, the tooltip text of up to six linked
+-- things, so it can answer from the actual stats. The transcript shows only
+-- what you typed, with each link as its [name].
+local MAX_TIPS, TIP_BYTES = 6, 700
+function NS.MakePromptText(raw, budget)
     local plain = raw:gsub('|c%x%x%x%x%x%x%x%x', ''):gsub('|r', '')
-    return (plain:gsub('|H([^|]+)|h(.-)|h', function(data, label)
+    local linked, seen = {}, {}
+    local agent = plain:gsub('|H([^|]+)|h(.-)|h', function(data, label)
         local kind, id = data:match('^(%a+):(%-?%d+)')
         if not kind then return label end
+        if not seen[data] and #linked < MAX_TIPS then seen[data] = true; linked[#linked+1] = data end
         if kind ~= 'item' then return label..' ('..kind..' '..id..')' end
         local details = {'item '..id, 'link '..data}
         local name, _, _, level, minimum, class, subclass = GetItemInfo(data)
@@ -22,12 +29,28 @@ function NS.MakePromptText(raw)
         if level and level > 0 then details[#details+1] = 'item level '..level end
         if minimum and minimum > 0 then details[#details+1] = 'requires level '..minimum end
         return (name and ('['..name..']') or label)..' ('..table.concat(details, '; ')..')'
-    end))
+    end)
+    local display = plain:gsub('|H[^|]+|h(.-)|h', '%1')
+    if budget then
+        local header, tips, size = '\n\nLinked from the game (tooltip text):', {}, #agent
+        for _, data in ipairs(linked) do
+            local text = NS.LinkTooltip and NS.LinkTooltip(data)
+            if text then
+                if #text > TIP_BYTES then text = NS.TrimUTF8(text:sub(1, TIP_BYTES))..' ...' end
+                local entry = '\n\n'..text
+                local extra = #entry + (#tips == 0 and #header or 0)
+                if size + extra > budget then break end
+                tips[#tips+1], size = entry, size + extra
+            end
+        end
+        if #tips > 0 then agent = agent..header..table.concat(tips) end
+    end
+    return agent, display
 end
 
 function NS.InsertLink(link)
     if not panel:IsShown() or not edit:HasFocus() or not linkData(link) then return false end
-    if #edit:GetText() + #link + 1 > NS.MAX_PROMPT then
+    if #edit:GetText() + #link + 1 > NS.MAX_TYPED then
         NS.SetStatus('Not enough room for this link. Shorten the message first.'); return false
     end
     edit:Insert(link..' ')
@@ -63,7 +86,7 @@ end)
 
 -- Incoming ---------------------------------------------------------------
 local MAX_LINKS, MAX_QUERIES = 128, 32
-local current, allowed, queried, queryCount, retryUntil = nil, {}, {}, 0, 0
+local allowed, queried, queryCount, retryUntil = {}, {}, 0, 0
 local scan = CreateFrame('GameTooltip', 'AgentBridgeScanTooltip', nil, 'GameTooltipTemplate')
 
 local function itemID(data)
@@ -122,9 +145,10 @@ local function renderInline(text)
 end
 
 -- Returns the joined markup, whether an item is still loading, whether any
--- line needs the fixed-width font, and the rows for the panel.
-function NS.RenderReply(text)
-    local entries, mono = NS.FormatLines(text, NS.BodyColumns())
+-- line needs the fixed-width font, and the rows for the panel. columns = 0
+-- lays tables out for a proportional font (the chat frame).
+function NS.RenderReply(text, columns)
+    local entries, mono = NS.FormatLines(text, columns or NS.BodyColumns())
     local out, rows, missing = {}, {}, false
     -- Links accumulate across the whole transcript, so older replies keep
     -- their tooltips; the per-reply cap still applies.
@@ -140,31 +164,49 @@ function NS.RenderReply(text)
     return table.concat(out, '\n'), missing, mono, rows
 end
 
-local STATE_NOTE = {[0] = 'waiting for the companion', [1] = 'queued', [2] = 'working', [3] = 'writing...',
+local STATE_NOTE = {[0] = 'sending...', [1] = 'queued', [2] = 'working', [3] = 'writing...',
     [5] = 'finished with a problem', [6] = 'interrupted'}
 
 -- Transcript ---------------------------------------------------------------
--- Finished exchanges live in saved settings, so the conversation survives a
--- /reload. Kept small: saved variables are rewritten on every logout.
-local KEEP_EXCHANGES, KEEP_BYTES = 40, 150000
+-- Finished exchanges live in saved settings, tagged with their chat, so every
+-- chat survives a /reload. Kept small: saved variables are rewritten on every
+-- logout. Requests still under way are kept here until their reply is final.
+local KEEP_PER_CHAT, KEEP_BYTES = 30, 200000
 local rendered = setmetatable({}, {__mode = 'k'})  -- exchange -> rows at a width
+local inflight = {}  -- [request] = {request, chat, prompt, text, state, rows, sentAt}
 
 local function history()
     if type(NS.S.history) ~= 'table' then NS.S.history = {} end
     return NS.S.history
 end
+local function size(exchange) return #(exchange.p or '') + #(exchange.r or '') end
 
-local function record(prompt, reply, state)
+local function record(chat, prompt, reply, state)
     local list = history()
-    local last = list[#list]
-    -- Re-showing a finished reply (item data arriving, a reload) must not
-    -- store it twice.
-    if last and last.c == NS.S.conversation and last.p == prompt and last.r == reply then return end
-    list[#list+1] = {c = NS.S.conversation, p = prompt, r = reply, s = state}
-    local total = 0
-    for _, exchange in ipairs(list) do total = total + #(exchange.r or '') end
-    while #list > KEEP_EXCHANGES or (total > KEEP_BYTES and #list > 1) do
-        total = total - #(list[1].r or '')
+    -- Showing a finished reply again must not store it twice.
+    for i = #list, 1, -1 do
+        if list[i].c == chat then
+            if list[i].p == prompt and list[i].r == reply then return end
+            break
+        end
+    end
+    list[#list+1] = {c = chat, p = prompt, r = reply, s = state}
+    local count, total = 0, 0
+    for _, exchange in ipairs(list) do
+        if exchange.c == chat then count = count + 1 end
+        total = total + size(exchange)
+    end
+    local i = 1
+    while count > KEEP_PER_CHAT and i <= #list do
+        if list[i].c == chat then
+            total, count = total - size(list[i]), count - 1
+            table.remove(list, i)
+        else
+            i = i + 1
+        end
+    end
+    while total > KEEP_BYTES and #list > 1 do
+        total = total - size(list[1])
         table.remove(list, 1)
     end
 end
@@ -172,64 +214,173 @@ end
 local function blockFor(exchange, columns)
     local hit = rendered[exchange]
     if hit and hit.columns == columns then return hit.block end
-    local _, _, _, rows = NS.RenderReply(exchange.r or '')
+    local _, missing, _, rows = NS.RenderReply(exchange.r or '')
     local note = exchange.s ~= 4 and ('('..(STATE_NOTE[exchange.s] or 'finished with a problem')..')') or nil
     local block = {prompt = exchange.p, rows = rows, note = note}
-    rendered[exchange] = {columns = columns, block = block}
+    rendered[exchange] = {columns = columns, block = block, missing = missing}
     return block
 end
 
--- Redraw this conversation: finished exchanges, then the one in progress.
+local function pending(chat)
+    local out = {}
+    for _, item in pairs(inflight) do
+        if item.chat == chat then out[#out+1] = item end
+    end
+    table.sort(out, function(a, b) return a.request < b.request end)
+    return out
+end
+
+local function clock(seconds)
+    seconds = math.max(0, math.floor(seconds))
+    return string.format('%d:%02d', math.floor(seconds / 60), seconds % 60)
+end
+-- One line under a prompt that is still under way: what the companion last
+-- said about it (queued, working, the agent's latest action) and how long ago
+-- it was sent, counted here so it keeps ticking between reply packets.
+local function noteFor(item)
+    local what
+    if item.state >= 4 then
+        what = 'receiving the rest...'
+    elseif item.state == 3 then
+        what = 'writing...'
+    else
+        what = item.text:match('^[^\n]*'):gsub('%s+', ' ')
+        if what == '' then what = STATE_NOTE[item.state] end
+        if #what > 110 then what = NS.TrimUTF8(what:sub(1, 107))..'...' end
+        what = NS.Escape(what)
+    end
+    return '('..what..'  '..clock(GetTime() - item.sentAt)..')'
+end
+
+-- Redraw the chat you are reading: finished exchanges, then those under way.
 function NS.RefreshTranscript(focus)
     if not NS.S then return end
-    local columns, blocks = NS.BodyColumns(), {}
+    local chat, columns, blocks = NS.S.chat, NS.BodyColumns(), {}
     for _, exchange in ipairs(history()) do
-        if exchange.c == NS.S.conversation then blocks[#blocks+1] = blockFor(exchange, columns) end
+        if exchange.c == chat then blocks[#blocks+1] = blockFor(exchange, columns) end
     end
-    if current and not current.recorded then
-        blocks[#blocks+1] = {prompt = current.prompt, rows = current.rows, note = current.note}
+    for _, item in ipairs(pending(chat)) do
+        blocks[#blocks+1] = {prompt = item.prompt, rows = item.rows, note = noteFor(item), live = true}
     end
     if #blocks == 0 then blocks[1] = {rows = {}, note = '(new conversation)'} end
     NS.RenderTranscript(blocks, focus)
 end
+local function refreshChats() if NS.RefreshChats then NS.RefreshChats() end end
 
--- A prompt was just sent: show it at the bottom of the conversation.
-function NS.StartExchange(prompt)
-    current = {prompt = prompt, rows = {}, note = '(sending...)', text = ''}
-    NS.RefreshTranscript('last')
+-- A prompt was just sent: show it at the bottom of its chat.
+function NS.StartExchange(request, chat, prompt)
+    inflight[request] = {request = request, chat = chat, prompt = prompt, text = '', state = 0, rows = {},
+                         sentAt = GetTime()}
+    queried, queryCount = {}, 0
+    if chat == NS.S.chat then NS.RefreshTranscript('last') end
+    refreshChats()
 end
 
-function NS.ShowReply(text, state, complete)
-    local markup, missing, _, rows = NS.RenderReply(text)
-    local note = STATE_NOTE[state]
-    if not complete and state >= 4 then note = 'receiving the rest...' end
-    local recorded = complete and state >= 4
-    if recorded then record(NS.currentPrompt, text, state) end
-    current = {text = text, state = state, complete = complete, markup = markup, prompt = NS.currentPrompt,
-               rows = rows, note = note and ('('..note..')'), recorded = recorded}
-    NS.RefreshTranscript()
-    return missing
+-- A finished reply you are not looking at is copied into the chat frame (up
+-- to /ab echo characters), links and all, labelled with its chat.
+local function echo(chat, text, state)
+    local limit = tonumber(NS.S.echo) or 0
+    if limit <= 0 or (panel:IsShown() and NS.S.chat == chat) then return end
+    local cut = #text > limit and NS.TrimUTF8(text:sub(1, limit)) or text
+    local _, _, _, rows = NS.RenderReply(cut, 0)
+    local label = '|cff66bbffAgent Bridge|r |cffffd100['..NS.Escape(NS.ChatTitle(chat))..']|r'
+    if state ~= 4 then label = label..' |cffff8080'..(STATE_NOTE[state] or 'finished with a problem')..'|r' end
+    DEFAULT_CHAT_FRAME:AddMessage(label)
+    for _, row in ipairs(rows) do
+        if row.text:find('%S') then DEFAULT_CHAT_FRAME:AddMessage('  '..row.text) end
+    end
+    if #cut < #text then
+        DEFAULT_CHAT_FRAME:AddMessage('|cff909090  ('..(#text - #cut)..' more characters: /ab to read the rest)|r')
+    end
 end
-function NS.ClearReply() current, queried, queryCount, retryUntil = nil, {}, 0, 0 end
-function NS.HasHistory()
-    for _, exchange in ipairs(history()) do
-        if exchange.c == NS.S.conversation then return true end
+
+function NS.ShowReply(request, text, state, complete)
+    local item = inflight[request]
+    if not item then return end
+    if complete and state >= 4 then
+        inflight[request] = nil
+        record(item.chat, item.prompt, text, state)
+        if item.chat == NS.S.chat then NS.RefreshTranscript() end
+        echo(item.chat, text, state)
+        refreshChats()
+        return
+    end
+    item.text, item.state = text, state
+    if state >= 3 then
+        local _, missing, _, rows = NS.RenderReply(text)
+        item.rows, item.missing = rows, missing
+    else
+        item.rows = {}
+    end
+    if item.chat == NS.S.chat then NS.RefreshTranscript() end
+end
+
+function NS.IsChatBusy(chat)
+    for _, item in pairs(inflight) do
+        if item.chat == chat then return true end
     end
     return false
 end
+function NS.HasHistory(chat)
+    chat = chat or NS.S.chat
+    for _, exchange in ipairs(history()) do
+        if exchange.c == chat then return true end
+    end
+    return false
+end
+-- A deleted chat: stop waiting for its replies (the companion keeps them) and
+-- drop its transcript.
+function NS.ForgetChat(chat)
+    for request, item in pairs(inflight) do
+        if item.chat == chat then
+            inflight[request] = nil
+            NS.ForgetRequest(request); NS.AckPrompt(request)
+        end
+    end
+    local list = history()
+    for i = #list, 1, -1 do
+        if list[i].c == chat then table.remove(list, i) end
+    end
+end
 
--- Re-render once uncached items arrive from the server (bounded to 10 s).
+-- Plain text for the copy box: the last reply in this chat, or all of it.
+function NS.CopyText(all)
+    local out, last = {}, nil
+    for _, exchange in ipairs(history()) do
+        if exchange.c == NS.S.chat then
+            last = exchange.r or ''
+            out[#out+1] = 'You: '..(exchange.p or '')..'\n\n'..last
+        end
+    end
+    if all then return table.concat(out, '\n\n----\n\n') end
+    return last or ''
+end
+
+-- Once a second: re-render replies whose items were still loading (for up to
+-- 10 s after the server was asked), and keep the elapsed time under a prompt
+-- that is still under way ticking.
 local poll, elapsed = CreateFrame('Frame'), 0
 poll:SetScript('OnUpdate', function(_, dt)
     elapsed = elapsed + dt
-    if elapsed < 1 or not current or not current.markup or GetTime() > retryUntil then return end
+    if elapsed < 1 or not NS.S then return end
     elapsed = 0
-    local markup, missing = NS.RenderReply(current.text)
-    if markup ~= current.markup then
-        for exchange in pairs(rendered) do rendered[exchange] = nil end
-        NS.ShowReply(current.text, current.state, current.complete)
+    if GetTime() <= retryUntil then
+        local stale = false
+        for exchange, hit in pairs(rendered) do
+            if hit.missing then rendered[exchange] = nil; stale = true end
+        end
+        for _, item in pairs(inflight) do
+            if item.missing and item.state >= 3 then
+                local _, missing, _, rows = NS.RenderReply(item.text)
+                item.rows, item.missing, stale = rows, missing, true
+            end
+        end
+        if stale then NS.RefreshTranscript() end
     end
-    if not missing then retryUntil = 0 end
+    if panel:IsShown() then
+        local list = pending(NS.S.chat)
+        if #list > 0 then NS.SetLiveNote(noteFor(list[#list])) end
+    end
 end)
 
 hook('OnHyperlinkEnter', function(self, data)

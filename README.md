@@ -13,7 +13,7 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 | Game → companion | 128 × 8 cell strip at the top of the screen, any opacity | Differences between cell pairs in a screen capture |
 | Companion → game | An unused font file in the addon's bank | Glyph advance widths via `GetStringWidth` |
 
-**Prompts.** The addon splits the UTF-8 prompt (max 1,280 bytes) into 64-byte checksummed frames and flashes them on the strip. Every bit is a *pair* of neighbouring cells, one light and one dark, and the companion reads the difference between them. Because only the difference matters, the strip decodes at any opacity, so you can turn it down with `/ab alpha 0.5` and still see the UI through it. A pair straddling a hard UI edge reads as low contrast and rejects the frame rather than guessing. The strip also carries a *control* frame: which font slot the addon will load next, how many milliseconds until it does, and which reply fragment it needs. The strip is only shown during an exchange.
+**Prompts.** The addon splits the UTF-8 prompt (max 8,000 bytes, including the header, linked tooltips and game context described under [In game](#in-game)) into 64-byte checksummed frames and flashes them on the strip. Every bit is a *pair* of neighbouring cells, one light and one dark, and the companion reads the difference between them. Because only the difference matters, the strip decodes at any opacity, so you can turn it down with `/ab alpha 0.5` and still see the UI through it. A pair straddling a hard UI edge reads as low contrast and rejects the frame rather than guessing. The strip also carries a *control* frame: which font slot the addon will load next, how many milliseconds until it does, and which reply fragment it needs. The strip is only shown during an exchange.
 
 **Replies.** A reply packet is 4,096 bytes: a 32-byte header, 4,060 bytes of text, and an Adler-32 checksum. The companion writes it into the requested slot as a TrueType font. Each byte uses two glyphs, one per 4-bit nibble: glyph `U+E000 + i` has advance `(2 + value) × 128` units at 1,024 units/em. Lua measures each glyph, recovers the nibbles, validates the packet, joins the fragments, and displays plain text with native item links. Polls read only the 32-byte header first, so an unchanged status, an empty slot or a stale one costs a fraction of a second instead of a full packet.
 
@@ -78,7 +78,9 @@ On first launch, pick the folder the agent should work in. In the window you can
 
 Capture starts automatically and finds the strip by itself.
 
-**Continuing a conversation you started elsewhere.** Every in-game follow-up resumes the previous session of whichever agent answered last — `--resume` for Claude Code, `exec resume` for Codex — across `/reload` and game restarts, until you press **New chat**. To pick up a conversation you had at your desk, click **Continue a conversation…**, choose it from the list, and send your next prompt in game; the work folder switches to match it. Claude Code branches with `--fork-session`, leaving the original transcript untouched. Codex has no branching, so in-game turns are appended to that thread.
+**Chats and sessions.** Each chat in the panel is its own agent conversation. A follow-up resumes that chat's previous session with whichever agent answered last — `--resume` for Claude Code, `exec resume` for Codex — across `/reload` and game restarts. Up to three agents run at once, one per chat; a second prompt in the same chat waits for the first, since it resumes the session that one produces.
+
+**Continuing a conversation you started elsewhere.** To pick up a conversation you had at your desk, click **Continue a conversation…**, choose it from the list, and send your next prompt in game; the work folder switches to match it. Claude Code branches with `--fork-session`, leaving the original transcript untouched. Codex has no branching, so in-game turns are appended to that thread.
 
 | Access | Claude Code | Codex |
 | --- | --- | --- |
@@ -93,10 +95,15 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Action | How |
 | --- | --- |
 | Show / hide the panel | `/ab` (also `/agent`, `/claude`, `/codex`), minimap button, or a key binding |
-| Type a prompt quickly | Right-click the minimap button, or bind "Open panel and type a prompt" |
-| Link an item | Focus the input box, then Shift-click or drag an item into it |
-| Scroll back through the conversation | Mouse wheel or the scrollbar; Shift+wheel pages |
-| New conversation | **New chat** or `/ab new` gives a clean page. Otherwise follow-ups continue the conversation, even across `/reload` |
+| Type a prompt quickly | `/ai <message>` from the chat box, right-click the minimap button, or bind "Open panel and type a prompt" |
+| Link an item, spell or quest | Focus the input box, then Shift-click or drag it in; with `/ai`, Shift-click into the chat box as usual |
+| Scroll back through a chat | Mouse wheel or the scrollbar; Shift+wheel pages |
+| Start another chat | **+ New chat** in the list, or `/ab new [name]`. The others keep running |
+| Switch chats | Click one in the list, or `/ab chat <number or name>`; `/ab chats` lists them |
+| Rename or delete a chat | Right-click it in the list, or `/ab rename <name>` and `/ab delete` |
+| Copy a reply out of the game | **Copy** or `/ab copy` (last reply), `/ab copy all` (whole chat); then Ctrl+C |
+| Replies in the chat frame | `/ab echo short` (default, 800 characters), `full`, `off`, or a number |
+| Game context | `/ab context on` (default), `off`, or `show` to see exactly what is sent |
 | Continue an existing chat | In the companion: **Continue a conversation…**, pick one, then send from the game |
 | Check the font channel | **Self-test** or `/ab test` (prints per-size results) |
 | See through the strip | `/ab alpha 0.5` (0.2 to 1) |
@@ -104,7 +111,16 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Channel state | `/ab status` |
 | Move the strip | `/ab strip top` (or `topleft`, `topright`, `bottom`, `bottomleft`, `bottomright`); the companion follows |
 
-The panel is a scrolling transcript of the conversation, with every prompt and reply in order. Sending a prompt scrolls it into view, and updates to a reply keep your place, so you can read back while it arrives. The last 40 exchanges (up to 150 KB) are kept across `/reload` and restarts; the companion keeps every reply permanently.
+The panel lists your chats down the left: the one you are reading is highlighted, `...` marks one still working, and `*` one with a reply you have not read. Each chat is a scrolling transcript. Sending a prompt scrolls it into view, and updates to a reply keep your place, so you can read back while it arrives. Under a prompt still under way, a line shows what the agent is doing (how many actions so far and the latest one, such as a file it read or a search) and a running clock. The last 30 exchanges per chat (up to 200 KB in all) are kept across `/reload` and restarts; the companion keeps every reply permanently.
+
+A reply that finishes while you are not reading it — the panel is closed, or you are in another chat — is copied into the chat frame, labelled with its chat, with item links intact.
+
+**What the agent is told.** Each prompt carries a small header: which chat it belongs to, the chat's name, and, unless `/ab context off`, your character's state when you sent it:
+- name, level, race, class, faction and guild
+- zone, subzone, map coordinates and any instance
+- money, talent points per tree and professions
+
+Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes the game state to Claude Code as part of the system prompt, and to Codex ahead of your message, marked as data about your character rather than instructions. Only your own character's state is read, and only when you send.
 
 Replies render as plain text. `[Name](item:ID)` references become item links; everything else is escaped. Nothing in a reply can run as code or perform a game action.
 
@@ -120,7 +136,8 @@ Replies render as plain text. `[Name](item:ID)` references become item links; ev
 
 **Not yet exercised live** (covered by simulation and unit tests only):
 
-- The multi-prompt transcript, which shipped after the last live session.
+- Parallel chats and the chat list, the game context, linked tooltips, the progress line, `/ai`, the copy box and chat-frame echo, all added after the last live session.
+- The multi-prompt transcript, beyond the scroll-on-open fix.
 - Replies longer than one 4,060-byte packet, and streaming previews.
 - Aligned tables in the fixed-width font, and item-link tooltips. The panel is now a plain frame, and 3.3.5a may not send hover events there; if not, item links show as coloured names without tooltips.
 - Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
@@ -146,7 +163,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - window resize recalibration
 - epoch recycling
 
-Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload`, New chat and its size cap.
+Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, and check the envelope each prompt carries (chat, name, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, the inbox migration and how game context reaches each agent.
 
 ## Credits and licence
 

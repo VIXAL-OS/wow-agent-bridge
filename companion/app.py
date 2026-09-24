@@ -4,7 +4,9 @@ Only the strip region is decoded and captures are never saved. Nothing is sent
 to the game process; replies travel through addon font files.
 """
 import argparse
+from contextlib import closing
 import ctypes
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -20,7 +22,7 @@ from .capture import grab, grab_window
 from .launching import claude_models, codex_models, find_claude, find_codex
 from .native import NativeBridge, validate_addon
 from .notifications import ReplyBanner
-from .protocol import Assembler, decode_image, frame_kind, parse_control
+from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope
 from .sessions import list_sessions
 from .wow import EpochKeeper, StripLocator, game_dir_for
 
@@ -28,8 +30,82 @@ LABELS = {'queued': 'Queued', 'working': 'Working', 'streaming': 'Writing', 'don
           'failed': 'Failed', 'interrupted': 'Interrupted'}
 
 
+WORKERS, MAX_OPEN = 3, 16  # agents running at once; prompts accepted but not finished
+
+
 def conversation_of(key):
     return key.split(':', 1)[0][:8]
+
+
+def chat_of(key, fields):
+    """The chat a prompt belongs to, as 8 hex digits.
+
+    The addon names it in the prompt's envelope. Older addons put the conversation
+    number at the start of the session instead, and it is the same number, so a
+    conversation from before chats existed carries on as its chat.
+    """
+    value = (fields.get('chat') or [''])[0]
+    if value.isdigit() and int(value) < 2 ** 32:
+        return f'{int(value):08x}'
+    return conversation_of(key)
+
+
+@dataclass
+class Request:
+    key: str
+    prompt: str
+    chat: str
+    name: str = ''
+    context: str = ''
+
+
+class Scheduler:
+    """Several agents at once, in arrival order, but one at a time per chat: a
+    chat's next turn resumes the session its previous turn produced."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.waiting, self.running = [], {}  # running: key -> chat
+
+    def put(self, request):
+        with self.cond:
+            if len(self.waiting) + len(self.running) >= MAX_OPEN:
+                return False
+            self.waiting.append(request)
+            self.cond.notify_all()
+            return True
+
+    def take(self):
+        with self.cond:
+            while True:
+                busy = set(self.running.values())
+                for index, request in enumerate(self.waiting):
+                    if request.chat not in busy:
+                        del self.waiting[index]
+                        self.running[request.key] = request.chat
+                        return request
+                self.cond.wait()
+
+    def done(self, key):
+        with self.cond:
+            self.running.pop(key, None)
+            self.cond.notify_all()
+
+    def open(self):
+        with self.cond:
+            return len(self.waiting) + len(self.running)
+
+    def describe(self, key):
+        """What a queued prompt is waiting for, as shown under it in game."""
+        with self.cond:
+            busy = set(self.running.values())
+            for index, request in enumerate(self.waiting):
+                if request.key == key:
+                    if request.chat in busy:
+                        return 'Queued behind the previous prompt in this chat.'
+                    ahead = sum(1 for other in self.waiting[:index] if other.chat not in busy)
+                    return f'Queued: {len(self.running)} running, {ahead} ahead of this one.'
+            return 'Starting.'
 
 
 class Inbox:
@@ -37,15 +113,25 @@ class Inbox:
         self.path = path
         self.db = sqlite3.connect(path)
         self.db.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, prompt TEXT, state TEXT, reply TEXT, '
-                        'backend TEXT, agent_session TEXT, created REAL)')
+                        'backend TEXT, agent_session TEXT, created REAL, chat TEXT, meta TEXT)')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
+        if 'chat' not in columns:
+            # Inboxes from before chats: each conversation becomes its chat.
+            self.db.execute('ALTER TABLE jobs ADD COLUMN chat TEXT')
+            self.db.execute('UPDATE jobs SET chat=substr(id, 1, 8)')
+        if 'meta' not in columns:
+            self.db.execute('ALTER TABLE jobs ADD COLUMN meta TEXT')
         # A crash may have happened after the agent ran. Never replay automatically.
         self.db.execute("UPDATE jobs SET state='interrupted' WHERE state IN ('queued','working','streaming')")
         self.db.commit()
 
-    def add(self, key, prompt, backend):
+    def add(self, request, backend):
+        meta = json.dumps({'name': request.name, 'context': request.context}, ensure_ascii=False)
         with self.db:
-            cursor = self.db.execute('INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?,?)',
-                                     (key, prompt, 'queued', '', backend, None, time.time()))
+            cursor = self.db.execute('INSERT OR IGNORE INTO jobs (id, prompt, state, reply, backend, agent_session, '
+                                     'created, chat, meta) VALUES (?,?,?,?,?,?,?,?,?)',
+                                     (request.key, request.prompt, 'queued', '', backend, None, time.time(),
+                                      request.chat, meta))
         return cursor.rowcount == 1
 
     def update(self, key, state, reply, agent_session=None):
@@ -66,28 +152,34 @@ class Context:
     the next job can start before the UI thread has committed the previous one."""
 
     def __init__(self, path):
-        self.path, self.recent = path, {}
+        self.path, self.recent, self.lock = path, {}, threading.Lock()
 
     def remember(self, key, backend, result):
-        self.recent[key] = (result.state, result.reply, backend, result.agent_session)
-        while len(self.recent) > 16:
-            self.recent.pop(next(iter(self.recent)))
+        with self.lock:
+            self.recent[key] = (result.state, result.reply, backend, result.agent_session)
+            while len(self.recent) > 32:
+                self.recent.pop(next(iter(self.recent)))
 
-    def job(self, key, prompt, backend):
-        with sqlite3.connect(self.path) as db:
-            rows = db.execute('SELECT id,prompt,state,reply,backend,agent_session FROM jobs WHERE id LIKE ? '
+    def job(self, request, backend):
+        """Earlier turns of this chat, and the session to resume if the last one
+        ran on the same agent."""
+        # closing(): a connection's own `with` commits but leaves it open.
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute('SELECT id,prompt,state,reply,backend,agent_session FROM jobs WHERE chat=? '
                               'AND rowid < (SELECT rowid FROM jobs WHERE id=?) ORDER BY rowid DESC LIMIT 8',
-                              (conversation_of(key) + '%', key)).fetchall()
+                              (request.chat, request.key)).fetchall()
+        with self.lock:
+            recent = dict(self.recent)
         turns = []
         for old, user, state, reply, old_backend, session in reversed(rows):
-            if old in self.recent:
-                state, reply, old_backend, session = self.recent[old]
+            if old in recent:
+                state, reply, old_backend, session = recent[old]
             if state == 'done':
                 turns.append((user, reply[:8000], old_backend, session))
         resume = None
         if turns and turns[-1][2] == backend and turns[-1][3]:
             resume = turns[-1][3]
-        return Job(key, prompt, resume, [(u, r) for u, r, _, _ in turns])
+        return Job(request.key, request.prompt, resume, [(u, r) for u, r, _, _ in turns], context=request.context)
 
 
 class App:
@@ -108,10 +200,10 @@ class App:
         self.guidance.write_text(GUIDANCE, encoding='utf-8')
         self.inbox = Inbox(args.state / 'inbox.sqlite3')
         self.assembler = Assembler()
-        self.jobs, self.events = queue.Queue(maxsize=8), queue.Queue()
-        self.activity, self.capturing, self.closed = {}, False, False
+        self.scheduler, self.context, self.events = Scheduler(), Context(self.inbox.path), queue.Queue()
+        self.activity, self.names, self.capturing, self.closed = {}, {}, False, False
         self.pending_resume = getattr(args, 'resume_session', None)
-        self.pending_branch = True
+        self.pending_branch, self.picker_lock = True, threading.Lock()
         self.frames, self.retry_at, self.last_status = 0, 0.0, None
         self.last_frame_at = self.last_attempt = self.window_at = -1e9
         self.capture_mode = 'screen'
@@ -123,7 +215,8 @@ class App:
             self.write(f'[{state}] {key}\nYou: {prompt}\n{reply}\n')
         self.write('Only the strip region is decoded; screenshots are never saved.')
         self.pending_publish, self.publish_wanted = None, threading.Event()
-        threading.Thread(target=self.worker, daemon=True).start()
+        for _ in range(WORKERS):
+            threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.publisher, daemon=True).start()
         root.protocol('WM_DELETE_WINDOW', self.close)
         if args.start_capture or self.settings.get('capture', True):
@@ -246,7 +339,7 @@ class App:
         self.project_label.set(f'Work folder: {self.project()}')
 
     def choose_project(self):
-        if self.jobs.unfinished_tasks:
+        if self.scheduler.open():
             self.write('Wait for running jobs to finish before changing work folders.')
             return
         chosen = filedialog.askdirectory(parent=self.root, title='Folder the agent works in', initialdir=str(self.project()))
@@ -331,28 +424,36 @@ class App:
                            guidance_file=self.guidance, web=self.web.get())
 
     def worker(self):
-        context = Context(self.inbox.path)
         while True:
-            key, prompt = self.jobs.get()
+            request = self.scheduler.take()
+            key = request.key
             cfg = self.agent_config()
             label = BACKENDS.get(cfg.backend, 'The agent')
             self.events.put((key, 'working', f'{label} is working ({cfg.sandbox}).', None))
+            actions = 0
+
+            def activity(what):
+                # Shown under the prompt in game: how far along, and the latest step.
+                nonlocal actions
+                actions += 1
+                count = f'{actions} action' + ('' if actions == 1 else 's')
+                self.events.put((key, 'activity', f'{label} is working · {count} · {what}', None))
             try:
-                job = context.job(key, prompt, cfg.backend)
-                chosen, self.pending_resume = self.pending_resume, None
+                job = self.context.job(request, cfg.backend)
+                with self.picker_lock:
+                    chosen, self.pending_resume = self.pending_resume, None
                 if chosen:
-                    job = Job(key, prompt, resume=chosen, history=job.history,
-                              fork=self.pending_branch and cfg.backend == 'claude')
+                    job = Job(key, request.prompt, resume=chosen, history=job.history,
+                              fork=self.pending_branch and cfg.backend == 'claude', context=request.context)
                     self.root.after(0, lambda: self.conversation.set('In-game conversation: continuing the last one'))
-                result = run_agent(cfg, job,
-                                   on_update=lambda text: self.events.put((key, 'streaming', text, None)),
-                                   on_activity=lambda what: self.events.put((key, 'activity', f'{label} is working. {what}', None)))
-                context.remember(key, cfg.backend, result)
+                result = run_agent(cfg, job, on_update=lambda text: self.events.put((key, 'streaming', text, None)),
+                                   on_activity=activity)
+                self.context.remember(key, cfg.backend, result)
                 self.events.put((key, result.state, result.reply, result.agent_session))
             except Exception as exc:  # Report, never crash the worker.
                 self.events.put((key, 'failed', f'Companion error: {exc}', None))
             finally:
-                self.jobs.task_done()
+                self.scheduler.done(key)
 
     # ---- main loop ------------------------------------------------------
     def snapshot(self, key):
@@ -360,8 +461,11 @@ class App:
         if row['state'] == 'working' and key in self.activity:
             row['reply'] = self.activity[key]
         if row['state'] == 'queued':
-            row['reply'] = f'Queued behind {max(0, self.jobs.unfinished_tasks - 1)} other request(s).'
+            row['reply'] = self.scheduler.describe(key)
         return row
+
+    def name_of(self, key):
+        return f'{self.names.get(key) or "chat"} #{key.rsplit(":", 1)[-1]}'
 
     def handle_events(self):
         while not self.events.empty():
@@ -377,12 +481,12 @@ class App:
                 self.inbox.update(key, state, '')
             else:
                 self.inbox.update(key, state, text, session)
-            self.job_status.set(f'{LABELS.get(state, state)} (prompt {key.rsplit(":", 1)[-1]})')
+            self.job_status.set(f'{LABELS.get(state, state)}: {self.name_of(key)}')
             if state in ('done', 'failed'):
                 self.activity.pop(key, None)
                 row = self.inbox.get(key) or {}
                 saved = self.save_reply(key, state, row.get('prompt', ''), text)
-                self.write(f'[{state}] {key}  (saved as {saved.name})\n{text}\n')
+                self.write(f'[{state}] {self.name_of(key)}  (saved as {saved.name})\n{text}\n')
                 if self.notify_enabled.get():
                     self.root.bell()
                     self.banner.show('Agent replied' if state == 'done' else 'Agent needs attention', text)
@@ -533,15 +637,20 @@ class App:
             self.publish(parse_control(frame))
             return
         result = self.assembler.accept(frame)
-        if result and not self.jobs.full():
-            key, prompt = result
-            if self.inbox.add(key, prompt, self.backend.get()):
-                self.write(f'[queued] {key}\nYou: {prompt}')
-                self.job_status.set(f'Queued (prompt {key.rsplit(":", 1)[-1]})')
-                self.jobs.put_nowait((key, prompt))
+        # When full, the prompt is not taken: the addon repeats it until acknowledged.
+        if result and self.scheduler.open() < MAX_OPEN:
+            key, blob = result
+            fields, body = parse_envelope(blob)
+            name = (fields.get('name') or [''])[0]
+            request = Request(key, body, chat_of(key, fields), name, '\n'.join(fields.get('ctx', [])))
+            if self.inbox.add(request, self.backend.get()):
+                self.names[key] = name
+                self.write(f'[queued] {self.name_of(key)}\nYou: {body}')
+                self.job_status.set(f'Queued: {self.name_of(key)}')
+                self.scheduler.put(request)
 
     def close(self):
-        if self.jobs.unfinished_tasks:
+        if self.scheduler.open():
             self.toggle_capture(False)
             self.capture_status.set('Capture paused. Close again after running jobs finish.')
             if getattr(self, '_close_warned', False):

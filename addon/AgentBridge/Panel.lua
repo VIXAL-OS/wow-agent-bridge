@@ -4,18 +4,19 @@ local Size = NS.Size
 
 local panel = CreateFrame('Frame', 'AgentBridgePanel', UIParent)
 NS.Panel = panel
-Size(panel, 560, 520); panel:SetPoint('CENTER'); panel:Hide()
+Size(panel, 720, 520); panel:SetPoint('CENTER'); panel:Hide()
 panel:SetFrameStrata('DIALOG'); panel:SetToplevel(true); panel:SetClampedToScreen(true)
 panel:SetBackdrop({bgFile = 'Interface\\DialogFrame\\UI-DialogBox-Background',
     edgeFile = 'Interface\\DialogFrame\\UI-DialogBox-Border', tile = true, tileSize = 32, edgeSize = 32,
     insets = {left = 11, right = 12, top = 12, bottom = 11}})
-panel:SetMovable(true); panel:SetResizable(true); panel:SetMinResize(420, 300)
+panel:SetMovable(true); panel:SetResizable(true); panel:SetMinResize(560, 320)
 panel:EnableMouse(true); panel:RegisterForDrag('LeftButton')
 tinsert(UISpecialFrames, 'AgentBridgePanel')
 
 local function savePanel()
     local point, _, relative, x, y = panel:GetPoint()
-    NS.S.panel = {point = point, relative = relative, x = x, y = y, w = panel:GetWidth(), h = panel:GetHeight()}
+    NS.S.panel = {point = point, relative = relative, x = x, y = y, w = panel:GetWidth(), h = panel:GetHeight(),
+                  sidebar = true}
 end
 panel:SetScript('OnDragStart', function(self) self:StartMoving() end)
 panel:SetScript('OnDragStop', function(self) self:StopMovingOrSizing(); savePanel() end)
@@ -35,8 +36,9 @@ status:SetPoint('TOPLEFT', 22, -32); status:SetPoint('TOPRIGHT', -36, -32); stat
 status:SetText('Send a prompt. The reply appears here while the companion runs.')
 function NS.SetStatus(text) status:SetText(text) end
 
+local SIDEBAR = 150  -- the chat list down the left
 local inset = CreateFrame('Frame', nil, panel)
-inset:SetPoint('TOPLEFT', 18, -48); inset:SetPoint('BOTTOMRIGHT', -18, 80)
+inset:SetPoint('TOPLEFT', 18 + SIDEBAR + 4, -48); inset:SetPoint('BOTTOMRIGHT', -18, 80)
 inset:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
     edgeFile = 'Interface\\Tooltips\\UI-Tooltip-Border', tile = true, tileSize = 16, edgeSize = 16,
     insets = {left = 4, right = 4, top = 4, bottom = 4}})
@@ -114,7 +116,7 @@ function NS.BodyColumns()
     return math.floor(textWidth() / char)
 end
 
-local lines, shown, blocks, lastPrompt = {}, 0, {}, nil
+local lines, shown, blocks, lastPrompt, liveLine = {}, 0, {}, nil, nil
 local function line(i)
     if not lines[i] then
         local fs = body:CreateFontString(nil, 'ARTWORK')
@@ -152,6 +154,9 @@ local function layout(focus)
         for _, row in ipairs(block.rows or {}) do add(row.text, row.mono) end
         if block.note then add('|cff999999'..block.note..'|r') end
     end
+    -- The note under a prompt still under way is updated in place each second.
+    local last = blocks[#blocks]
+    liveLine = last and last.live and last.note and lines[n] or nil
     for i = n + 1, #lines do lines[i]:Hide() end
     shown = n
     body:SetHeight(math.max(1, y))
@@ -171,6 +176,9 @@ function NS.RenderBody(prompt, rows, note)
     local focus = prompt ~= lastPrompt and 'last' or nil
     lastPrompt = prompt
     NS.RenderTranscript({{prompt = prompt, rows = rows or {}, note = note}}, focus)
+end
+function NS.SetLiveNote(text)
+    if liveLine then liveLine:SetText('|cff999999'..text..'|r') end
 end
 function NS.BodyText()
     local out = {}
@@ -203,10 +211,9 @@ end)
 
 local edit = CreateFrame('EditBox', 'AgentBridgeInput', panel, 'InputBoxTemplate')
 NS.Input = edit
-edit:SetPoint('BOTTOMLEFT', 28, 48); edit:SetPoint('BOTTOMRIGHT', -112, 48); edit:SetHeight(24)
-edit:SetAutoFocus(false); edit:SetMaxBytes(NS.MAX_PROMPT)
+edit:SetPoint('BOTTOMLEFT', 28 + SIDEBAR + 4, 48); edit:SetPoint('BOTTOMRIGHT', -112, 48); edit:SetHeight(24)
+edit:SetAutoFocus(false); edit:SetMaxBytes(NS.MAX_TYPED)
 edit:SetScript('OnEscapePressed', function(self) self:ClearFocus() end)
-panel:SetScript('OnHide', function() edit:ClearFocus() end)
 
 local function button(label, width, ...)
     local b = CreateFrame('Button', nil, panel, 'UIPanelButtonTemplate')
@@ -215,15 +222,98 @@ local function button(label, width, ...)
 end
 local send = button('Send', 84, 'LEFT', edit, 'RIGHT', 8, 0)
 local pause = button('Pause', 90, 'BOTTOMLEFT', 20, 18)
-local newChat = button('New chat', 90, 'LEFT', pause, 'RIGHT', 6, 0)
-local test = button('Self-test', 90, 'LEFT', newChat, 'RIGHT', 6, 0)
+local copy = button('Copy', 90, 'LEFT', pause, 'RIGHT', 6, 0)
+local test = button('Self-test', 90, 'LEFT', copy, 'RIGHT', 6, 0)
 local hide = button('Hide', 70, 'BOTTOMRIGHT', -34, 18)
 NS.SendButton = send
 hide:SetScript('OnClick', function() panel:Hide() end)
 pause:SetScript('OnClick', function() if NS.IsReceiving() then NS.Pause() else NS.Resume() end end)
-newChat:SetScript('OnClick', function() NS.NewChat() end)
+copy:SetScript('OnClick', function() NS.ShowCopy(false) end)
 test:SetScript('OnClick', function() NS.RunSelfTest(true) end)
 function NS.OnReceiveState(active) pause:SetText(active and 'Pause' or 'Resume') end
+
+-- Chats down the left: the one you are reading is highlighted, "..." marks one
+-- still working and "*" one with a reply you have not read. Right-click a chat
+-- to rename or delete it; the mouse wheel scrolls a long list.
+local ROW = 20
+local side = CreateFrame('Frame', nil, panel)
+side:SetPoint('TOPLEFT', 18, -48); side:SetPoint('BOTTOMLEFT', 18, 44); side:SetWidth(SIDEBAR)
+side:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
+    edgeFile = 'Interface\\Tooltips\\UI-Tooltip-Border', tile = true, tileSize = 16, edgeSize = 16,
+    insets = {left = 4, right = 4, top = 4, bottom = 4}})
+side:SetBackdropColor(0, 0, 0, .65)
+local newChat = CreateFrame('Button', nil, side, 'UIPanelButtonTemplate')
+Size(newChat, SIDEBAR - 14, 22); newChat:SetPoint('TOP', 0, -6); newChat:SetText('+ New chat')
+newChat:SetScript('OnClick', function() NS.NewChat(); edit:SetFocus() end)
+
+local menu = CreateFrame('Frame', 'AgentBridgeChatMenu', panel)
+Size(menu, 112, 82); menu:SetFrameStrata('FULLSCREEN_DIALOG'); menu:Hide()
+menu:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
+    edgeFile = 'Interface\\Tooltips\\UI-Tooltip-Border', tile = true, tileSize = 16, edgeSize = 16,
+    insets = {left = 4, right = 4, top = 4, bottom = 4}})
+menu:SetBackdropColor(0, 0, 0, .9)
+tinsert(UISpecialFrames, 'AgentBridgeChatMenu')
+for index, entry in ipairs({{'Rename', function(id) NS.AskRename(id) end},
+                            {'Delete', function(id) NS.AskDelete(id) end}, {'Cancel', function() end}}) do
+    local b = CreateFrame('Button', nil, menu, 'UIPanelButtonTemplate')
+    Size(b, 96, 20); b:SetPoint('TOP', 0, -8 - (index - 1) * 22); b:SetText(entry[1])
+    b:SetScript('OnClick', function() menu:Hide(); entry[2](menu.chat) end)
+end
+
+local rows, first = {}, 1
+local function row(i)
+    if rows[i] then return rows[i] end
+    local b = CreateFrame('Button', nil, side)
+    Size(b, SIDEBAR - 14, ROW); b:SetPoint('TOPLEFT', 7, -32 - (i - 1) * ROW)
+    b:RegisterForClicks('LeftButtonUp', 'RightButtonUp')
+    b:SetHighlightTexture('Interface\\QuestFrame\\UI-QuestTitleHighlight', 'ADD')
+    b.selected = b:CreateTexture(nil, 'BACKGROUND')
+    b.selected:SetAllPoints(b); b.selected:SetTexture(.25, .45, 1, .35)
+    b.label = b:CreateFontString(nil, 'OVERLAY', 'GameFontHighlightSmall')
+    b.label:SetPoint('LEFT', b, 'LEFT', 4, 0); b.label:SetPoint('RIGHT', b, 'RIGHT', -4, 0)
+    b.label:SetHeight(ROW); b.label:SetJustifyH('LEFT')
+    b:SetScript('OnClick', function(self, which)
+        if which == 'RightButton' then
+            menu.chat = self.chat
+            menu:ClearAllPoints(); menu:SetPoint('TOPLEFT', self, 'TOPRIGHT', 2, 0); menu:Show()
+        else
+            menu:Hide(); NS.SelectChat(self.chat)
+        end
+    end)
+    rows[i] = b
+    return b
+end
+
+function NS.RefreshChats()
+    if not NS.S then return end
+    local list = NS.S.chats
+    local fit = math.max(1, math.floor(((side:GetHeight() or 300) - 40) / ROW))
+    first = math.max(1, math.min(first, #list - fit + 1))
+    for i = 1, fit do
+        local chat = list[first + i - 1]
+        if chat then
+            local b = row(i)
+            b.chat = chat.id
+            local mark = NS.IsChatBusy(chat.id) and '|cffffd100...|r ' or chat.unread and '|cff66ff88*|r ' or ''
+            b.label:SetText(mark..NS.Escape(NS.ChatTitle(chat.id)))
+            if chat.id == NS.S.chat then b.selected:Show() else b.selected:Hide() end
+            b:Show()
+        elseif rows[i] then
+            rows[i]:Hide()
+        end
+    end
+    for i = fit + 1, #rows do rows[i]:Hide() end
+end
+side:EnableMouseWheel(true)
+side:SetScript('OnMouseWheel', function(_, delta) first = first - delta; NS.RefreshChats() end)
+side:SetScript('OnSizeChanged', function() NS.RefreshChats() end)
+panel:SetScript('OnHide', function() edit:ClearFocus(); menu:Hide() end)
+panel:HookScript('OnShow', function()
+    -- Opening the panel reads the chat on show, so it is no longer unread.
+    local chat = NS.S and NS.CurrentChat and NS.CurrentChat()
+    if chat then chat.unread = nil end
+    NS.RefreshChats()
+end)
 
 local grip = CreateFrame('Button', nil, panel)
 Size(grip, 16, 16); grip:SetPoint('BOTTOMRIGHT', -10, 10)
@@ -291,7 +381,8 @@ NS.OnLoad(function(S)
     if type(p) == 'table' and p.point and p.w and p.h then
         panel:ClearAllPoints()
         panel:SetPoint(p.point, UIParent, p.relative or p.point, p.x or 0, p.y or 0)
-        Size(panel, math.max(420, p.w), math.max(300, p.h))
+        -- Panels saved before the chat list existed get wider once, to make room.
+        Size(panel, math.max(p.sidebar and 560 or 720, p.w), math.max(320, p.h))
     end
     placeMinimap()
 end)

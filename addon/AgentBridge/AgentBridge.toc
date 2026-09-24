@@ -11,4 +11,7 @@ Format.lua
 Strip.lua
 Receiver.lua
 Links.lua
+Context.lua
+Chats.lua
+Copy.lua
 Commands.lua

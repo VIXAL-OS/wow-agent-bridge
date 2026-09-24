@@ -4,9 +4,21 @@ local U16, U32, Adler = NS.U16, NS.U32, NS.Adler
 local ZERO = string.char(0)
 local PACKET, CHUNK = NS.REPLY_SIZE, NS.REPLY_SIZE - 36
 local EMPTY = string.rep(ZERO, PACKET)
-NS.MAX_PROMPT = 1280
+NS.MAX_PROMPT = 8000  -- the whole envelope: your text, linked tooltips, game context
+NS.MAX_TYPED = 2000   -- what you can type into the box
 
--- CPB1: prompt fragments of 40 bytes, at most 32 per prompt.
+-- The header the companion reads before your text: which chat it belongs to,
+-- its name, and the game context, one `key=value` per line. Control
+-- characters in values become spaces, so a value can never end the header.
+function NS.Envelope(fields, body)
+    local out = {'\1AB1'}
+    for _, pair in ipairs(fields) do
+        out[#out+1] = pair[1]..'='..(tostring(pair[2]):gsub('%c', ' '))
+    end
+    return table.concat(out, '\n')..'\n\2'..body
+end
+
+-- CPB1: prompt fragments of 40 bytes, at most 200 per prompt.
 function NS.EncodePrompt(text, session, request)
     assert(#text > 0 and #text <= NS.MAX_PROMPT and #session == 8)
     local frames, total = {}, math.ceil(#text/40)
