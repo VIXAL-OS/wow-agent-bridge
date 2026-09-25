@@ -132,6 +132,8 @@ function GetAddOnInfo(name)
 end
 function IsAddOnLoaded(name) return py.addon_loaded(name) end
 function LoadAddOn(name) return py.load_addon(name) end
+-- Tests start and end a fight by setting STUB.combat.
+function InCombatLockdown() return STUB.combat == true end
 function time() return 1758000000 + math.floor(py.now()) end
 function GetCVar(name) if name == 'gxResolution' then return '1920x1080' end end
 STUB.items, STUB.spells, STUB.itemRefs = {}, {}, {}

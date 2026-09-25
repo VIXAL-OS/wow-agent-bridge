@@ -75,6 +75,29 @@ class Hybrid(unittest.TestCase):
         fonts = [f for f in sim.client.loads if f.startswith('reply')]
         self.assertEqual(len(fonts), len(set(fonts)))
 
+    def test_combat_postpones_the_load_and_keeps_the_fast_path(self):
+        sim = self.sim()
+        sim.agent = agent(lambda prompt: prompt + HOSTILE)
+        blank = lua_file(b'')
+        fonts = lambda: len([f for f in sim.client.loads if f.startswith('reply')])
+        sim.send('first')
+        self.assertTrue(sim.run(150, until=lambda: slot_path(sim.addon, 1).read_bytes() != blank))
+        sim.g.STUB.combat = True  # the fight starts before the addon reads the announcement
+        sim.run(5)
+        held = fonts()
+        sim.run(20)
+        self.assertEqual(sim.hybrid_loads, [], 'nothing is loaded in combat')
+        self.assertIsNone(sim.last_reply())
+        self.assertEqual(fonts(), held, 'no font slots are spent while it waits')
+        self.assertIn(b'loads wait for combat to end', sim.ns.HybridInfo())
+        sim.g.STUB.combat = False
+        self.assertTrue(sim.run(10, until=lambda: sim.last_reply() == 'first' + HOSTILE))
+        self.assertEqual(sim.hybrid_loads, [b'AgentBridgeReply01'])
+        # Combat was not an error: the next long reply still takes the fast path.
+        sim.send('second')
+        self.assertTrue(sim.run(150, until=lambda: sim.last_reply() == 'second' + HOSTILE))
+        self.assertEqual(sim.hybrid_loads, [b'AgentBridgeReply01', b'AgentBridgeReply02'])
+
     def test_exhausted_pool_falls_back(self):
         sim = self.sim()
         sim.hybrid_loaded.update(sim.hybrid_installed)
@@ -136,7 +159,24 @@ class Hybrid(unittest.TestCase):
         self.assertEqual(bytes(sim.ns.EncodeControl(b'abcdefgh', 5, 9000, 1, True, 3, 2)),
                          encode_control(b'abcdefgh', 5, 9000, 1, True, 3, hybrid_slot=2))
         self.assertIsNone(sim.ns.LoadHybrid(b'bad', b'abcdefgh', 1)[0])
+        self.assertIsNone(sim.ns.ClaimHybrid(b'bad')[0])
         self.assertEqual(sim.hybrid_loads, [])
+
+    def test_two_replies_held_in_combat_keep_their_own_slots(self):
+        sim = self.sim()
+        sim.agent = agent(lambda prompt: prompt + HOSTILE)
+        sim.g.STUB.combat = True
+        first = sim.g.AgentBridgeState.chat
+        sim.send('first')
+        second = sim.ns.NewChat(b'Second').id
+        sim.send('second')
+        sim.run(90)
+        self.assertEqual((sim.hybrid_loads, sim.replies(first), sim.replies(second)), ([], [], []))
+        sim.g.STUB.combat = False
+        self.assertTrue(sim.run(10, until=lambda: sim.replies(first) and sim.replies(second)))
+        self.assertEqual(sim.replies(first), ['first' + HOSTILE])
+        self.assertEqual(sim.replies(second), ['second' + HOSTILE])
+        self.assertEqual(sorted(sim.hybrid_loads), [b'AgentBridgeReply01', b'AgentBridgeReply02'])
 
     def test_perf_records_timings_without_resetting_shared_clock(self):
         sim = self.sim('short')

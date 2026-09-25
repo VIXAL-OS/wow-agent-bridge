@@ -52,7 +52,9 @@ class BrowserLifetime(unittest.TestCase):
         self.addCleanup(sentinel.kill)
         child_code = ("import subprocess,sys,json,os,time; "
                       "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],creationflags=0x8); "
-                      "open(sys.argv[1],'w').write(json.dumps([os.getpid(),p.pid])); time.sleep(60)")
+                      # Rename into place: ready.json never exists without its contents.
+                      "f=open(sys.argv[1]+'.tmp','w'); f.write(json.dumps([os.getpid(),p.pid])); f.close(); "
+                      "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); time.sleep(60)")
         worker_code = ("from companion.browser_lifetime import protect_worker; "
                        "protect_worker(); protect_worker(); import subprocess,sys; "
                        "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],creationflags=0x8); "

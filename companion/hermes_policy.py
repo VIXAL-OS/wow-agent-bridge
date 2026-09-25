@@ -12,7 +12,13 @@ BASE_TOOLS = ['read_file', 'search_files', 'memory', 'session_search', 'todo_lis
               'skills_list', 'skill_view', 'skill_manage', 'delegate_task']
 BROWSER_READ = ['browser_navigate', 'browser_snapshot', 'browser_scroll', 'browser_back', 'browser_get_images']
 BROWSER_WRITE = ['browser_click', 'browser_type', 'browser_press']
-POLICY_VERSION = 3
+# Tools that change what Hermes knows or does in later runs.
+PERSISTENT = ('memory', 'skill_manage')
+# Tools whose results can carry text from outside this machine: search results,
+# web pages, images, and past sessions (which hold whatever earlier runs read).
+UNTRUSTED = ['web_search', 'web_extract', 'vision_analyze', 'session_search'] + BROWSER_READ + BROWSER_WRITE
+# Part of each session's identity: a policy change starts fresh sessions.
+POLICY_VERSION = 4
 
 
 def features(home):
@@ -30,6 +36,9 @@ def tool_names(level, web, extras=None):
         raise ValueError('Unknown Hermes access level: ' + str(level))
     extras = extras or {}
     names = list(BASE_TOOLS)
+    if level == 'read-only':
+        # Memory still reaches the model through its prompt; it just cannot change.
+        names = [name for name in names if name not in PERSISTENT]
     if web:
         names += ['web_search', 'web_extract']
         if extras.get('browser'):
@@ -102,9 +111,23 @@ def install_guards(project, level):
 
     File-edit modes enforce resolved paths, including symlinks/junctions. Shell
     mode is explicitly NOT an OS sandbox: commands have the user's permissions.
+
+    Memory and skills outlive a run, so an instruction planted in a web page
+    could steer every later one. They cannot change at read-only access, and at
+    any level they lock for the rest of a run once it has read untrusted
+    content. That covers subagents and Hermes's background review too: both
+    dispatch through this process's registry.
     """
     from tools.registry import registry
     lock = threading.RLock()
+    exposed = {'untrusted': False}
+    dispatch = registry.dispatch
+
+    def watched(name, args, **kwargs):
+        if name in UNTRUSTED:
+            exposed['untrusted'] = True  # before the call: even a failed fetch may return page text
+        return dispatch(name, args, **kwargs)
+    registry.dispatch = watched
     for name in ('write_file', 'patch', 'memory', 'skill_manage', 'text_to_speech'):
         entry = registry.get_entry(name)
         if entry is None or entry.is_async:
@@ -112,6 +135,14 @@ def install_guards(project, level):
         original = entry.handler
         def guarded(args, _name=name, _original=original, **kwargs):
             args = dict(args)
+            if _name in PERSISTENT:
+                if level == 'read-only':
+                    return json.dumps({'error': 'Memory and skills cannot change at read-only access.'})
+                if exposed['untrusted']:
+                    return json.dumps({'error': (
+                        'Memory and skills are locked for the rest of this run because it read web or '
+                        'other outside content, which could plant lasting instructions. Tell the user '
+                        'what you would have saved; they can ask you to save it in a new message.')})
             if _name == 'text_to_speech' and args.get('output_path'):
                 try:
                     if level == 'read-only':

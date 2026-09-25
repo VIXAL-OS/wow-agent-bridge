@@ -170,7 +170,8 @@ local function consume() slot = slot + 1; reading = nil end
 local function nextJob()
     local best
     for _, job in pairs(jobs) do
-        if not best or job.due < best.due then best = job end
+        -- A job holding a long-reply announcement needs no more font slots.
+        if not job.hybrid and (not best or job.due < best.due) then best = job end
     end
     return best
 end
@@ -221,8 +222,9 @@ function NS.ReceiverInfo()
         reading = reading ~= nil}
 end
 
-local function finish(job, reason, text, state, complete)
-    consume()
+-- Act on what a read produced. settle() is also used for a long reply loaded
+-- after combat, when the font slot that announced it was already retired.
+local function settle(job, reason, text, state, complete)
     local now = GetTime()
     if reason == 'Empty reply slot' then
         -- Nobody wrote this slot before it loaded (companion stopped, strip hidden).
@@ -291,6 +293,20 @@ local function finish(job, reason, text, state, complete)
     job.lastRevision = assembly.revision
     job.due = now + (state == 3 and 4 or math.min(MAX_POLL, POLL_WINDOW + job.unchanged * 2.5))
 end
+local function finish(job, reason, text, state, complete)
+    consume()
+    settle(job, reason, text, state, complete)
+end
+
+-- A long reply announced by a font packet: load its slot, or fall back to
+-- fonts for this reply if the slot does not check out.
+local function loadHybrid(job, descriptor)
+    local text, state = NS.Profile('hybrid-load', NS.LoadHybrid, descriptor, session, job.request)
+    if text then settle(job, nil, text, state, true); return end
+    job.assembly, job.lastRevision = NS.NewAssembly(), nil
+    settle(job, 'Stale reply packet')
+    NS.SetStatus('Long-reply slot unavailable; continuing through fonts.')
+end
 
 local function stepReceiver(now)
     for request, job in pairs(jobs) do
@@ -304,6 +320,17 @@ local function stepReceiver(now)
                 NS.OnReplyFinished(job.chat, 6)
             end
             if not next(jobs) then NS.OnReceiveState(false) end
+        end
+    end
+    if not reading and not NS.HybridBlocked() then
+        -- Out of combat: load one long reply that was held back, per frame.
+        for _, job in pairs(jobs) do
+            if job.hybrid then
+                local descriptor = job.hybrid
+                job.hybrid = nil
+                loadHybrid(job, descriptor)
+                return
+            end
         end
     end
     if not reading then
@@ -358,13 +385,18 @@ local function stepReceiver(now)
             local packet, why = NS.ParseReply(table.concat(reading.bytes), session, job.request, slot)
             if not packet then finish(job, why); return end
             if packet.state == 7 then
-                local text, state = NS.Profile('hybrid-load', NS.LoadHybrid, packet.text, session, job.request)
-                if not text then
+                consume()
+                if not NS.ClaimHybrid(packet.text) then
                     job.assembly, job.lastRevision = NS.NewAssembly(), nil
-                    finish(job, 'Stale reply packet')
+                    settle(job, 'Stale reply packet')
                     NS.SetStatus('Long-reply slot unavailable; continuing through fonts.')
+                elseif NS.HybridBlocked() then
+                    -- Slots are not loaded in combat. Hold the announcement and
+                    -- load it once combat ends; no font slots are spent meanwhile.
+                    job.hybrid = packet.text
+                    NS.SetStatus('A long reply is ready; it loads when combat ends.')
                 else
-                    finish(job, nil, text, state, true)
+                    loadHybrid(job, packet.text)
                 end
                 return
             end

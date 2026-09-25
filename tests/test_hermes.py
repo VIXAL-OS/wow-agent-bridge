@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from companion.agents import AgentConfig, Job, run_agent, run_process
 from companion.hermes import HermesStream, model_choices, resume_id, session_scope
-from companion.hermes_policy import features, install_scratch_policy, scratch_path, tool_names, write_path
+from companion.hermes_policy import (features, install_guards, install_scratch_policy, scratch_path, tool_names,
+                                     write_path)
 from companion.hermes_lock import profile_lock
 from tools.configure_hermes import configure, hydra_profiles
 from tests.harness import Sim
@@ -169,9 +170,10 @@ class Hermes(unittest.TestCase):
         read = set(tool_names('read-only', True, extras))
         edit = set(tool_names('workspace-write', True, extras))
         shell = set(tool_names('workspace-write+shell', True, extras))
-        self.assertTrue({'memory', 'skill_manage', 'delegate_task', 'read_file', 'search_files'} <= read)
+        self.assertTrue({'skill_view', 'skills_list', 'delegate_task', 'read_file', 'search_files'} <= read)
         self.assertFalse({'write_file', 'patch', 'terminal', 'process_manage', 'browser_click'} & read)
-        self.assertTrue({'write_file', 'patch'} <= edit)
+        self.assertFalse({'memory', 'skill_manage'} & read, 'read-only cannot change memory or skills')
+        self.assertTrue({'write_file', 'patch', 'memory', 'skill_manage'} <= edit)
         self.assertFalse({'terminal', 'browser_type'} & edit)
         self.assertTrue({'terminal', 'process_manage', 'browser_click', 'browser_type'} <= shell)
         self.assertFalse({'cronjob_manage', 'computer_use', 'execute_code', 'browser_console', 'browser_cdp'} & shell)
@@ -179,6 +181,53 @@ class Hermes(unittest.TestCase):
         self.assertFalse(any(t.startswith(('web_', 'browser_')) for t in offline))
         with self.assertRaises(ValueError):
             tool_names('all', True)
+
+    def guarded_registry(self, level):
+        """Hermes's registry, faked: install_guards wraps it as it would the real one."""
+        calls = []
+
+        class Registry:
+            def __init__(self):
+                self.entries = {}
+                for name in ('write_file', 'patch', 'memory', 'skill_manage', 'text_to_speech',
+                             'web_extract', 'read_file'):
+                    self.entries[name] = types.SimpleNamespace(
+                        handler=lambda args, _name=name, **kw: (calls.append(_name), json.dumps({'ok': _name}))[1],
+                        is_async=False, schema={'description': name}, toolset='t', check_fn=None,
+                        requires_env=[], description=name, emoji='', max_result_size_chars=None,
+                        dynamic_schema_overrides=None)
+
+            def get_entry(self, name):
+                return self.entries.get(name)
+
+            def register(self, name, handler, **_):
+                self.entries[name].handler = handler
+
+            def dispatch(self, name, args, **kwargs):
+                return self.entries[name].handler(args, **kwargs)
+
+        registry = Registry()
+        module = types.ModuleType('tools.registry')
+        module.registry = registry
+        with patch.dict(sys.modules, {'tools.registry': module}):
+            install_guards(self.home, level)
+        return registry, calls
+
+    def test_memory_and_skills_cannot_outlive_web_content(self):
+        registry, calls = self.guarded_registry('read-only')
+        for name in ('memory', 'skill_manage'):
+            self.assertIn('read-only', json.loads(registry.dispatch(name, {'action': 'add'}))['error'])
+        registry, calls = self.guarded_registry('workspace-write')
+        self.assertEqual(json.loads(registry.dispatch('memory', {'action': 'add'})), {'ok': 'memory'})
+        registry.dispatch('read_file', {'path': 'notes.txt'})  # local files do not lock memory
+        self.assertEqual(json.loads(registry.dispatch('skill_manage', {'action': 'create'})), {'ok': 'skill_manage'})
+        registry.dispatch('web_extract', {'urls': ['https://example.org']})
+        for name in ('memory', 'skill_manage'):
+            self.assertIn('locked for the rest of this run', json.loads(registry.dispatch(name, {'action': 'add'}))['error'])
+        self.assertEqual(calls, ['memory', 'read_file', 'skill_manage', 'web_extract'], 'locked calls never ran')
+        # The lock belongs to one run: the next run's worker starts clean.
+        registry, calls = self.guarded_registry('workspace-write')
+        self.assertEqual(json.loads(registry.dispatch('memory', {'action': 'add'})), {'ok': 'memory'})
 
     def test_workspace_write_boundaries(self):
         project = self.home / 'project'

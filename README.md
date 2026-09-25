@@ -29,7 +29,7 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 - 60 KB of hostile text (quotes, long brackets, escapes, UTF-8, NULs) arrived intact in 1–2 ms.
 - `PlaySoundFile` returns `1` for an empty file and a valid one alike, so it cannot tell the addon a reply is ready.
 
-The integrated hybrid keeps readiness checks, progress and short replies on fonts. When a finished reply exceeds 4,060 bytes (including its small agent/model header), the companion atomically writes it into the unused slot advertised by the addon, then publishes a font packet announcing it. The game loads that slot once. Sixteen slots are available per UI load; `/reload` frees them. Missing, disabled or exhausted slots fall back to fonts. A failed or invalid load disables the hybrid until the next UI load and retries the reply through fonts. During combat the addon offers no new hybrid slot.
+The integrated hybrid keeps readiness checks, progress and short replies on fonts. When a finished reply exceeds 4,060 bytes (including its small agent/model header), the companion atomically writes it into the unused slot advertised by the addon, then publishes a font packet announcing it. The game loads that slot once. Sixteen slots are available per UI load; `/reload` frees them. Missing, disabled or exhausted slots fall back to fonts. A failed or invalid load disables the hybrid until the next UI load and retries the reply through fonts. Slots are never loaded in combat: a long reply announced during a fight is held, its slot reserved, and it loads as soon as combat ends, without spending font slots meanwhile or turning the hybrid off.
 
 Only one fixed Lua assignment is generated: `AgentBridgeHybridData = "<lowercase hex>"`. The writer validates the entire source template immediately before publication. Reply text never enters Lua source directly. The receiver clears the global before and after loading, decodes hex, and checks the session, request, slot, final state, exact length and checksum against the font descriptor before displaying anything. The payload limit remains 60,000 bytes including metadata. There is no `loadstring` or reply-driven function call. This protects against reply text becoming code; it is not a sandbox for someone who can independently replace local addon files.
 
@@ -98,13 +98,13 @@ The companion's **Access** dropdown applies to Hermes:
 
 | Access | Hermes capabilities |
 | --- | --- |
-| `read-only` | Read and search files; use memory, skills, conversation search, task lists and delegation. |
-| `workspace-write` | Also create and patch files inside the selected **Work folder**. |
+| `read-only` | Read and search files; use existing memory and skills without changing them; conversation search, task lists and delegation. |
+| `workspace-write` | Also create and patch files inside the selected **Work folder**, and save memory and skills. |
 | `workspace-write+shell` | Also run terminal commands and tests, manage its processes, and interact with browser forms. |
 
 File tools resolve paths and reject edits outside the work folder, including symlinks/junctions, Git metadata and Windows alternate data streams. **Shell access runs commands with your Windows account's permissions; it is not an OS sandbox.** Memory, skills, sessions and media caches are stored in the separate Hermes bridge profile even at read-only project access. Project `AGENTS.md` instructions are loaded normally. Native desktop Hermes settings and conversations remain separate.
 
-Memory persists across new chats. Requests sharing a Hermes profile queue behind one another so memory and skills cannot be updated by competing bridge processes. Each run can delegate to at most two children, with no recursive spawning and a three-minute timeout per child. Children inherit the selected tools and cannot write the parent's memory. Automatic background review and title-generation calls stay disabled.
+Memory persists across new chats, which is also why it is guarded: an instruction planted in a web page could otherwise steer every later run. Once a run has used web search, a web page, the browser, image analysis or conversation search, memory and skills are locked for the rest of that run, including its children. Hermes then says what it would have saved, and you can ask it to save that in a new message. Requests sharing a Hermes profile queue behind one another so memory and skills cannot be updated by competing bridge processes. Each run can delegate to at most two children, with no recursive spawning and a three-minute timeout per child. Children inherit the selected tools and cannot write the parent's memory. Automatic background review and title-generation calls stay disabled.
 
 Optional tools require their dependencies before enabling them:
 
