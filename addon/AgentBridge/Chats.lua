@@ -73,7 +73,7 @@ end
 -- agent it last used, a new one takes the companion's selection, and the model
 -- is the companion's default for that agent). chat.seenAgent and seenModel are
 -- what the companion last reported actually answering.
-NS.AGENTS = {claude = 'Claude', codex = 'Codex', mock = 'Mock'}
+NS.AGENTS = {claude = 'Claude', codex = 'Codex', hermes = 'Hermes', mock = 'Mock'}
 local function validModel(model)
     return type(model) == 'string' and #model <= 64 and model:match('^%w[%w%._:/%[%]%-]*$') ~= nil
 end

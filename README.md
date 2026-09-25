@@ -1,6 +1,6 @@
 # Agent Bridge for ChromieCraft (WoW 3.3.5a)
 
-Chat with **Claude Code** or **Codex** from a panel inside World of Warcraft 3.3.5a, keep playing while the agent works, and get a chime and minimap badge when the reply is ready.
+Chat with **Claude Code**, **Codex**, or **Hermes Agent** from a panel inside World of Warcraft 3.3.5a, keep playing while the agent works, and get a chime and minimap badge when the reply is ready.
 
 This is a port of [0xInuarashi/wow-forever-codex](https://github.com/0xInuarashi/wow-forever-codex), which does the same for WoW: Forever. The core idea is theirs: an addon can't open a connection, so prompts leave the game as a pixel strip and replies come back as font glyph widths. This version re-implements it for the Wrath 3.3.5a client that ChromieCraft uses, and adds a Claude Code backend alongside Codex.
 
@@ -61,15 +61,143 @@ Use `/ab perf on`, reproduce a transfer, then `/ab perf` to print call counts, a
   - Polling backs off while nothing changes.
   - Prompts stop repeating once the companion acknowledges them.
   - Long final replies can use one checked addon slot instead of many font fragments.
-- **Two agents.**
+- **Three agents.**
   - Claude Code runs `claude -p --output-format stream-json`, with live streaming and tool-activity status. Follow-ups use native `--resume`.
   - Codex runs `codex exec --json`, resuming threads with `exec resume` (its sandbox goes through a config override there), and falls back to passing history as data.
-  - Both can search the web, which is on by default. The status line shows each real query, so you can tell a search that happened from a reply that only claims a source.
-  - Either way, prompts go on stdin, never on a command line.
+  - Hermes runs its headless CLI in its own Python environment, with JSONL streaming, native session resume, project tools, persistent memory, reusable skills, and bounded delegation. Optional browser, vision and speech tools use its separate bridge profile.
+  - All three can search the web, which is on by default. The status line shows each real query, so you can tell a search that happened from a reply that only claims a source.
+  - Prompts go on stdin, never on a command line.
+
+### Hermes setup
+
+Install [Hermes Agent](https://github.com/NousResearch/hermes-agent) separately. The adapter was tested with release `v2026.9.24` (`0.21.5`). It finds the Python executable under `~/.hermes/hermes-agent/venv` or `.venv`; another installation can be selected with the companion's `--hermes <python-path>` option. Hermes dependencies stay out of the companion's environment. The Anthropic provider needs Hermes's optional Anthropic SDK.
+
+For a Hydra bot using `ModelProvider` declarations in `bot.py`, import its configured routes with Hermes's Python:
+
+```powershell
+& "$env:USERPROFILE\.hermes\hermes-agent\venv\Scripts\python.exe" -m tools.configure_hermes --hydra '<Hydra folder>'
+```
+
+This reads configuration as data, copies only enabled model API keys and the Tavily key, and creates `~/.hermes/agentbridge`. It never starts or modifies the Discord bot. It refuses to overwrite an existing profile. The profile contains local `.env` credentials, `config.yaml` provider routes, and `models.json` aliases. No credentials belong in this repository. Set `--hermes-home <folder>` to use another bridge profile.
+
+In game, right-click a chat and choose **Use Hermes**, or type `/ab agent hermes`. Pick an alias with **Model...** or `/ab model deepseek`; `/ab model default` uses the companion's saved Hermes choice, then the profile default. The companion's Model dropdown lists the configured aliases. To configure routes manually, `models.json` has this shape:
+
+```json
+{"default":"deepseek","models":{"deepseek":{"provider":"bridge-deepseek","model":"deepseek-flash","reasoning":"none"}}}
+```
+
+Each `provider` names a route in Hermes's `config.yaml`. Optional `reasoning` defaults to `none`; Gemini models that require thinking should use `low`. Availability and charges depend on the selected API provider and account tier. Missing or invalid aliases fail without silently switching providers.
+
+Enable project tools and persistent memory in a configured profile using Hermes's Python:
+
+```powershell
+& "$env:USERPROFILE\.hermes\hermes-agent\venv\Scripts\python.exe" -m tools.upgrade_hermes
+```
+
+The companion's **Access** dropdown applies to Hermes:
+
+| Access | Hermes capabilities |
+| --- | --- |
+| `read-only` | Read and search files; use memory, skills, conversation search, task lists and delegation. |
+| `workspace-write` | Also create and patch files inside the selected **Work folder**. |
+| `workspace-write+shell` | Also run terminal commands and tests, manage its processes, and interact with browser forms. |
+
+File tools resolve paths and reject edits outside the work folder, including symlinks/junctions, Git metadata and Windows alternate data streams. **Shell access runs commands with your Windows account's permissions; it is not an OS sandbox.** Memory, skills, sessions and media caches are stored in the separate Hermes bridge profile even at read-only project access. Project `AGENTS.md` instructions are loaded normally. Native desktop Hermes settings and conversations remain separate.
+
+Memory persists across new chats. Requests sharing a Hermes profile queue behind one another so memory and skills cannot be updated by competing bridge processes. Each run can delegate to at most two children, with no recursive spawning and a three-minute timeout per child. Children inherit the selected tools and cannot write the parent's memory. Automatic background review and title-generation calls stay disabled.
+
+Optional tools require their dependencies before enabling them:
+
+- **Browser:** install `agent-browser@0.26.0` with npm under `<Hermes bridge home>/runtime`, run its `agent-browser install` command to download Chrome for Testing, then pass the resulting Chrome path to `tools.upgrade_hermes --browser-executable '<path>'`. The bridge launches headless sessions with GPU rendering disabled. Reading pages is available at all access levels; clicks, typing and key presses require `workspace-write+shell`. Turning **Web search** off hides both search and browser tools.
+- **Image analysis:** add `--vision` when the `bridge-gemini` provider route is configured. This uses that provider to inspect image URLs or local image files; the WoW panel does not upload screenshots automatically.
+- **Speech:** install `edge-tts==7.2.7` in the Hermes environment and add `--speech`. Audio files are saved under the bridge profile's `cache/audio` folder; the WoW panel does not play them automatically.
+
+Browser workers close their sessions on normal shutdown. On Windows, each Hermes
+worker and shared MCP worker also joins a private job object before starting tools:
+when that worker exits or is forcibly stopped, Windows terminates its remaining
+child processes, including detached browsers and failed browser launches. This
+does not target personal browsers or the WoW client. Processes started by a worker
+are scoped to that worker's lifetime; persistent services should be started separately.
+If Windows cannot establish this protection, the worker fails before launching tools.
+The browser daemon additionally has a five-minute idle shutdown, enforced after
+profile environment loading. Hermes's own inactivity cleanup may close it earlier.
+
+For an opt-in browser cleanup check on Windows, run
+`python -m tools.check_browser_cleanup` from the repository using Hermes's venv
+Python (which includes `psutil`). It uses one disposable Chrome for Testing
+session at a time, on `about:blank`, and verifies normal close, forced worker
+termination, and idle expiry against the exact test processes. It does not call
+an AI provider. A short three-second idle deadline is used only for that test;
+production workers use five minutes. Unit tests also cover detached descendants
+and ensure an unrelated process survives.
+
+Pass all optional flags you want to keep enabled when rerunning the upgrade command. It backs up the original config, preserves provider routes, and creates a starter Agent Bridge skill. General plugin discovery, MCP servers and shell hooks remain disabled. Image generation, scheduled jobs and messaging integrations are not wired into this adapter: they need a supported image provider or a persistent scheduler/integration setup, respectively. See the upstream [tools](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools) and [memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory/) documentation.
+
+Runs allow 40 tool iterations and use the companion's timeout (30 minutes by default), with a 30-second shutdown margin. Changing model, work folder, Access, Web search or optional tools starts a fresh native session using recent bridge history. Partial output is never treated as a successful completion. Backend-only upgrades need a companion restart; existing in-game Hermes chats continue to work without reloading WoW.
+
+### Shared extras for Claude Code and Codex
+
+Claude Code and Codex already provide project tools and native delegation. The
+bridge can also give both CLIs the configured Hermes browser, image-analysis and
+speech tools through a private MCP process. This does not run a Hermes agent or
+switch the chat's main model. Vision uses the configured Gemini route and its API
+billing; speech uses Edge TTS. Credentials remain in the Hermes bridge profile.
+
+After setting up the optional Hermes tools above, install its MCP dependencies
+in the Hermes environment (the tested SDK is `mcp==2.0.0`, with
+`httpx2==2.7.0` and `starlette==1.3.1`), then run from this repository:
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.configure_extras
+```
+
+The helper enables `coding_agents` in `bridge-tools.json`, backs up that file,
+and installs an Agent Bridge skill into `~/.claude/skills` and `~/.agents/skills`.
+Existing skills are preserved. Use `--home` for a custom Hermes bridge profile.
+Restart the companion after updating its Python code; WoW does not need a reload.
+Set `coding_agents` to `false` to stop adding these extras to future bridge runs.
+
+| Capability | Claude Code | Codex |
+| --- | --- | --- |
+| Persistent memory | Native auto-memory enabled per bridge invocation | Native memory use and generation enabled per bridge invocation |
+| Skills | Native `Skill` tool allowed | Native skills discovery |
+| Delegation | Native `Agent` tool allowed | Native subagents enabled, at most two open children per session |
+| Browser, image analysis, speech | Bridge MCP tools allowed according to Access and optional feature flags | Same MCP tools and flags, with automatic approval review |
+
+Each agent keeps its own native memory; this does not synchronize memories with
+Hermes or ChatGPT. Codex generates memories asynchronously from eligible idle
+sessions, so enabling it does not guarantee immediate recall after a short chat.
+See [Codex memory](https://learn.chatgpt.com/docs/customization/memories).
+
+The shared browser uses isolated headless Chrome sessions with GPU rendering
+disabled. Browsing follows **Web search**; clicking, typing and key presses
+require `workspace-write+shell`. Image analysis and speech follow their separate
+feature flags. Audio defaults to the Hermes cache; custom output paths require
+write access and must remain inside the work folder. Images and audio are not
+automatically captured or played inside WoW.
+
+Claude receives an explicit tool allowlist. Codex uses a granular approval policy
+and automatic review for eligible MCP requests, while shell/file escalation and
+permission-expansion requests remain disabled. Its selected sandbox stays in
+place. The review may reject a tool request; the agent should report that result.
+These options apply only to bridge-launched runs, not the CLIs' global settings.
+The server also rejects disabled tools even if called directly. See
+[Codex auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review).
+
+Verified with Claude Code `2.1.223`, Codex `0.155.0-alpha.16.4` and the Hermes
+version above: native skill discovery and a single child delegation in both
+CLIs; browser navigation and generated speech through both adapters; browser
+forms, image analysis and access restrictions directly through the shared MCP
+server. Older CLI versions may not understand these options. The new extras
+have not yet been verified through a live in-game prompt.
+
+This setup does not add persistent scheduling, messaging integrations or a
+shared image-generation provider. Desktop-only plugins and automation tools do
+not automatically become available to CLI runs launched by the companion.
 
 ## Install
 
-Requirements: Windows with NTFS, Python 3.12+ with tkinter, and a 3.3.5a client in windowed or borderless mode. You also need at least one of these, logged in: the [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI, or the Codex CLI (also bundled with the Codex desktop app).
+Requirements: Windows with NTFS, Python 3.12+ with tkinter, and a 3.3.5a client in windowed or borderless mode. You also need at least one configured backend: the [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI, the Codex CLI (also bundled with the Codex desktop app), or Hermes with a credentialed provider profile as described above.
 
 ```powershell
 python -m venv .venv
@@ -96,7 +224,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Restart Agent Bridge.
 The helper closes this installation's companion gracefully and opens it again. If a job keeps it open, it asks you to let the job finish instead of starting another companion. For a desktop shortcut, use the same command with an absolute path to the script; add `-WindowStyle Hidden` before `-File` to hide the helper's console. The companion window still opens normally.
 
 On first launch, pick the folder the agent should work in. In the window you can:
-- choose which agent new chats use: **Claude Code**, **Codex** or **Mock agent** (the mock tests the transport without an agent)
+- choose which agent new chats use: **Claude Code**, **Codex**, **Hermes** or **Mock agent** (the mock tests the transport without an agent)
 - choose the access level (see below)
 - pick each agent's default model: the dropdown follows the agent buttons and lists the models that CLI offers on this machine, read from its own data, so new ones appear without an update. You can also type any name the CLI accepts; blank uses the CLI's own default
 - turn **Web search** on or off
@@ -120,7 +248,7 @@ The model works the same way: `/ab model <name>` for the chat, otherwise the com
 | `workspace-write` | `--permission-mode acceptEdits` | `--sandbox workspace-write` |
 | `workspace-write+shell` | `acceptEdits`, also allowing `Edit`, `Write`, `Bash` | `--sandbox workspace-write` |
 
-A headless run cannot stop to ask for approval, so anything a level does not allow is refused. Only `workspace-write+shell` runs shell commands unattended — git, tests, tools — so choose it deliberately. With web search on, Claude also gets `WebSearch` and `WebFetch`, and Codex gets `web_search="live"`. There is no bypass mode.
+A headless run cannot stop to ask for approval, so anything a level does not allow is refused. Claude's `workspace-write+shell` level also allows shell commands unattended; Codex can run commands inside its selected sandbox at either write level. With web search on, Claude also gets `WebSearch` and `WebFetch`, and Codex gets `web_search="live"`. Shared extras add the tools and automatic MCP review described above without disabling the sandbox.
 
 ## In game
 
@@ -129,6 +257,7 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Show / hide the panel | `/ab` (also `/agent`, `/claude`, `/codex`), minimap button, or a key binding |
 | Resize the panel | Drag the labelled grip in the bottom-right corner. Width and height are saved automatically (minimum 560 × 320) |
 | Type a prompt quickly | `/ai <message>` from the chat box, right-click the minimap button, or bind "Open panel and type a prompt" |
+| Retry a failed or interrupted reply | **Retry** or `/ab retry` resends the selected chat's last prompt with a fresh request ID, current game context, and the chat's current agent/model. It preserves linked items/spells and any new draft, and is disabled while that chat is working. The last prompt survives `/reload` |
 | Link an item, spell or quest | Focus the input box, then Shift-click or drag it in; with `/ai`, Shift-click into the chat box as usual |
 | Scroll back through a chat | Mouse wheel or the scrollbar; Shift+wheel pages |
 | Start another chat | **+ New chat** in the list, or `/ab new [name]`. The others keep running |
@@ -157,7 +286,61 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 - zone, subzone, map coordinates and any instance
 - money, talent points per tree and professions
 
-Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes the game state to Claude Code as part of the system prompt, and to Codex ahead of your message, marked as data about your character rather than instructions. Only your own character's state is read, and only when you send.
+Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes game state to Claude Code as part of the system prompt, and to Codex and Hermes ahead of your message, marked as data about your character rather than instructions.
+
+**Gear, bags and learned recipes.** With context enabled, the addon maintains
+character snapshots using ordinary game APIs:
+
+- **Gear:** equipped slots 0–19, item names, full item strings (including enchant
+  and gem fields), item levels and available `GetItemStats` values. These stats
+  are not complete tooltips and do not describe every proc or set effect.
+- **Bags:** occupied slots in the backpack and bags 1–4, with item names, full
+  item strings and stack quantities. Bank, guild bank, mail and keyring are excluded.
+- **Recipes:** learned recipe names, recipe spell IDs and output item IDs when
+  available. Open each of your own profession windows to scan it. Clear search
+  and makeable filters, choose all categories/slots, and expand categories for a
+  complete scan. The addon does not change these controls. Linked professions
+  belonging to other players are ignored. Recipe reagent lists are not included.
+
+Gear and bag scans are triggered by events, debounced, and spread over frames;
+they pause during combat. Recipe scans also run incrementally while their window
+is open. Partial scans preserve previously observed recipes, and never claim that
+an omitted recipe is unlearned. Recipe caches survive `/reload` and are scoped to
+realm and character. Unlearning a profession removes its cache from future prompt
+references. Use `/ab context show` to see record counts, coverage and scan age.
+
+Only sending a prompt starts data transfer. The prompt identifies the exact
+snapshot revisions it needs; the companion requests missing revisions, receives
+checked `CPBC` pages, and commits each full section atomically. Changes can use
+row patches; a missing patch baseline automatically falls back to a full section.
+The companion does not start the agent until every referenced section is present.
+Unchanged data is reused across chats/backends and companion restarts. Cancelling
+an incomplete send does not allow a later upload to resurrect the old prompt.
+
+The first sync, especially a large recipe collection, adds transfer time. Later
+prompts send revision references and changed rows. Each data page remains below
+the existing 8,000-byte packet-message limit, separately from the typed prompt.
+Sections are capped at 2,000 records and 160 KB; a limit or incomplete game data
+is explicitly labelled partial. `/ab perf` includes `character-context` timings.
+
+All three agents receive freshness summaries and absolute paths to immutable
+UTF-8 snapshot files under the companion's `state/characters` directory. They
+read relevant files with their native file tools when answering inventory or
+recipe questions, instead of receiving the entire recipe catalogue in every
+model prompt. Observations are labelled current, cached or stale and timestamped;
+they are not live queries while the agent is working.
+
+`/ab context off` stops new sharing/scanning and cancels unfinished context syncs.
+Previously saved local snapshots and earlier agent conversation context remain.
+After installing these changes, restart the companion and run `/reload` once;
+then open profession windows. All Lua changes are in existing addon files, so a
+full WoW restart is not required.
+
+Verified with production Lua 5.1 simulations: initial and multi-page sync,
+unchanged reuse, bag deltas, missing-baseline recovery, partial/linked recipe
+scans, opt-out and bounded event scans. Claude Code, Codex and Hermes also read
+synthetic gear/bag/recipe snapshot files successfully through their real adapters.
+Live in-game confirmation and actual client frame-time measurements remain pending.
 
 Replies render as plain text. `[Name](item:ID)` references become item links; the same notation with `spell:ID` produces spell links. Markdown web links and bare HTTP/HTTPS URLs also appear as clickable source rows below the reply, up to 32 distinct sources. The full destination appears on hover. Clicking sends a separate browser request to the companion and uses no agent tokens. The status line reports the browser result; if the companion does not acknowledge within 45 seconds, start it and click again. Repeated captures of one click do not open duplicate tabs, including after a companion restart. Only HTTP/HTTPS URLs without embedded credentials are accepted.
 

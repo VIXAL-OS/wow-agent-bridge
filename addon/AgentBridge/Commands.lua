@@ -2,6 +2,27 @@
 local NS = AgentBridge
 local edit = NS.Input
 
+-- Keep the original input, including hyperlink IDs, even if no reply arrives
+-- before /reload. Older chats can still retry the plain prompt in their history.
+function NS.LastPrompt(id)
+    local chat = NS.FindChat(id)
+    if not chat then return end
+    if type(chat.lastPrompt) == 'string' and chat.lastPrompt:find('%S') then return chat.lastPrompt end
+    local history = NS.S.history or {}
+    for i = #history, 1, -1 do
+        local entry = history[i]
+        if entry.c == id and type(entry.p) == 'string' and entry.p:find('%S') then return entry.p end
+    end
+end
+
+function NS.RefreshRetry()
+    if NS.S and NS.LastPrompt(NS.S.chat) and not NS.IsChatBusy(NS.S.chat) then
+        NS.RetryButton:Enable()
+    else
+        NS.RetryButton:Disable()
+    end
+end
+
 -- Send a prompt to the chat you are reading. The companion gets an envelope:
 -- which chat it belongs to, its name, the agent and model if you chose them for
 -- it, and (unless /ab context off) where your character is and what it is
@@ -15,26 +36,46 @@ function NS.Send(raw)
     local fields = {{'chat', chat.id}, {'name', title}}
     if chat.agent then fields[#fields+1] = {'agent', chat.agent} end
     if chat.model then fields[#fields+1] = {'model', chat.model} end
+    local character
     if NS.S.context then
         local ok, context = pcall(NS.GameContext)
         if ok and type(context) == 'string' then
             for line in context:gmatch('[^\n]+') do fields[#fields+1] = {'ctx', line} end
         end
+        character = NS.CharacterFields(fields)
     end
     local body, display = NS.MakePromptText(raw, NS.MAX_PROMPT - #NS.Envelope(fields, ''))
     local text = NS.Envelope(fields, body)
     if #text > NS.MAX_PROMPT then
         return false, 'Message plus link details is too long ('..#text..'/'..NS.MAX_PROMPT..' bytes). Shorten it.'
     end
+    chat.lastPrompt = raw
+    NS.RefreshRetry()
     local sequence = NS.NextRequest()
+    local started, why = NS.BeginRequest(sequence, chat.id)
+    if not started then return false, why or 'Reply channel unavailable. Run /ab test to check it.' end
+    if character then NS.RememberCharacter(sequence, character) end
     NS.QueuePrompt(sequence, NS.EncodePrompt(text, NS.session, sequence))
-    NS.BeginRequest(sequence, chat.id)
     NS.SetBadge(nil)
     if not chat.name then chat.auto = chat.auto or title end
     NS.StartExchange(sequence, chat.id, display)
     NS.SetStatus('Prompt #'..sequence..' sent. You can close this panel and keep playing.')
     return true
 end
+
+function NS.RetryLastPrompt()
+    local raw = NS.LastPrompt(NS.S.chat)
+    if not raw then return false, 'There is no prompt to retry in this chat.' end
+    if NS.IsChatBusy(NS.S.chat) then return false, 'This chat is still working. Wait for it to finish before retrying.' end
+    -- A fresh request ID avoids replaying the companion's cached failure. Send
+    -- rebuilds current game context and uses this chat's current agent/model.
+    return NS.Send(raw)
+end
+
+NS.RetryButton:SetScript('OnClick', function()
+    local ok, why = NS.RetryLastPrompt()
+    if not ok then NS.SetStatus(why) end
+end)
 
 local function submit()
     local ok, why = NS.Send(edit:GetText())
@@ -78,7 +119,7 @@ local ECHO = {off = 0, short = 800, full = 100000}
 function NS.UseAgent(id, agent)
     local before = NS.ChatAgent(id)
     if not NS.SetChatAgent(id, agent) then
-        NS.Print('Unknown agent "'..NS.Escape(agent)..'". Use /ab agent claude, codex or mock.')
+        NS.Print('Unknown agent "'..NS.Escape(agent)..'". Use /ab agent claude, codex, hermes or mock.')
         return false
     end
     local title = NS.Escape(NS.ChatTitle(id))
@@ -94,14 +135,15 @@ end
 local HELP = {
     '/ab - show or hide the panel (also /agent, /claude, /codex)',
     '/ai <message> - send to the current chat without opening the panel',
+    '/ab retry - resend this chat\'s last prompt; keeps any new draft',
     '/ab new [name] - start another chat (the others keep going)',
     '/ab chats - list chats;  /ab chat <number or name> - switch',
     '/ab rename <name> | delete - rename or delete the current chat',
-    '/ab agent claude|codex - which agent answers the current chat (no name: show it)',
+    '/ab agent claude|codex|hermes - which agent answers the current chat (no name: show it)',
     '/ab model <name>|default - the model for the current chat (no name: show it)',
     '/ab copy [all] - copy the last reply (or the whole chat) out of the game',
     '/ab echo off|short|full|<n> - copy finished replies you are not reading into chat',
-    '/ab context on|off|show - send your character, zone, money, talents and professions with each prompt',
+    '/ab context on|off|show - share character, gear, bags and scanned recipes; show scan status',
     '/ab pause | resume - stop or restart reply checks',
     '/ab test - run the font self-test and print results',
     '/ab status - show channel state',
@@ -118,6 +160,10 @@ SlashCmdList.AGENTBRIDGE = function(arg)
     if cmd == '' then NS.Toggle()
     elseif cmd == 'show' then NS.Panel:Show()
     elseif cmd == 'hide' then NS.Panel:Hide()
+    elseif cmd == 'retry' then
+        local ok, why = NS.RetryLastPrompt()
+        if ok then NS.Print('resent the last prompt to "'..NS.Escape(NS.ChatTitle(NS.S.chat))..'".')
+        else NS.SetStatus(why); NS.Print(why) end
     elseif cmd == 'new' then
         NS.NewChat(rest ~= '' and rest or nil)
         NS.Print('started "'..NS.Escape(NS.ChatTitle(NS.S.chat))..'". /ai sends to it.')
@@ -142,11 +188,14 @@ SlashCmdList.AGENTBRIDGE = function(arg)
             or ('finished replies you are not reading are copied into chat, up to '..NS.S.echo..' characters.'))
     elseif cmd == 'context' and (word == 'on' or word == 'off') then
         NS.S.context = word == 'on'
+        if not NS.S.context then NS.CharacterContextOff() end
         NS.Print('game context '..(NS.S.context and 'is sent with each prompt.' or 'is no longer sent.'))
     elseif cmd == 'context' and word == 'show' then
         local ok, context = pcall(NS.GameContext)
         NS.Print((NS.S.context and 'sent with each prompt:' or 'off (would send):'))
         for line in tostring(ok and context or 'unavailable'):gmatch('[^\n]+') do NS.Print('  '..NS.Escape(line)) end
+        for line in NS.CharacterStatus():gmatch('[^\n]+') do NS.Print('  '..NS.Escape(line)) end
+        NS.Print('Open each profession with filters cleared and categories expanded to refresh recipes. Unscanned does not mean unlearned.')
     elseif cmd == 'pause' then NS.Pause(); NS.SetStatus('Reply checks paused. Resume or Send to continue.')
     elseif cmd == 'resume' then NS.Resume()
     elseif cmd == 'test' then NS.RunSelfTest(true)

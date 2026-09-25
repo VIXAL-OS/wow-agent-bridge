@@ -66,3 +66,13 @@ this repository. Editing docs alone does not authorize reinstalling anything.
 `python -m pip install -r requirements-dev.txt`, then
 `python -m unittest discover -s tests -t .`. The end-to-end tests run the
 production Lua under Lua 5.1 against a pessimistic client model.
+
+Browser probes must run inside a dedicated protected worker. Use
+`python -m tools.check_browser_cleanup` with Hermes's Python for the standard
+normal/forced/idle checks. For a one-off script, use
+`python -m companion.browser_lifetime <script.py>`; retain explicit session cleanup
+in `finally`, stop immediately if navigation/startup fails, and verify that the
+exact test processes exited. Never run a series of unguarded `agent-browser open`
+commands or use `close --all`/image-name process kills. Check one disposable
+browser at a time. A returned close command or leftover profile directory alone
+does not establish whether all its processes are gone.

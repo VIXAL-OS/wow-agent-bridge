@@ -38,6 +38,9 @@ function NS.EncodeURL(url, session, request)
     assert(NS.ValidURL(url))
     return encodeMessage(url, session, request, 'CPBU')
 end
+function NS.EncodeCharacter(text, session, request)
+    return encodeMessage(text, session, request, 'CPBC')
+end
 
 -- CPBN v3: which slot the addon loads next, how long until then, which reply
 -- fragment it needs, whether it is receiving, and for which request.

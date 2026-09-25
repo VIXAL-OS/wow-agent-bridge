@@ -45,10 +45,11 @@ local function rebuild()
 end
 function NS.QueuePrompt(request, promptFrames)
     pending[#pending+1] = {request = request, frames = promptFrames}
-    while #pending > 8 do table.remove(pending, 1) end
+    while #pending > 17 do table.remove(pending, 1) end
     rebuild(); lastSubmit = GetTime()
 end
 function NS.AckPrompt(request)
+    if NS.CharacterAck then NS.CharacterAck(request) end
     for i = #pending, 1, -1 do
         if pending[i].request == request then table.remove(pending, i); rebuild() end
     end

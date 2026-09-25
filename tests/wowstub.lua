@@ -41,6 +41,9 @@ end
 function Object:Show() self.shown = true end
 function Object:Hide() self.shown = false end
 function Object:IsShown() return self.shown end
+function Object:Enable() self.enabled = true end
+function Object:Disable() self.enabled = false end
+function Object:IsEnabled() return rawget(self, 'enabled') ~= false end
 function Object:RegisterEvent(e) STUB.events[e] = STUB.events[e] or {}; STUB.events[e][self] = true end
 function Object:UnregisterEvent(e) if STUB.events[e] then STUB.events[e][self] = nil end end
 function Object:CreateTexture() local t = new('Texture'); self.textures[#self.textures+1] = t; return t end

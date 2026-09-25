@@ -302,8 +302,18 @@ local send = button('Send', 84, 'LEFT', edit, 'RIGHT', 8, 0)
 local pause = button('Pause', 90, 'BOTTOMLEFT', 20, 18)
 local copy = button('Select text', 90, 'LEFT', pause, 'RIGHT', 6, 0)
 local test = button('Self-test', 90, 'LEFT', copy, 'RIGHT', 6, 0)
+local retry = button('Retry', 64, 'LEFT', test, 'RIGHT', 6, 0)
 local hide = button('Hide', 70, 'BOTTOMRIGHT', -94, 18)
 NS.SendButton = send
+NS.RetryButton = retry
+retry:Disable()
+retry:SetScript('OnEnter', function(self)
+    GameTooltip:SetOwner(self, 'ANCHOR_TOP')
+    GameTooltip:SetText('Retry last prompt', 1, 1, 1)
+    GameTooltip:AddLine('Resend this chat\'s last prompt using its current agent and model. Your draft is kept.', .8, .8, .8, true)
+    GameTooltip:Show()
+end)
+retry:SetScript('OnLeave', function() GameTooltip:Hide() end)
 hide:SetScript('OnClick', function() panel:Hide() end)
 pause:SetScript('OnClick', function() if NS.IsReceiving() then NS.Pause() else NS.Resume() end end)
 copy:SetScript('OnClick', function() NS.ShowCopy(true) end)
@@ -329,6 +339,7 @@ local MENU = {
     {'Delete...', function(id) NS.AskDelete(id) end},
     {'Use Claude Code', function(id) NS.UseAgent(id, 'claude') end},
     {'Use Codex', function(id) NS.UseAgent(id, 'codex') end},
+    {'Use Hermes', function(id) NS.UseAgent(id, 'hermes') end},
     {'Model...', function(id) NS.AskModel(id) end},
     {'Cancel', function() end},
 }
@@ -382,6 +393,7 @@ end
 
 function NS.RefreshChats()
     if not NS.S then return end
+    if NS.RefreshRetry then NS.RefreshRetry() end
     local list = NS.S.chats
     local fit = math.max(1, math.floor(((side:GetHeight() or 300) - 40) / ROW))
     first = math.max(1, math.min(first, #list - fit + 1))

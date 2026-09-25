@@ -57,6 +57,19 @@ def find_claude(remembered=''):
     ])
 
 
+def find_hermes(remembered=''):
+    """Hermes stays in its own environment; do not install it into the companion."""
+    homes = [Path.home() / '.hermes']
+    if os.environ.get('HERMES_HOME'):
+        homes.insert(0, Path(os.environ['HERMES_HOME']))
+    candidates = [remembered]
+    for home in homes:
+        for checkout in (home / 'hermes-agent', home):
+            for venv in ('venv', '.venv'):
+                candidates += [checkout / venv / 'Scripts' / 'python.exe', checkout / venv / 'bin' / 'python']
+    return _first(candidates)
+
+
 def find_codex(remembered=''):
     found = _first([remembered, shutil.which('codex.exe')])
     if found:

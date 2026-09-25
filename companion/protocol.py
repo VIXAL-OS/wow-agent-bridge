@@ -6,6 +6,7 @@ two. Reading a difference rather than an absolute level means the strip stays
 readable at any opacity, so it can be drawn semi-transparently over the UI.
   CPB1  prompt fragment   20-byte header + 40-byte padded chunk + Adler-32
   CPBU  clicked web URL   same framing, separate parser/handler, max 2,048 bytes
+  CPBC  character page    same framing; bounded data pages, never agent prompts
   CPBN  receive control   20-byte header + 20-byte control + padding + Adler-32
 Companion -> WoW: 4096-byte packets carried by font glyph advance widths.
   CFN2  reply fragment    32-byte header + 4060-byte padded chunk + Adler-32
@@ -91,6 +92,14 @@ def parse_url_frame(frame):
     return key, part, total, chunk
 
 
+def parse_character_frame(frame):
+    return parse_prompt(frame, b'CPBC')
+
+
+def encode_character(text, session=b'12345678', request=1):
+    return _encode_message(text, session, request, b'CPBC')
+
+
 @dataclass(frozen=True)
 class Control:
     session: str
@@ -164,7 +173,7 @@ def parse_envelope(blob):
 
 
 def frame_kind(frame):
-    return {b'CPB1': 'prompt', b'CPBN': 'control', b'CPBU': 'browser'}.get(bytes(frame[:4]))
+    return {b'CPB1': 'prompt', b'CPBN': 'control', b'CPBU': 'browser', b'CPBC': 'character'}.get(bytes(frame[:4]))
 
 
 def reply_meta(agent, model=''):
@@ -262,6 +271,8 @@ def decode_image(image):
         parse_prompt(frame)
     elif kind == 'browser':
         parse_url_frame(frame)
+    elif kind == 'character':
+        parse_character_frame(frame)
     else:
         raise ValueError('Unknown frame')
     return frame

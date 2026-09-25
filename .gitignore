@@ -2,5 +2,9 @@
 __pycache__/
 *.py[cod]
 state/
+cache/
 *.log
 addon/AgentBridge/mono.ttf
+# Credentials live in each agent's own profile, never here.
+.env
+*.env

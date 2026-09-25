@@ -20,6 +20,8 @@ from companion.wow import write_epoch
 from companion.hybrid import install_slots, slot_name
 from companion.browser import BrowserRequests
 from companion.protocol import parse_url_frame
+from companion.protocol import parse_character_frame
+from companion.character import CharacterStore
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'addon' / 'AgentBridge'
@@ -116,6 +118,9 @@ class Sim:
         self.browser = BrowserRequests(sqlite3.connect(':memory:'), opener=self.open_url)
         self._close_browser = weakref.finalize(self, self.browser.db.close)
         self.url_assembler = Assembler(clock=lambda: self.t, parser=parse_url_frame)
+        self.character_assembler = Assembler(clock=lambda: self.t, parser=parse_character_frame)
+        self.character = CharacterStore(self.browser.db, self.addon.parent / 'character-cache')
+        self.character_pending, self.character_frames = {}, 0
         self.client = Client(self.addon, scale, rounding)
         self.native = NativeBridge(self.addon, clock=lambda: self.t)
         self.assembler = Assembler(clock=lambda: self.t)
@@ -180,6 +185,11 @@ class Sim:
         return True
 
     def snapshot(self, key):
+        character = self.character.get(key)
+        if character:
+            return character
+        if key in self.character_pending:
+            return self.character.waiting(key, self.character_pending[key][0]) or {'id': key, 'state': 'waiting', 'reply': ''}
         browser = self.browser.get(key)
         if browser:
             return browser
@@ -205,13 +215,24 @@ class Sim:
             result = self.url_assembler.accept(data)
             if result:
                 self.browser.accept(*result)
+        elif frame_kind(data) == 'character':
+            self.character_frames += 1
+            result = self.character_assembler.accept(data)
+            if result:
+                self.character.accept(*result)
         elif frame_kind(data) == 'prompt':
             result = self.assembler.accept(data)
             if result and result[0] not in self.jobs:
                 # As the companion does: the agent answers the body; the header
                 # says which chat it belongs to and carries the game context.
                 fields, body = parse_envelope(result[1])
-                self.jobs[result[0]] = {'prompt': body, 'fields': fields, 'start': self.t}
+                key = result[0]
+                if self.character.missing(fields):
+                    self.character_pending[key] = (fields, body)
+                else:
+                    self.jobs[key] = {'prompt': body, 'fields': fields, 'start': self.t,
+                                      'character': self.character.context(fields)}
+                    self.character_pending.pop(key, None)
 
     def run(self, seconds, until=None):
         end, next_capture = self.t + seconds, self.t

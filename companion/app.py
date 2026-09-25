@@ -20,11 +20,13 @@ from tkinter import filedialog, scrolledtext, ttk
 
 from .agents import BACKENDS, GUIDANCE, AgentConfig, Job, run_agent
 from .browser import BrowserRequests
+from .character import CharacterStore
 from .capture import grab, grab_window
-from .launching import claude_models, codex_models, find_claude, find_codex
+from .launching import claude_models, codex_models, find_claude, find_codex, find_hermes
+from .hermes import model_choices as hermes_models
 from .native import NativeBridge, validate_addon
 from .notifications import ReplyBanner
-from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope, parse_url_frame
+from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope, parse_url_frame, parse_character_frame
 from .sessions import list_sessions
 from .wow import EpochKeeper, StripLocator, game_dir_for
 
@@ -233,7 +235,7 @@ class App:
             self.settings = json.loads(self.settings_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             self.settings = {}
-        for name in ('backend', 'project', 'addon', 'sandbox', 'claude', 'codex'):
+        for name in ('backend', 'project', 'addon', 'sandbox', 'claude', 'codex', 'hermes', 'hermes_home'):
             value = getattr(args, name, None)
             if value:
                 self.settings[name] = str(value)
@@ -253,6 +255,9 @@ class App:
         self.assembler = Assembler()
         self.url_assembler = Assembler(parser=parse_url_frame)
         self.browser = BrowserRequests(self.inbox.db)
+        self.character = CharacterStore(self.inbox.db, args.state / 'characters')
+        self.character_assembler = Assembler(parser=parse_character_frame)
+        self.character_pending = {}
         self.scheduler, self.context, self.events = Scheduler(), Context(self.inbox.path), queue.Queue()
         self.activity, self.names, self.capturing, self.closed = {}, {}, False, False
         # (session id, agent, branch): continues on the next prompt that agent answers.
@@ -305,7 +310,8 @@ class App:
         for key, label in BACKENDS.items():
             ttk.Radiobutton(row, text=label, value=key, variable=self.backend,
                             command=self.on_backend).pack(side='left', padx=4)
-        ttk.Label(row, text='   Access:').pack(side='left')
+        row = ttk.Frame(root); row.pack(fill='x', **pad)
+        ttk.Label(row, text='Access:').pack(side='left')
         self.sandbox = tk.StringVar(value=s.get('sandbox', 'read-only'))
         box = ttk.Combobox(row, textvariable=self.sandbox, values=('read-only', 'workspace-write', 'workspace-write+shell'), width=20, state='readonly')
         box.pack(side='left', padx=4)
@@ -316,7 +322,7 @@ class App:
         self.model_backend = self.backend.get()
         self.model = tk.StringVar(value=self.default_model(self.model_backend))
         # Editable: the lists are shortcuts, any name the CLI accepts works.
-        self.model_box = ttk.Combobox(row, textvariable=self.model, width=16, values=self.model_choices())
+        self.model_box = ttk.Combobox(row, textvariable=self.model, width=24, values=self.model_choices())
         self.model_box.configure(postcommand=lambda: self.model_box.configure(values=self.model_choices()))
         self.model_box.pack(side='left', padx=4)
         self.model_box.bind('<<ComboboxSelected>>', lambda _: self.save_model())
@@ -386,6 +392,8 @@ class App:
         # Read fresh each time, so a model added to either CLI shows up here.
         backend = self.backend.get()
         found = claude_models() if backend == 'claude' else codex_models() if backend == 'codex' else []
+        if backend == 'hermes':
+            found = hermes_models(self.settings.get('hermes_home'))
         return tuple([''] + found)
 
     def default_model(self, backend):
@@ -423,7 +431,7 @@ class App:
         """Attach the next in-game prompt to an existing Claude Code conversation."""
         backend = self.backend.get()
         if backend not in ('claude', 'codex'):
-            self.write('Pick Claude Code or Codex first; the mock agent has no conversations.')
+            self.write('Conversation import supports Claude Code and Codex. Hermes continues its in-game chats automatically.')
             return
         found = list_sessions(backend=backend)
         if not found:
@@ -495,7 +503,9 @@ class App:
         return AgentConfig(backend=request.agent, project=self.project(), sandbox=self.sandbox.get(),
                            model=request.model, claude=find_claude(self.settings.get('claude', '')),
                            codex=find_codex(self.settings.get('codex', '')), timeout=self.args.timeout,
-                           guidance_file=self.guidance, web=self.web.get())
+                           guidance_file=self.guidance, web=self.web.get(),
+                           hermes=find_hermes(self.settings.get('hermes', '')),
+                           hermes_home=self.settings.get('hermes_home'))
 
     def worker(self):
         while True:
@@ -503,7 +513,8 @@ class App:
             key = request.key
             cfg = self.agent_config(request)
             label = BACKENDS.get(cfg.backend, 'The agent')
-            self.events.put((key, 'working', f'{label} is working ({cfg.sandbox}).', None))
+            access = cfg.sandbox
+            self.events.put((key, 'working', f'{label} is working ({access}).', None))
             actions = 0
 
             def activity(what):
@@ -536,6 +547,12 @@ class App:
 
     # ---- main loop ------------------------------------------------------
     def snapshot(self, key):
+        character = self.character.get(key)
+        if character:
+            return character
+        if key in self.character_pending:
+            fields, _ = parse_envelope(self.character_pending[key])
+            return self.character.waiting(key, fields) or {'id': key, 'state': 'waiting', 'reply': 'Waiting for an agent slot.'}
         browser = self.browser.get(key)
         if browser:
             return browser
@@ -729,23 +746,52 @@ class App:
                 if not previous:
                     self.write(outcome['reply'])
             return
+        if frame_kind(frame) == 'character':
+            result = self.character_assembler.accept(frame)
+            if result:
+                self.character.accept(*result)
+            return
         result = self.assembler.accept(frame)
         # When full, the prompt is not taken: the addon repeats it until acknowledged.
         if result and self.scheduler.open() < MAX_OPEN:
-            key, blob = result
-            fields, body = parse_envelope(blob)
-            name, chat = (fields.get('name') or [''])[0], chat_of(key, fields)
-            agent, model, notes = resolve_agent(fields, self.inbox.last_backend(chat), self.backend.get(),
-                                                self.settings.get('models') or {})
-            request = Request(key, body, chat, name, '\n'.join(fields.get('ctx', [])), agent, model)
-            if self.inbox.add(request):
-                self.names[key] = name
-                for note in notes:
-                    self.write(f'Note: {note}; using the default instead.')
-                who = BACKENDS.get(agent, agent) + (f', {model}' if model else '')
-                self.write(f'[queued] {self.name_of(key)} ({who})\nYou: {body}')
-                self.job_status.set(f'Queued: {self.name_of(key)}')
-                self.scheduler.put(request)
+            self.accept_prompt(*result)
+
+    def accept_prompt(self, key, blob):
+        # Only a fresh complete prompt transmission can launch a job. Receiving
+        # a later snapshot must never resurrect a cancelled/deleted chat request.
+        if self.inbox.get(key):
+            self.character_pending.pop(key, None)
+            return
+        if self.scheduler.open() >= MAX_OPEN:
+            return
+        fields, body = parse_envelope(blob)
+        name, chat = (fields.get('name') or [''])[0], chat_of(key, fields)
+        agent, model, notes = resolve_agent(fields, self.inbox.last_backend(chat), self.backend.get(),
+                                          self.settings.get('models') or {})
+        error, extra = None, ''
+        try:
+            if self.character.missing(fields):
+                if key not in self.character_pending and len(self.character_pending) >= MAX_OPEN:
+                    self.character_pending.pop(next(iter(self.character_pending)))
+                self.character_pending[key] = blob
+                return
+            extra = self.character.context(fields)
+        except (ValueError, OSError) as exc:
+            error = 'Character context rejected: ' + str(exc)
+        self.character_pending.pop(key, None)
+        context = '\n'.join(fields.get('ctx', []) + ([extra] if extra else []))
+        request = Request(key, body, chat, name, context, agent, model)
+        if self.inbox.add(request):
+            self.names[key] = name
+            if error:
+                self.inbox.update(key, 'failed', error)
+                return
+            for note in notes:
+                self.write(f'Note: {note}; using the default instead.')
+            who = BACKENDS.get(agent, agent) + (f', {model}' if model else '')
+            self.write(f'[queued] {self.name_of(key)} ({who})\nYou: {body}')
+            self.job_status.set(f'Queued: {self.name_of(key)}')
+            self.scheduler.put(request)
 
     def close(self):
         if self.scheduler.open():
@@ -770,10 +816,12 @@ def main(argv=None):
     parser.add_argument('--project', type=Path, help='Existing folder the agent works in')
     parser.add_argument('--addon', type=Path, help='Installed Interface/AddOns/AgentBridge folder')
     parser.add_argument('--state', type=Path, default=Path(__file__).resolve().parents[1] / 'state')
-    parser.add_argument('--sandbox', choices=['read-only', 'workspace-write'])
+    parser.add_argument('--sandbox', choices=['read-only', 'workspace-write', 'workspace-write+shell'])
     parser.add_argument('--model')
     parser.add_argument('--claude', help='Path to claude.exe')
     parser.add_argument('--codex', help='Path to codex.exe')
+    parser.add_argument('--hermes', help='Path to the Python executable in Hermes\'s venv')
+    parser.add_argument('--hermes-home', help='Hermes bridge profile folder (default: ~/.hermes/agentbridge)')
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--resume-session', help='Continue this agent session on the next in-game prompt')
     parser.add_argument('--start-capture', action='store_true')

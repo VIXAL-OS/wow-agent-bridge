@@ -162,7 +162,9 @@ local reading
 local jobs = {}  -- [request] = {request, chat, assembly, due, expires, failures, missed, unchanged, lastRevision}
 
 local function exhausted()
-    NS.SetStatus('Reply channel used up for this game session. Restart WoW while the companion runs to recycle it.')
+    local text = 'Reply channel used up for this game session. Restart WoW while the companion runs to recycle it.'
+    NS.SetStatus(text)
+    return text
 end
 local function consume() slot = slot + 1; reading = nil end
 local function nextJob()
@@ -187,7 +189,7 @@ function NS.Resume()
     NS.OnReceiveState(true); NS.SetStatus('Checking for replies...')
 end
 function NS.BeginRequest(sequence, chat, callback, timeout)
-    if slot > SIZE then exhausted(); return end
+    if slot > SIZE then return false, exhausted() end
     local now = GetTime()
     session, paused = NS.session, false
     jobs[sequence] = {request = sequence, chat = chat, assembly = NS.NewAssembly(), due = now + FIRST_WINDOW,
@@ -197,6 +199,7 @@ function NS.BeginRequest(sequence, chat, callback, timeout)
 end
 -- Stop watching a request (its chat was deleted); the companion keeps the reply.
 function NS.ForgetRequest(sequence)
+    if NS.CharacterAck then NS.CharacterAck(sequence) end
     if reading and reading.job.request == sequence then consume() end
     jobs[sequence] = nil
 end
@@ -251,6 +254,11 @@ local function finish(job, reason, text, state, complete)
     end
     job.failures, job.missed = 0, 0
     if not text then job.due = now + FRAGMENT_WINDOW; return end
+    if state == 0 and NS.CharacterNeed and NS.CharacterNeed(job.request, text) then
+        job.lastRevision = job.assembly.revision
+        job.due = now + POLL_WINDOW
+        return
+    end
     if state >= 1 then NS.AckPrompt(job.request) end
     if job.callback then
         if complete and state >= 4 then
@@ -288,13 +296,14 @@ local function stepReceiver(now)
     for request, job in pairs(jobs) do
         if now >= job.expires and not (reading and reading.job == job) then
             jobs[request] = nil
+            NS.AckPrompt(request)
             if job.callback then
-                NS.AckPrompt(request)
-                job.callback('No browser acknowledgement. Start the companion and click the source again.', 6)
-                if not next(jobs) then NS.OnReceiveState(false) end
+                job.callback('No companion acknowledgement. Start the companion and retry the request.', 6)
             else
-                NS.ShowReply(request, 'Stopped checking after an hour. The reply is safe in the companion.', 6, true)
+                NS.ShowReply(request, 'Stopped checking after an hour. Check the companion for the reply, or click Retry to resend.', 6, true)
+                NS.OnReplyFinished(job.chat, 6)
             end
+            if not next(jobs) then NS.OnReceiveState(false) end
         end
     end
     if not reading then
