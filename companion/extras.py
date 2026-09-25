@@ -26,22 +26,32 @@ def configuration(cfg):
     }
 
 
-def claude_options(config):
+# Native memory and web search. A run that reads the web could be steered by a
+# page into saving a lasting instruction, which memory would carry into every
+# later run. So with web search on, neither CLI writes memory, whatever the
+# user's own settings say: Claude's auto memory is off (its one switch also
+# covers reading), and Codex still reads existing memories but generates none.
+# The same rule locks Hermes's memory (see hermes_policy.install_guards).
+CLAUDE_NO_MEMORY_ENV = {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
+
+
+def claude_options(config, web=False):
+    settings = {'autoMemoryEnabled': False} if web else ({'autoMemoryEnabled': True} if config else {})
+    options = ['--settings', json.dumps(settings)] if settings else []
     if config is None:
-        return [], []
+        return options, []
     server = {key: config[key] for key in ('command', 'args')}
-    return (['--settings', json.dumps({'autoMemoryEnabled': True}),
-             '--mcp-config', json.dumps({'mcpServers': {'agentbridge': server}})],
+    return (options + ['--mcp-config', json.dumps({'mcpServers': {'agentbridge': server}})],
             ['Skill', 'Agent', 'TodoWrite'] + ['mcp__agentbridge__' + name for name in config['tools']])
 
 
-def codex_options(config):
+def codex_options(config, web=False):
     if config is None:
-        return []
+        return ['-c', 'memories.generate_memories=false'] if web else []
     values = {
         'features.memories': True,
         'memories.use_memories': True,
-        'memories.generate_memories': True,
+        'memories.generate_memories': not web,
         'features.multi_agent': True,
         'agents.max_concurrent_threads_per_session': 2,
         'mcp_servers.agentbridge.command': config['command'],

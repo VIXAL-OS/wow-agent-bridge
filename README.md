@@ -159,10 +159,19 @@ Set `coding_agents` to `false` to stop adding these extras to future bridge runs
 
 | Capability | Claude Code | Codex |
 | --- | --- | --- |
-| Persistent memory | Native auto-memory enabled per bridge invocation | Native memory use and generation enabled per bridge invocation |
+| Persistent memory | Native auto-memory enabled per bridge invocation, only while web search is off | Native memory use enabled; generation only while web search is off |
 | Skills | Native `Skill` tool allowed | Native skills discovery |
 | Delegation | Native `Agent` tool allowed | Native subagents enabled, at most two open children per session |
 | Browser, image analysis, speech | Bridge MCP tools allowed according to Access and optional feature flags | Same MCP tools and flags, with automatic approval review |
+
+**Memory and web search.** A page an agent reads could try to plant an
+instruction that memory would carry into every later run. So whenever **Web
+search** is on, neither CLI may write memory, with or without these extras and
+whatever your own settings say. Claude Code's auto memory is off (by setting and
+by `CLAUDE_CODE_DISABLE_AUTO_MEMORY`); its one switch also covers reading.
+Codex still reads existing memories but generates none. Hermes follows the same
+rule per run (see its access levels above). Turn Web search off in the
+companion when you want a chat to build memory.
 
 Each agent keeps its own native memory; this does not synchronize memories with
 Hermes or ChatGPT. Codex generates memories asynchronously from eligible idle

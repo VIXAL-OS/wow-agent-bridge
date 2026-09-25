@@ -4,6 +4,7 @@ Prompts go to the agent on stdin, never through a shell or command line.
 """
 from dataclasses import dataclass, field, replace
 import json
+import os
 from pathlib import Path, PurePath
 import queue
 import subprocess
@@ -325,7 +326,7 @@ WEB_TOOLS = ['WebSearch', 'WebFetch']
 
 def claude_command(cfg, job, guidance=None):
     from .extras import configuration, claude_options
-    options, extra_tools = claude_options(configuration(cfg))
+    options, extra_tools = claude_options(configuration(cfg), cfg.web)
     command = [cfg.claude, '-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']
     web = WEB_TOOLS if cfg.web else []
     # Headless runs cannot ask for approval, so every tool the level allows is
@@ -354,6 +355,15 @@ def claude_command(cfg, job, guidance=None):
     return command
 
 
+def claude_env(cfg):
+    """With web search on, auto memory is off by environment as well as by
+    setting, so no settings file can turn it back on (see extras.py)."""
+    if not cfg.web:
+        return None
+    from .extras import CLAUDE_NO_MEMORY_ENV
+    return {**os.environ, **CLAUDE_NO_MEMORY_ENV}
+
+
 def codex_sandbox(level):
     """Codex runs commands inside its own sandbox, so both write levels map to one."""
     return 'workspace-write' if level.startswith('workspace-write') else 'read-only'
@@ -363,7 +373,7 @@ def codex_command(cfg, job=None):
     from .extras import configuration, codex_options
     # Web search is a config value rather than --search, because `exec resume`
     # does not accept that flag.
-    web = ['-c', f'web_search="{"live" if cfg.web else "disabled"}"'] + codex_options(configuration(cfg))
+    web = ['-c', f'web_search="{"live" if cfg.web else "disabled"}"'] + codex_options(configuration(cfg), cfg.web)
     if job is not None and job.resume:
         # `exec resume` takes neither --sandbox nor -C; the sandbox goes through
         # a config override and the working folder comes from the process itself.
@@ -422,7 +432,7 @@ def run_agent(cfg, job, on_update=None, on_activity=None):
         guidance, temporary = guidance_for(cfg, job)
         try:
             returncode, tail, timed_out = run_process(claude_command(cfg, job, guidance), cfg.project, prompt,
-                                                      cfg.timeout, parser.feed, kill_tree=True)
+                                                      cfg.timeout, parser.feed, env=claude_env(cfg), kill_tree=True)
         finally:
             if temporary:
                 Path(guidance).unlink(missing_ok=True)

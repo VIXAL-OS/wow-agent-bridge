@@ -286,7 +286,9 @@ class Hermes(unittest.TestCase):
         script = ('import subprocess,sys,json,time; '
                   'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); '
                   'print(json.dumps({"pid":p.pid}),flush=True); time.sleep(60)')
-        _, _, timed_out = run_process([sys.executable, '-c', script], self.home, '', 2,
+        # Long enough for two interpreters to start on a busy machine (tests run
+        # at low priority beside the game) before the timeout ends the tree.
+        _, _, timed_out = run_process([sys.executable, '-c', script], self.home, '', 8,
                                      events.append, kill_tree=True)
         self.assertTrue(timed_out)
         self.assertTrue(events)
