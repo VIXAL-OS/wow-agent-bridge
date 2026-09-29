@@ -2,8 +2,8 @@
 
 WoW -> companion: 64-byte frames drawn as a 128 x 8 cell strip. Each bit is a
 *pair* of adjacent cells, one light and one dark, and the decoder compares the
-two. Reading a difference rather than an absolute level means the strip stays
-readable at any opacity, so it can be drawn semi-transparently over the UI.
+two. Paired cells tolerate translucency over similar backgrounds; sharp edges
+can overwhelm low-opacity pairs, which the frame checksum then rejects.
   CPB1  prompt fragment   20-byte header + 40-byte padded chunk + Adler-32
   CPBU  clicked web URL   same framing, separate parser/handler, max 2,048 bytes
   CPBC  character page    same framing; bounded data pages, never agent prompts
@@ -237,8 +237,8 @@ def cell_pair(bit):
 def read_image_frame(image):
     """Decode an exact crop of the strip by comparing each cell pair.
 
-    Only the difference within a pair matters, so a translucent strip over any
-    background still decodes. Each cell is averaged over its middle third,
+    Only the difference within a pair matters, but sharp background edges can
+    reverse it at low opacity. Each cell is averaged over its middle third,
     which is what the box resize below produces: that suppresses the blur at
     cell edges without reading nine pixels per cell in Python.
 

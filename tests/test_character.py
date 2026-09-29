@@ -224,6 +224,20 @@ class CharacterInGame(unittest.TestCase):
         refs = [v[2] for v in fields.values() if v[1] == b'snapshot']
         self.assertTrue(any(b'|cached' in ref for ref in refs))
 
+    def test_slow_capture_finishes_large_character_upload(self):
+        # Model covered-window capture after the initial prompt arrives. The
+        # old fixed retransmission phase times out on the recipe upload.
+        self.sim.g.STUB.recipeCount = 420
+        self.sim.g.STUB.fire(b'TRADE_SKILL_SHOW'); self.sim.run(6)
+        self.sim.send('slow capture')
+        self.assertTrue(self.sim.run(30, until=lambda: bool(self.sim.character_pending)))
+        self.sim.CAPTURE = .3
+        self.assertTrue(self.sim.run(900, until=lambda: self.sim.last_reply() is not None))
+        self.assertEqual(self.sim.last_reply(), 'Echo: slow capture')
+        self.assertEqual(len(self.sim.jobs), 1)
+        self.assertIn('recipes:Alchemy: 420 records; complete', next(iter(self.sim.jobs.values()))['character'])
+        self.assertFalse(self.sim.status().active)
+
     def test_partial_scans_keep_known_recipes_and_ignore_linked_professions(self):
         self.sim.g.STUB.fire(b'TRADE_SKILL_SHOW'); self.sim.run(3)
         original, doc = self.document('recipes:Alchemy')

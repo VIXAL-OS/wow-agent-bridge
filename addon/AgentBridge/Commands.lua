@@ -149,7 +149,7 @@ local HELP = {
     '/ab status - show channel state',
     '/ab perf on|off|reset - record performance; /ab perf prints timings',
     '/ab strip top|topleft|topright|bottom|bottomleft|bottomright - move the pixel strip',
-    '/ab alpha 0.5 - strip opacity, so you can see the UI behind it (0.2 to 1)',
+    '/ab alpha 0.2 - preferred strip opacity (0.2 to 1); uploads/retries boost it automatically',
     '/ab sound on|off - chime when a reply is ready',
 }
 SLASH_AGENTBRIDGE1, SLASH_AGENTBRIDGE2, SLASH_AGENTBRIDGE3, SLASH_AGENTBRIDGE4 = '/ab', '/agent', '/claude', '/codex'
@@ -206,11 +206,13 @@ SlashCmdList.AGENTBRIDGE = function(arg)
             NS.BANK_SIZE, r.pending, r.active and 'receiving' or 'idle', tostring(r.calib or 'not calibrated'),
             NS.S.strip, NS.recycledFrom and (', recycled from slot '..NS.recycledFrom) or ''))
         NS.Print('Hybrid: '..NS.HybridInfo())
+        local preferred, effective = NS.StripAlphaInfo()
+        NS.Print(string.format('Strip opacity: %.2g preferred, %.2g effective (automatic boost)', preferred, effective))
     elseif cmd == 'strip' and NS.ANCHORS[word:upper()] then
         NS.S.strip = word:upper(); NS.PlaceStrip(NS.S.strip)
         NS.Print('strip moved to '..NS.S.strip..'. The companion finds it automatically.')
     elseif cmd == 'alpha' and tonumber(word) then
-        NS.Print('strip opacity set to '..NS.SetStripAlpha(tonumber(word))..' (0.2 to 1)')
+        NS.Print('preferred strip opacity set to '..NS.SetStripAlpha(tonumber(word))..'; uploads and retries boost it automatically')
     elseif cmd == 'sound' and (word == 'on' or word == 'off') then
         NS.S.sound = word == 'on'; NS.Print('sound '..word)
     else

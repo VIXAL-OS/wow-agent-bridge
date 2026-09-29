@@ -125,6 +125,7 @@ class Sim:
         self.native = NativeBridge(self.addon, clock=lambda: self.t)
         self.assembler = Assembler(clock=lambda: self.t)
         self.jobs, self.writes, self.companion_on = {}, 0, True
+        self.optical_filter = None
         self.boot(saved)
 
     def boot(self, saved=None):
@@ -208,6 +209,10 @@ class Sim:
         if not data or not self.companion_on:
             return
         data = bytes(data)
+        if self.optical_filter:
+            data = self.optical_filter(data, self.g.AgentBridgeStrip.textures[1].opacity)
+            if data is None:
+                return
         if frame_kind(data) == 'control':
             if self.native.accept(parse_control(data), self.snapshot(parse_control(data).key)):
                 self.writes += 1

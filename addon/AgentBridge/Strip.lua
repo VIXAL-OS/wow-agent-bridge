@@ -1,6 +1,7 @@
 -- Outbound channel: a 128 x 8 cell strip the companion reads from the screen.
 -- Each bit is a pair of neighbouring cells, one light and one dark, so the
--- companion reads the difference and the strip stays decodable at any opacity.
+-- companion reads the difference. Sharp background edges can overwhelm faint
+-- pairs, so uploads and stalled exchanges temporarily use stronger contrast.
 -- The frame has no parent, so its effective scale is exactly 1 (768 units =
 -- window height) whatever the UI scale, and Alt+Z does not hide it.
 local NS = AgentBridge
@@ -16,11 +17,11 @@ for i = 0, COLS*ROWS-1 do
     t:SetTexture(0, 0, 0, 1)
     cells[i+1] = t
 end
-local alpha = 1
+local preferred, alpha = 1, 1
 function NS.SetStripAlpha(value)
-    alpha = math.max(.2, math.min(1, tonumber(value) or 1))
-    NS.S.alpha = alpha
-    return alpha
+    preferred = math.max(.2, math.min(1, tonumber(value) or 1))
+    NS.S.alpha = preferred
+    return preferred
 end
 
 NS.ANCHORS = {TOP = true, TOPLEFT = true, TOPRIGHT = true, BOTTOM = true, BOTTOMLEFT = true, BOTTOMRIGHT = true}
@@ -35,26 +36,47 @@ end)
 
 -- Prompts repeat until the companion acknowledges them (any reply state past
 -- "waiting"), so a missed capture is recovered without resending by hand.
-local pending, frames, cursor = {}, {}, 1
+local pending, frames, cursor, rotation = {}, {}, 1, 0
+local recovery = {}
+function NS.StripStalled(request) recovery[request] = true end
+function NS.StripProgress(request) recovery[request] = nil end
+function NS.StripTransferProgress(request)
+    for _, item in ipairs(pending) do
+        if item.request == request then item.started = GetTime() end
+    end
+end
+local function effectiveAlpha()
+    if next(recovery) then return 1 end
+    local value, now = preferred, GetTime()
+    for _, item in ipairs(pending) do
+        if item.character then value = math.max(value, .6) end
+        -- Allow two complete sweeps of the shared strip before treating an
+        -- unacknowledged prompt/page as stalled. Long pages need more time.
+        if now - item.started >= math.max(12, #frames * .4 + 8) then return 1 end
+    end
+    return value
+end
+function NS.StripAlphaInfo() return preferred, alpha end
 local lastSubmit, lastData, lastAlpha, elapsed, tick = -1000, nil, nil, 0, 0
 local function rebuild()
-    frames, cursor = {}, 1
+    frames, cursor, rotation = {}, 1, 0
     for _, item in ipairs(pending) do
         for _, frame in ipairs(item.frames) do frames[#frames+1] = frame end
     end
 end
-function NS.QueuePrompt(request, promptFrames)
-    pending[#pending+1] = {request = request, frames = promptFrames}
+function NS.QueuePrompt(request, promptFrames, character)
+    pending[#pending+1] = {request = request, frames = promptFrames, character = character, started = GetTime()}
     while #pending > 17 do table.remove(pending, 1) end
     rebuild(); lastSubmit = GetTime()
 end
 function NS.AckPrompt(request)
+    NS.StripProgress(request)
     if NS.CharacterAck then NS.CharacterAck(request) end
     for i = #pending, 1, -1 do
         if pending[i].request == request then table.remove(pending, i); rebuild() end
     end
 end
-function NS.ClearPrompts() pending = {}; rebuild() end
+function NS.ClearPrompts() pending, recovery = {}, {}; rebuild() end
 
 local function wanted()
     return NS.IsReceiving() or (#frames > 0 and GetTime() - lastSubmit < 120)
@@ -84,9 +106,11 @@ driver:SetScript('OnUpdate', function(_, dt)
     if elapsed < .15 then return end
     elapsed = 0
     if not NS.session or not wanted() then
+        alpha = preferred
         if strip:IsShown() then strip:Hide(); lastData = nil end
         return
     end
+    alpha = effectiveAlpha()
     if not strip:IsShown() then strip:Show() end
     -- While a prompt is being sent, three of every four frames carry it: a long
     -- prompt with tooltips and context gets through sooner, and the control
@@ -96,7 +120,12 @@ driver:SetScript('OnUpdate', function(_, dt)
     if #frames == 0 or tick % 4 == 0 then
         data = NS.ControlFrame()
     else
-        data = frames[cursor]; cursor = cursor % #frames + 1
+        -- Shift each retransmission by one fragment. A slower capture loop can
+        -- otherwise sample the same subset forever when its cadence lines up
+        -- with this strip, especially while the game is in the background.
+        data = frames[(cursor + rotation - 1) % #frames + 1]
+        cursor = cursor % #frames + 1
+        if cursor == 1 then rotation = (rotation + 1) % #frames end
     end
     if data == lastData and alpha == lastAlpha then return end
     NS.Profile('strip-paint', paint, data)

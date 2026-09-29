@@ -47,7 +47,10 @@ function Object:IsEnabled() return rawget(self, 'enabled') ~= false end
 function Object:RegisterEvent(e) STUB.events[e] = STUB.events[e] or {}; STUB.events[e][self] = true end
 function Object:UnregisterEvent(e) if STUB.events[e] then STUB.events[e][self] = nil end end
 function Object:CreateTexture() local t = new('Texture'); self.textures[#self.textures+1] = t; return t end
-function Object:SetTexture(a, g, b) if type(a) == 'number' then self.color = a end self.file = a end
+function Object:SetTexture(a, g, b, alpha)
+    if type(a) == 'number' then self.color, self.opacity = a, alpha or 1 end
+    self.file = a
+end
 -- Frames are positioned by anchors here, so report the real panel's rough size.
 function Object:GetWidth() return self.width or 520 end
 function Object:GetHeight() return self.height or 400 end

@@ -351,10 +351,14 @@ local function uploadStep()
     end
     local function sendPage(index)
         if not requests[job.parent] then active = nil; return end
+        NS.StripTransferProgress(job.parent)
         local seq = NS.NextRequest(); job.request = seq
         local fields = {{'character', job.owner}, {'section', job.section}, {'revision', job.doc.revision},
                         {'page', index}, {'total', #pages}}
+        -- A full page and the parent prompt share the strip. Leave room for
+        -- several retransmissions when background capture misses fragments.
         local ok = NS.BeginRequest(seq, nil, function(reply, state)
+            NS.StripTransferProgress(job.parent)
             if state ~= 4 or reply ~= 'ABCTX_OK' then
                 active = nil
                 if reply == 'ABCTX_BASE_MISSING' and not job.full then
@@ -362,9 +366,9 @@ local function uploadStep()
                 else failSync(job.parent, reply) end
             elseif index < #pages then sendPage(index+1)
             else active = nil end
-        end, 120)
+        end, 240)
         if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
-        NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, pages[index]), NS.session, seq))
+        NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, pages[index]), NS.session, seq), true)
         NS.SetStatus('Syncing '..job.section..' ('..index..'/'..#pages..')...')
     end
     sendPage(1)

@@ -10,11 +10,11 @@ No DLL injection, no memory access, no synthetic input. The addon uses documente
 
 | Direction | Carrier | Receiver reads |
 | --- | --- | --- |
-| Game → companion | 128 × 8 cell strip at the top of the screen, any opacity | Differences between cell pairs in a screen capture |
+| Game → companion | 128 × 8 cell strip at the top of the screen, with adaptive opacity | Differences between cell pairs in a screen capture |
 | Companion → game | An unused font file in the addon's bank | Glyph advance widths via `GetStringWidth` |
 | Companion → game, finished replies over 4,060 bytes | One of 16 optional load-on-demand addons | A fixed hex-data assignment, announced by a checksummed font packet |
 
-**Prompts.** The addon splits the UTF-8 prompt (max 8,000 bytes, including the header, linked tooltips and game context described under [In game](#in-game)) into 64-byte checksummed frames and flashes them on the strip. Every bit is a *pair* of neighbouring cells, one light and one dark, and the companion reads the difference between them. Because only the difference matters, the strip decodes at any opacity, so you can turn it down with `/ab alpha 0.5` and still see the UI through it. A pair straddling a hard UI edge reads as low contrast and rejects the frame rather than guessing. The strip also carries a *control* frame: which font slot the addon will load next, how many milliseconds until it does, and which reply fragment it needs. The strip is only shown during an exchange.
+**Prompts.** The addon splits the UTF-8 prompt (max 8,000 bytes, including the header, linked tooltips and game context described under [In game](#in-game)) into 64-byte checksummed frames and flashes them on the strip. Every bit is a *pair* of neighbouring cells, one light and one dark, and the companion reads the difference between them. `/ab alpha 0.2` sets your preferred opacity. Sharp background edges can overwhelm faint pairs and cause checksum failures, so character uploads automatically use at least `0.6`. Missing or invalid replies raise opacity to `1`; an unacknowledged outgoing prompt/page also raises it after enough time for two strip sweeps (at least 12 seconds). Successful acknowledgement restores your preference, or the upload minimum while another page remains pending. Healthy replies with unchanged content do not trigger a boost. Temporary boosts never change the saved preference; `/ab status` shows preferred and effective opacity. The strip also carries a *control* frame: which font slot the addon will load next, how many milliseconds until it does, and which reply fragment it needs. The strip is only shown during an exchange.
 
 **Replies.** A reply packet is 4,096 bytes: a 32-byte header, 4,060 bytes of text, and an Adler-32 checksum. The companion writes it into the requested slot as a TrueType font. Each byte uses two glyphs, one per 4-bit nibble: glyph `U+E000 + i` has advance `(2 + value) × 128` units at 1,024 units/em. Lua measures each glyph, recovers the nibbles, validates the packet, joins the fragments, and displays plain text with native item links. Polls read only the 32-byte header first, so an unchanged status, an empty slot or a stale one costs a fraction of a second instead of a full packet.
 
@@ -280,7 +280,7 @@ A headless run cannot stop to ask for approval, so anything a level does not all
 | Game context | `/ab context on` (default), `off`, or `show` to see exactly what is sent |
 | Continue an existing chat | In the companion: **Continue a conversation…**, pick one, then send from the game |
 | Check the font channel | **Self-test** or `/ab test` (prints per-size results) |
-| See through the strip | `/ab alpha 0.5` (0.2 to 1) |
+| Set preferred strip opacity | `/ab alpha 0.2` (0.2 to 1; uploads and retries boost it automatically) |
 | Read the full, unformatted reply | **Saved replies** in the companion |
 | Channel state | `/ab status` |
 | Measure transfer performance | `/ab perf on`, then `/ab perf`; `off` stops and `reset` clears measurements |
@@ -319,7 +319,18 @@ realm and character. Unlearning a profession removes its cache from future promp
 references. Use `/ab context show` to see record counts, coverage and scan age.
 
 Only sending a prompt starts data transfer. The prompt identifies the exact
-snapshot revisions it needs; the companion requests missing revisions, receives
+snapshot revisions it needs. Before requesting uploads, the companion checks
+`WTF/Account/*/SavedVariables/AgentBridge.lua` in the selected game installation
+for matching recipe snapshots. WoW writes these files on `/reload` or logout;
+opening your professions and then reloading lets a large recipe baseline travel
+through the saved file instead of the strip. The companion parses bounded Lua
+literals as data (never executes Lua) and checks the character, section, revision,
+JSON schema and checksum. Only recipes referenced by the prompt are imported;
+freshness and coverage still come from the prompt and validated snapshot. A
+missing, outdated, malformed or oversized file falls back to the optical channel.
+No extra reload is required when a matching saved snapshot already exists.
+
+The companion requests the remaining missing revisions, receives
 checked `CPBC` pages, and commits each full section atomically. Changes can use
 row patches; a missing patch baseline automatically falls back to a full section.
 The companion does not start the agent until every referenced section is present.

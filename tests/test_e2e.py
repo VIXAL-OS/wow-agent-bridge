@@ -51,6 +51,15 @@ class EndToEnd(unittest.TestCase):
         self.assertFalse(sim.status().active)
         self.assertEqual(list(sim.g.STUB.sounds.values()), [b'TellMessage'])
 
+    def test_prompt_arrives_when_capture_samples_every_other_strip_tick(self):
+        sim = self.sim()
+        sim.run(2)
+        sim.CAPTURE = .3
+        sim.send('slow prompt')
+        self.assertTrue(sim.run(180, until=lambda: sim.last_reply() is not None))
+        self.assertEqual(sim.last_reply(), 'Echo: slow prompt')
+        self.assertFalse(sim.status().active)
+
     def test_multipart_utf8_reply(self):
         sim = self.sim(reply=lambda p: LONG)
         sim.run(2)

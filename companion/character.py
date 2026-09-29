@@ -1,4 +1,4 @@
-"""Versioned character snapshots received as data over the optical channel.
+"""Versioned character snapshots from saved files and the optical channel.
 
 The prompt references immutable revisions. Only missing revisions are uploaded;
 row patches are committed atomically and never applied to a different baseline.
@@ -89,8 +89,9 @@ def validate_document(value, section):
 
 
 class CharacterStore:
-    def __init__(self, db, directory):
+    def __init__(self, db, directory, saved_recipes=None):
         self.db, self.directory = db, Path(directory).resolve()
+        self.saved_recipes = saved_recipes
         with db:
             db.execute('CREATE TABLE IF NOT EXISTS character_snapshots '
                        '(owner TEXT, section TEXT, revision TEXT, body TEXT, created REAL, '
@@ -115,6 +116,36 @@ class CharacterStore:
     def missing(self, fields):
         owner, refs = manifest(fields)
         return [(s, r) for s, r, _, _ in refs if self.body(owner, s, r) is None]
+
+    def import_saved(self, fields):
+        """Import only recipes explicitly referenced by this fresh prompt.
+
+        A saved file is an optional cache, never an authority for freshness or
+        permission to share other characters/sections. Invalid data is ignored.
+        """
+        owner, refs = manifest(fields)
+        wanted = [(s, r) for s, r, _, _ in refs if s.startswith('recipes:') and self.body(owner, s, r) is None]
+        if not wanted or self.saved_recipes is None:
+            return 0
+        imported = 0
+        for section, rev, body in self.saved_recipes.candidates(owner, wanted):
+            if self.body(owner, section, rev) is not None:
+                continue
+            try:
+                if len(body.encode('utf-8')) > MAX_DOCUMENT or revision(body) != rev:
+                    continue
+                value = validate_document(json.loads(body), section)
+                if canonical(value) != body:
+                    continue
+            except (ValueError, TypeError, KeyError, IndexError, RecursionError):
+                continue
+            with self.db:
+                self.db.execute('INSERT OR IGNORE INTO character_snapshots VALUES (?,?,?,?,?)',
+                                (owner, section, rev, body, time.time()))
+                self.db.execute('DELETE FROM character_pages WHERE owner=? AND section=? AND revision=?',
+                                (owner, section, rev))
+            imported += 1
+        return imported
 
     def waiting(self, key, fields):
         missing = self.missing(fields)

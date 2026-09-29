@@ -200,6 +200,7 @@ function NS.BeginRequest(sequence, chat, callback, timeout)
 end
 -- Stop watching a request (its chat was deleted); the companion keeps the reply.
 function NS.ForgetRequest(sequence)
+    NS.StripProgress(sequence)
     if NS.CharacterAck then NS.CharacterAck(sequence) end
     if reading and reading.job.request == sequence then consume() end
     jobs[sequence] = nil
@@ -226,6 +227,10 @@ end
 -- after combat, when the font slot that announced it was already retired.
 local function settle(job, reason, text, state, complete)
     local now = GetTime()
+    -- An unchanged but valid packet is healthy communication: a slow agent
+    -- must not keep the strip opaque. Empty/invalid slots need clearer control.
+    if not reason or reason == 'Unchanged' then NS.StripProgress(job.request)
+    else NS.StripStalled(job.request) end
     if reason == 'Empty reply slot' then
         -- Nobody wrote this slot before it loaded (companion stopped, strip hidden).
         job.missed, job.failures = job.missed + 1, 0
@@ -314,7 +319,7 @@ local function stepReceiver(now)
             jobs[request] = nil
             NS.AckPrompt(request)
             if job.callback then
-                job.callback('No companion acknowledgement. Start the companion and retry the request.', 6)
+                job.callback('Companion acknowledgement timed out. Check that capture is enabled and WoW is not minimized, then retry.', 6)
             else
                 NS.ShowReply(request, 'Stopped checking after an hour. Check the companion for the reply, or click Retry to resend.', 6, true)
                 NS.OnReplyFinished(job.chat, 6)
