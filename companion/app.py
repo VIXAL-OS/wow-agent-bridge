@@ -28,7 +28,7 @@ from .native import NativeBridge, validate_addon
 from .notifications import ReplyBanner
 from .protocol import Assembler, decode_image, frame_kind, parse_control, parse_envelope, parse_url_frame, parse_character_frame
 from .sessions import list_sessions
-from .savedvariables import SavedRecipes
+from .savedvariables import SavedSnapshots
 from .wow import EpochKeeper, StripLocator, game_dir_for
 
 LABELS = {'queued': 'Queued', 'working': 'Working', 'streaming': 'Writing', 'done': 'Done',
@@ -488,7 +488,7 @@ class App:
             self.native = NativeBridge(addon, agent_label=lambda: BACKENDS.get(self.backend.get(), 'The agent'))
             self.epoch = EpochKeeper(addon)
             self.locator = StripLocator(game_dir_for(addon))
-            self.character.saved_recipes = SavedRecipes(game_dir_for(addon))
+            self.character.saved_snapshots = SavedSnapshots(game_dir_for(addon))
             self.write(f'Addon: {addon}')
         except (OSError, ValueError) as exc:
             self.write(f'Reply channel unavailable: {exc}')
@@ -774,7 +774,7 @@ class App:
         try:
             imported = self.character.import_saved(fields)
             if imported:
-                self.write(f'Loaded {imported} matching recipe snapshot(s) from saved addon data.')
+                self.write(f'Loaded {imported} matching recipe/collection snapshot(s) from saved addon data.')
             if self.character.missing(fields):
                 if key not in self.character_pending and len(self.character_pending) >= MAX_OPEN:
                     self.character_pending.pop(next(iter(self.character_pending)))

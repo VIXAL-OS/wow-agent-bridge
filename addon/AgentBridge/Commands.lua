@@ -196,6 +196,7 @@ SlashCmdList.AGENTBRIDGE = function(arg)
         for line in tostring(ok and context or 'unavailable'):gmatch('[^\n]+') do NS.Print('  '..NS.Escape(line)) end
         for line in NS.CharacterStatus():gmatch('[^\n]+') do NS.Print('  '..NS.Escape(line)) end
         NS.Print('Open each profession with filters cleared and categories expanded to refresh recipes. Unscanned does not mean unlearned.')
+        NS.Print('Pets/mounts refresh automatically. Visit a stable to refresh hunter stable pets; closed stable snapshots are cached.')
     elseif cmd == 'pause' then NS.Pause(); NS.SetStatus('Reply checks paused. Resume or Send to continue.')
     elseif cmd == 'resume' then NS.Resume()
     elseif cmd == 'test' then NS.RunSelfTest(true)

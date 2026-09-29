@@ -1,6 +1,6 @@
 """Read WoW's serialized SavedVariables as bounded data, never as Lua code.
 
-Only AgentBridgeState's recipe cache is exposed. Files come from the selected
+Only AgentBridgeState's recipe and collection caches are exposed. Files come from the selected
 game's account directory, never from a path supplied by a prompt or snapshot.
 """
 from itertools import islice
@@ -15,6 +15,11 @@ MAX_FILES = 64
 MAX_VALUES = 200000
 MAX_DEPTH = 32
 NUMBER = re.compile(rb'-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+COLLECTIONS = frozenset(('mounts', 'pets', 'stablepets'))
+
+
+def saved_section(section):
+    return isinstance(section, str) and (section.startswith('recipes:') or section in COLLECTIONS)
 
 
 class _Reader:
@@ -139,24 +144,27 @@ def parse_savedvariables(data):
     return state
 
 
-def _recipes(state):
+def _snapshots(state):
     result = {}
-    owners = state.get('characterRecipes')
-    if not isinstance(owners, dict):
-        return result
-    for owner, sections in owners.items():
-        if not isinstance(owner, str) or not isinstance(sections, dict):
+    for bucket in ('characterRecipes', 'characterCollections'):
+        owners = state.get(bucket)
+        if not isinstance(owners, dict):
             continue
-        for section, doc in sections.items():
-            if not isinstance(section, str) or not section.startswith('recipes:') or not isinstance(doc, dict):
+        for owner, sections in owners.items():
+            if not isinstance(owner, str) or not isinstance(sections, dict):
                 continue
-            rev, body = doc.get('revision'), doc.get('body')
-            if isinstance(rev, str) and isinstance(body, str):
-                result[owner, section, rev] = body
+            for section, doc in sections.items():
+                if not saved_section(section) or not isinstance(doc, dict):
+                    continue
+                if (bucket == 'characterRecipes') != section.startswith('recipes:'):
+                    continue
+                rev, body = doc.get('revision'), doc.get('body')
+                if isinstance(rev, str) and isinstance(body, str):
+                    result[owner, section, rev] = body
     return result
 
 
-class SavedRecipes:
+class SavedSnapshots:
     def __init__(self, game_dir, clock=time.monotonic):
         self.root = Path(game_dir).resolve() / 'WTF' / 'Account'
         self.clock, self.next_check, self.files = clock, -1e9, {}
@@ -193,7 +201,7 @@ class SavedRecipes:
                 if signature != (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_ino) or len(data) != before.st_size:
                     continue  # Reload is still writing; retry at the next check.
                 try:
-                    entries = _recipes(parse_savedvariables(data))
+                    entries = _snapshots(parse_savedvariables(data))
                 except (ValueError, RecursionError):
                     entries = {}  # Incomplete/unsupported files fall back to pixels.
                 updated[path] = (signature, entries)

@@ -94,6 +94,9 @@ local documents, dirty, generation, tasks = {}, {}, {}, {}
 local scanErrors = {}
 local requests, uploads, active = {}, {}, nil
 local owner, recipeOpen = nil, false
+local stableOpen = false
+local COLLECTIONS = {mounts = 'MOUNT', pets = 'CRITTER'}
+local SAVED_COLLECTIONS = {mounts = true, pets = true, stablepets = true}
 local recipeEpoch = 0
 local function clean(value, limit)
     local text = tostring(value or ''):gsub('[%c|]', ' ')
@@ -164,10 +167,12 @@ local function store(section, rows, status, detail, epoch)
     scanErrors[section] = nil
     if section:sub(1, 8) == 'recipes:' then scanErrors.recipes = nil end
     dirty[section] = nil
-    if section:sub(1, 8) == 'recipes:' and NS.S then
-        NS.S.characterRecipes = NS.S.characterRecipes or {}
-        NS.S.characterRecipes[owner] = NS.S.characterRecipes[owner] or {}
-        NS.S.characterRecipes[owner][section] = {body = body, revision = rev, rows = kept,
+    local bucket = section:sub(1, 8) == 'recipes:' and 'characterRecipes'
+        or SAVED_COLLECTIONS[section] and 'characterCollections'
+    if bucket and NS.S then
+        NS.S[bucket] = NS.S[bucket] or {}
+        NS.S[bucket][owner] = NS.S[bucket][owner] or {}
+        NS.S[bucket][owner][section] = {body = body, revision = rev, rows = kept,
             seen = doc.seen, status = status, detail = detail, count = doc.count}
     end
 end
@@ -218,6 +223,83 @@ local function bags(epoch)
     end
     store('bags', rows, complete and 'complete' or 'partial',
         string.format('Carried bags only; %d/%d occupied slots; bank, mail and keyring excluded.', used, capacity), epoch)
+end
+local function positiveID(value)
+    local n = tonumber(value)
+    return n and n > 0 and n <= 2147483647 and n == math.floor(n) and string.format('%.0f', n) or nil
+end
+local function companions(section, epoch)
+    local kind = COLLECTIONS[section]
+    local total = tonumber(GetNumCompanions(kind))
+    if not total or total < 0 or total ~= math.floor(total) then
+        store(section, {}, 'unavailable', 'Collection count unavailable; absence does not mean unlearned.', epoch)
+        return
+    end
+    local rows, complete = {}, total <= MAX_ROWS
+    for index = 1, math.min(total, MAX_ROWS) do
+        local creature, name, spell = GetCompanionInfo(kind, index)
+        local key, creatureID = positiveID(spell), positiveID(creature)
+        name = clean(name)
+        if key and name ~= '' then
+            if rows[key] or not creatureID then complete = false end
+            rows[key] = {key, name, creatureID or '0'}
+        else complete = false end
+        coroutine.yield()
+    end
+    if tonumber(GetNumCompanions(kind)) ~= total then mark(section); return end
+    if not complete then
+        -- Preserve observations when the client has not loaded every entry.
+        for key, row in pairs(documents[section] and documents[section].rows or {}) do
+            if not rows[key] then rows[key] = row end
+            coroutine.yield()
+        end
+    end
+    local detail = section == 'mounts' and 'Learned mount collection; summon spell IDs and creature IDs.'
+        or 'Learned companion pets (CRITTER); summon spell IDs and creature IDs.'
+    if not complete then detail = detail..' Incomplete scan; includes prior observations; absence does not mean unlearned.' end
+    store(section, rows, complete and 'complete' or 'partial', detail, epoch)
+end
+local function petLevel(value)
+    local n = tonumber(value)
+    return n and n >= 1 and n <= 255 and n == math.floor(n) and tostring(n) or ''
+end
+local function combatpet(epoch)
+    local rows, complete = {}, true
+    local detail = 'Active player pet only; an absent pet may be dismissed or stabled. Other summonable combat pets are not enumerated.'
+    if UnitExists('pet') then
+        local name = clean(UnitName('pet'))
+        local family = clean(UnitCreatureFamily and UnitCreatureFamily('pet'))
+        local level = petLevel(UnitLevel('pet'))
+        local hasUI, hunter = nil, nil
+        if HasPetUI then hasUI, hunter = HasPetUI() end
+        local kind = hasUI and (hunter and 'hunter' or 'summoned') or 'unknown'
+        local talent = clean(GetPetTalentTree and GetPetTalentTree())
+        complete = name ~= '' and family ~= '' and level ~= ''
+        rows.active = {'active', name, family, level, talent, kind}
+    end
+    store('combatpet', rows, complete and 'complete' or 'partial', detail, epoch)
+end
+local function stablepets(epoch)
+    if not stableOpen then return end
+    local slots = tonumber(GetNumStableSlots())
+    if not slots or slots < 0 or slots > 4 or slots ~= math.floor(slots) then
+        store('stablepets', {}, 'unavailable', 'Hunter stable slot count unavailable.', epoch); return
+    end
+    local rows, complete = {}, true
+    for slot = 0, slots do
+        if not stableOpen or generation.stablepets ~= epoch then return end
+        local icon, name, level, family, talent = GetStablePetInfo(slot)
+        if icon or name then
+            name, family, level = clean(name), clean(family), petLevel(level)
+            if name == '' or family == '' or level == '' then complete = false end
+            local key = tostring(slot)
+            rows[key] = {key, name, family, level, clean(talent)}
+        end
+        coroutine.yield()
+    end
+    if not stableOpen or generation.stablepets ~= epoch then return end
+    store('stablepets', rows, complete and 'complete' or 'partial',
+        'Hunter stable observed while open; slot 0 is the current/dismissed pet; slots 1-4 are stabled. Slot 0 may duplicate the active pet.', epoch)
 end
 local function recipeIdentity()
     if not recipeOpen or not GetTradeSkillLine or not IsTradeSkillLinked or IsTradeSkillLinked() then return end
@@ -301,11 +383,16 @@ function NS.CharacterFields(fields)
             local stale = dirty[section] or scanErrors[section] or (isRecipe and scanErrors.recipes)
             local freshness = stale and 'stale' or doc.session ~= NS.session and 'cached' or 'current'
             if not stale and isRecipe and recipeIdentity() ~= section then freshness = 'cached' end
+            if not stale and section == 'stablepets' and not stableOpen then freshness = 'cached' end
             fields[#fields+1] = {'snapshot', section..'|'..doc.revision..'|'..doc.seen..'|'..freshness}
             bundle.docs[section] = doc
         end
     end
-    fields[#fields+1] = {'ctx', 'Gear/bags are event-cached observations. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included.'}
+    fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts are event-cached observations. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
+    if not GetNumCompanions or not GetCompanionInfo then
+        fields[#fields+1] = {'ctx', 'Mount and companion-pet collection APIs unavailable; do not infer an empty collection.'}
+    end
+    if not UnitExists then fields[#fields+1] = {'ctx', 'Active combat-pet API unavailable; do not infer no pet.'} end
     if dirty.gear or dirty.bags then fields[#fields+1] = {'ctx', 'Inventory scan pending; cached inventory may be stale. Send again after the scan finishes.'} end
     for section in pairs(scanErrors) do fields[#fields+1] = {'ctx', section..' scan failed; do not treat cached data as current.'} end
     return bundle
@@ -326,16 +413,26 @@ function NS.CharacterNeed(request, text)
     local bundle = requests[request]
     if not bundle or not NS.S.context then return true end
     bundle.queued = bundle.queued or {}
+    local added = false
     for line in text:sub(9):gmatch('[^\n]+') do
         local section, rev = line:match('^([^|]+)|([%x]+%-%d+)$')
         local doc = section and bundle.docs[section]
         if doc and doc.revision == rev and not bundle.queued[section] then
             bundle.queued[section] = true
             uploads[#uploads+1] = {parent = request, section = section, doc = doc, owner = bundle.owner}
+            added = true
         end
     end
-    NS.ShowReply(request, 'Syncing gear, bags and recipe changes with the companion...', 0, true)
+    -- The companion already has this prompt. Give snapshot pages the strip,
+    -- then repeat the prompt after all its uploads so only a fresh send runs it.
+    if added then NS.HoldPrompt(request, true) end
+    NS.ShowReply(request, 'Syncing character snapshots with the companion...', 0, true)
     return true
+end
+local function resumeParent(request)
+    if active and active.parent == request then return end
+    for _, job in ipairs(uploads) do if job.parent == request then return end end
+    NS.HoldPrompt(request, false)
 end
 local function uploadStep()
     if active then return end
@@ -355,8 +452,7 @@ local function uploadStep()
         local seq = NS.NextRequest(); job.request = seq
         local fields = {{'character', job.owner}, {'section', job.section}, {'revision', job.doc.revision},
                         {'page', index}, {'total', #pages}}
-        -- A full page and the parent prompt share the strip. Leave room for
-        -- several retransmissions when background capture misses fragments.
+        -- Leave room for several retransmissions when capture misses fragments.
         local ok = NS.BeginRequest(seq, nil, function(reply, state)
             NS.StripTransferProgress(job.parent)
             if state ~= 4 or reply ~= 'ABCTX_OK' then
@@ -366,6 +462,7 @@ local function uploadStep()
                 else failSync(job.parent, reply) end
             elseif index < #pages then sendPage(index+1)
             else active = nil end
+            resumeParent(job.parent)
         end, 240)
         if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
         NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, pages[index]), NS.session, seq), true)
@@ -395,26 +492,55 @@ local function loadOwner()
     if owner then NS.CharacterContextOff() end
     owner = identity
     documents, dirty, generation, tasks, scanErrors = {}, {}, {}, {}, {}
-    local saved = type(NS.S.characterRecipes) == 'table' and NS.S.characterRecipes[owner]
-    if type(saved) == 'table' then
-        for section, doc in pairs(saved) do
-            if type(section) == 'string' and section:sub(1, 8) == 'recipes:' and type(doc) == 'table'
-                and type(doc.body) == 'string' and #doc.body <= MAX_BYTES and type(doc.rows) == 'table'
-                and type(doc.revision) == 'string' and type(doc.seen) == 'number'
-                and type(doc.count) == 'number' and type(doc.status) == 'string' and type(doc.detail) == 'string' then
-                documents[section] = doc
+    stableOpen = false
+    for _, bucket in ipairs({'characterRecipes', 'characterCollections'}) do
+        local saved = type(NS.S[bucket]) == 'table' and NS.S[bucket][owner]
+        if type(saved) == 'table' then
+            for section, doc in pairs(saved) do
+                local allowed = type(section) == 'string' and (bucket == 'characterRecipes' and section:sub(1, 8) == 'recipes:'
+                    or bucket == 'characterCollections' and SAVED_COLLECTIONS[section])
+                if allowed and type(doc) == 'table'
+                    and type(doc.body) == 'string' and #doc.body <= MAX_BYTES and type(doc.rows) == 'table'
+                    and type(doc.revision) == 'string' and type(doc.seen) == 'number'
+                    and type(doc.count) == 'number' and type(doc.status) == 'string' and type(doc.detail) == 'string' then
+                    documents[section] = doc
+                end
             end
         end
     end
-    mark('gear'); mark('bags')
+    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet')
 end
 local driver = CreateFrame('Frame')
 for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UNIT_INVENTORY_CHANGED', 'BAG_UPDATE',
     'GET_ITEM_INFO_RECEIVED', 'TRADE_SKILL_SHOW', 'TRADE_SKILL_UPDATE', 'TRADE_SKILL_FILTER_UPDATE',
-    'TRADE_SKILL_CLOSE', 'SKILL_LINES_CHANGED'}) do pcall(driver.RegisterEvent, driver, event) end
+    'TRADE_SKILL_CLOSE', 'SKILL_LINES_CHANGED', 'COMPANION_LEARNED', 'COMPANION_UNLEARNED', 'COMPANION_UPDATE',
+    'UNIT_PET', 'UNIT_NAME_UPDATE', 'UNIT_LEVEL', 'PET_UI_UPDATE', 'PET_UI_CLOSE', 'PET_TALENT_UPDATE',
+    'PET_STABLE_SHOW', 'PET_STABLE_UPDATE', 'PET_STABLE_UPDATE_PAPERDOLL', 'PET_STABLE_CLOSED'}) do pcall(driver.RegisterEvent, driver, event) end
 driver:SetScript('OnEvent', function(_, event, unit)
     if event == 'PLAYER_ENTERING_WORLD' then loadOwner() end
     if event == 'UNIT_INVENTORY_CHANGED' and unit ~= 'player' then return end
+    if event:find('COMPANION_') == 1 then
+        if unit == 'MOUNT' then mark('mounts')
+        elseif unit == 'CRITTER' then mark('pets')
+        else mark('mounts'); mark('pets') end
+        return
+    end
+    if event:find('PET_STABLE_') == 1 then
+        if event == 'PET_STABLE_CLOSED' then
+            stableOpen = false; generation.stablepets = (generation.stablepets or 0) + 1; tasks.stablepets = nil
+        else
+            if event == 'PET_STABLE_SHOW' then stableOpen = true end
+            if stableOpen then mark('stablepets') end
+        end
+        return
+    end
+    if event == 'UNIT_PET' or event == 'UNIT_NAME_UPDATE' or event == 'UNIT_LEVEL' or event:find('PET_') == 1 then
+        if event == 'UNIT_PET' and unit ~= 'player' then return end
+        if (event == 'UNIT_NAME_UPDATE' or event == 'UNIT_LEVEL') and unit ~= 'pet' then return end
+        mark('combatpet')
+        if stableOpen then mark('stablepets') end
+        return
+    end
     if event == 'TRADE_SKILL_CLOSE' then recipeOpen = false; recipeEpoch = recipeEpoch + 1
     elseif event:find('TRADE_SKILL') then
         if event == 'TRADE_SKILL_SHOW' then recipeOpen = true end
@@ -424,20 +550,27 @@ driver:SetScript('OnEvent', function(_, event, unit)
     elseif event == 'BAG_UPDATE' then mark('bags')
     else
         mark('gear'); mark('bags')
+        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet') end
         if event == 'SKILL_LINES_CHANGED' then
             for section in pairs(documents) do if section:sub(1, 8) == 'recipes:' then dirty[section] = GetTime() end end
             recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5
         end
     end
 end)
+local scanners = {gear = gear, bags = bags, recipes = recipes,
+    mounts = function(epoch) companions('mounts', epoch) end,
+    pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets}
 local function work()
     if not NS.S or not NS.S.context or not owner then return end
     uploadStep()
     if InCombatLockdown and InCombatLockdown() then return end
     local now = GetTime()
-    for section, fn in pairs({gear = gear, bags = bags, recipes = recipes}) do
+    for section, fn in pairs(scanners) do
         local available = section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
             or section == 'recipes' and recipeIdentity()
+            or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
+            or section == 'combatpet' and UnitExists
+            or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
         if available and dirty[section] and now >= dirty[section] and not tasks[section] then
             local epoch = section == 'recipes' and recipeEpoch or generation[section]
             tasks[section] = coroutine.create(function() fn(epoch) end)

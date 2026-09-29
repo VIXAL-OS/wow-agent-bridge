@@ -297,7 +297,7 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 
 Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes game state to Claude Code as part of the system prompt, and to Codex and Hermes ahead of your message, marked as data about your character rather than instructions.
 
-**Gear, bags and learned recipes.** With context enabled, the addon maintains
+**Gear, bags, learned recipes, pets and mounts.** With context enabled, the addon maintains
 character snapshots using ordinary game APIs:
 
 - **Gear:** equipped slots 0–19, item names, full item strings (including enchant
@@ -310,22 +310,40 @@ character snapshots using ordinary game APIs:
   and makeable filters, choose all categories/slots, and expand categories for a
   complete scan. The addon does not change these controls. Linked professions
   belonging to other players are ignored. Recipe reagent lists are not included.
+- **Mounts and companion pets:** learned `MOUNT` and `CRITTER` collections, with
+  names, summon spell IDs and creature IDs. These scan automatically on login
+  and collection events; opening the collection panel is unnecessary. Summoning
+  a mount or companion does not change its ownership snapshot.
+- **Active combat pet:** the player's current pet name, family, level, talent
+  tree when available, and whether the pet UI identifies it as a hunter or
+  summoned pet. Updates follow pet changes, renames and levels. An absent active
+  pet may be dismissed or stabled; this does not enumerate every combat pet the
+  class can summon. Missing metadata is labelled partial.
+- **Hunter stable:** opening the stable scans slots 0–4 through the legacy
+  stable API. Slot 0 is the current/dismissed pet and may duplicate the active
+  pet; slots 1–4 are stabled pets. Names, families, levels and talent trees are
+  recorded. Closing the stable stops scanning and marks the observation cached.
+  An unopened stable is unscanned, never assumed empty.
+
+Pet APIs and return values follow the original 3.3.5 interface code:
+[collection and active-pet UI](https://github.com/wowgaming/3.3.5-interface-files/blob/main/PetPaperDollFrame.lua)
+and [hunter stable UI](https://github.com/wowgaming/3.3.5-interface-files/blob/main/PetStable.lua).
 
 Gear and bag scans are triggered by events, debounced, and spread over frames;
 they pause during combat. Recipe scans also run incrementally while their window
 is open. Partial scans preserve previously observed recipes, and never claim that
-an omitted recipe is unlearned. Recipe caches survive `/reload` and are scoped to
+an omitted recipe is unlearned. Recipe, mount, companion-pet and stable caches survive `/reload` and are scoped to
 realm and character. Unlearning a profession removes its cache from future prompt
 references. Use `/ab context show` to see record counts, coverage and scan age.
 
 Only sending a prompt starts data transfer. The prompt identifies the exact
 snapshot revisions it needs. Before requesting uploads, the companion checks
 `WTF/Account/*/SavedVariables/AgentBridge.lua` in the selected game installation
-for matching recipe snapshots. WoW writes these files on `/reload` or logout;
-opening your professions and then reloading lets a large recipe baseline travel
+for matching recipe and collection snapshots. WoW writes these files on `/reload` or logout;
+letting the scans finish and then reloading lets a large baseline travel
 through the saved file instead of the strip. The companion parses bounded Lua
 literals as data (never executes Lua) and checks the character, section, revision,
-JSON schema and checksum. Only recipes referenced by the prompt are imported;
+JSON schema and checksum. Only recipe/collection snapshots referenced by the prompt are imported;
 freshness and coverage still come from the prompt and validated snapshot. A
 missing, outdated, malformed or oversized file falls back to the optical channel.
 No extra reload is required when a matching saved snapshot already exists.
@@ -333,6 +351,8 @@ No extra reload is required when a matching saved snapshot already exists.
 The companion requests the remaining missing revisions, receives
 checked `CPBC` pages, and commits each full section atomically. Changes can use
 row patches; a missing patch baseline automatically falls back to a full section.
+The original prompt pauses its retransmissions during its snapshot uploads,
+then resumes so a fresh prompt starts the agent after synchronization.
 The companion does not start the agent until every referenced section is present.
 Unchanged data is reused across chats/backends and companion restarts. Cancelling
 an incomplete send does not allow a later upload to resurrect the old prompt.
@@ -346,7 +366,7 @@ is explicitly labelled partial. `/ab perf` includes `character-context` timings.
 All three agents receive freshness summaries and absolute paths to immutable
 UTF-8 snapshot files under the companion's `state/characters` directory. They
 read relevant files with their native file tools when answering inventory or
-recipe questions, instead of receiving the entire recipe catalogue in every
+recipe, pet or mount questions, instead of receiving every collection in each
 model prompt. Observations are labelled current, cached or stale and timestamped;
 they are not live queries while the agent is working.
 

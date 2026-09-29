@@ -49,10 +49,12 @@ local function effectiveAlpha()
     if next(recovery) then return 1 end
     local value, now = preferred, GetTime()
     for _, item in ipairs(pending) do
-        if item.character then value = math.max(value, .6) end
-        -- Allow two complete sweeps of the shared strip before treating an
-        -- unacknowledged prompt/page as stalled. Long pages need more time.
-        if now - item.started >= math.max(12, #frames * .4 + 8) then return 1 end
+        if not item.held then
+            if item.character then value = math.max(value, .6) end
+            -- Allow two complete sweeps of the shared strip before treating an
+            -- unacknowledged prompt/page as stalled. Long pages need more time.
+            if now - item.started >= math.max(12, #frames * .4 + 8) then return 1 end
+        end
     end
     return value
 end
@@ -61,7 +63,16 @@ local lastSubmit, lastData, lastAlpha, elapsed, tick = -1000, nil, nil, 0, 0
 local function rebuild()
     frames, cursor, rotation = {}, 1, 0
     for _, item in ipairs(pending) do
-        for _, frame in ipairs(item.frames) do frames[#frames+1] = frame end
+        if not item.held then
+            for _, frame in ipairs(item.frames) do frames[#frames+1] = frame end
+        end
+    end
+end
+function NS.HoldPrompt(request, hold)
+    for _, item in ipairs(pending) do
+        if item.request == request and item.held ~= hold then
+            item.held, item.started = hold, GetTime(); rebuild(); return
+        end
     end
 end
 function NS.QueuePrompt(request, promptFrames, character)

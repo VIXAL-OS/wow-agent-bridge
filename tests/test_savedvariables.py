@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from companion.app import App, Inbox, Scheduler
 from companion.character import CharacterStore, canonical, revision
-from companion.savedvariables import SavedRecipes, parse_savedvariables
+from companion.savedvariables import SavedSnapshots, parse_savedvariables
 from tests.test_character import envelope
 
 
@@ -80,7 +80,7 @@ class SavedRecipeImport(unittest.TestCase):
         self.file = self.game / 'WTF/Account/TEST/SavedVariables/AgentBridge.lua'
         self.file.parent.mkdir(parents=True)
         self.now = 0
-        self.source = SavedRecipes(self.game, clock=lambda: self.now)
+        self.source = SavedSnapshots(self.game, clock=lambda: self.now)
         self.db = sqlite3.connect(':memory:')
         self.addCleanup(self.db.close)
         self.store = CharacterStore(self.db, self.game / 'characters', self.source)
@@ -212,4 +212,4 @@ class SavedRecipeImport(unittest.TestCase):
         self.assertEqual(request.prompt, 'What recipes do I know?')
         self.assertIn('420 records; partial; cached', request.context)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM character_requests').fetchone()[0], 0)
-        app.write.assert_any_call('Loaded 1 matching recipe snapshot(s) from saved addon data.')
+        app.write.assert_any_call('Loaded 1 matching recipe/collection snapshot(s) from saved addon data.')
