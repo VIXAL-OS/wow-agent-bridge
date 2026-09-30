@@ -114,7 +114,15 @@ end
 local driver = CreateFrame('Frame')
 driver:SetScript('OnUpdate', function(_, dt)
     elapsed = elapsed + dt
-    if elapsed < .15 then return end
+    -- After two unacknowledged sweeps, hold each page fragment long enough for
+    -- covered-window capture (~0.3s) to observe it. Healthy transfers stay fast.
+    local interval, now = .15, GetTime()
+    for _, item in ipairs(pending) do
+        if item.character and not item.held and now - item.started >= math.max(12, #frames * .4 + 8) then
+            interval = .35; break
+        end
+    end
+    if elapsed < interval then return end
     elapsed = 0
     if not NS.session or not wanted() then
         alpha = preferred

@@ -1,6 +1,6 @@
 """Read WoW's serialized SavedVariables as bounded data, never as Lua code.
 
-Only AgentBridgeState's recipe and collection caches are exposed. Files come from the selected
+Only AgentBridgeState's recipe, collection and achievement caches are exposed. Files come from the selected
 game's account directory, never from a path supplied by a prompt or snapshot.
 """
 from itertools import islice
@@ -19,7 +19,8 @@ COLLECTIONS = frozenset(('mounts', 'pets', 'stablepets'))
 
 
 def saved_section(section):
-    return isinstance(section, str) and (section.startswith('recipes:') or section in COLLECTIONS)
+    return isinstance(section, str) and (section.startswith('recipes:') or section in COLLECTIONS
+                                        or re.fullmatch(r'achievements:[1-8]', section) is not None)
 
 
 class _Reader:
@@ -146,7 +147,7 @@ def parse_savedvariables(data):
 
 def _snapshots(state):
     result = {}
-    for bucket in ('characterRecipes', 'characterCollections'):
+    for bucket in ('characterRecipes', 'characterCollections', 'characterAchievements'):
         owners = state.get(bucket)
         if not isinstance(owners, dict):
             continue
@@ -156,7 +157,9 @@ def _snapshots(state):
             for section, doc in sections.items():
                 if not saved_section(section) or not isinstance(doc, dict):
                     continue
-                if (bucket == 'characterRecipes') != section.startswith('recipes:'):
+                expected = ('characterRecipes' if section.startswith('recipes:') else
+                            'characterAchievements' if section.startswith('achievements:') else 'characterCollections')
+                if bucket != expected:
                     continue
                 rev, body = doc.get('revision'), doc.get('body')
                 if isinstance(rev, str) and isinstance(body, str):

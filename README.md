@@ -297,7 +297,7 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 
 Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes game state to Claude Code as part of the system prompt, and to Codex and Hermes ahead of your message, marked as data about your character rather than instructions.
 
-**Gear, bags, learned recipes, pets and mounts.** With context enabled, the addon maintains
+**Gear, bags, learned recipes, pets, mounts and achievements.** With context enabled, the addon maintains
 character snapshots using ordinary game APIs:
 
 - **Gear:** equipped slots 0–19, item names, full item strings (including enchant
@@ -324,17 +324,31 @@ character snapshots using ordinary game APIs:
   pet; slots 1–4 are stabled pets. Names, families, levels and talent trees are
   recorded. Closing the stable stops scanning and marks the observation cached.
   An unopened stable is unscanned, never assumed empty.
+- **Achievements and criteria:** achievement names, descriptions, completion,
+  points, dates and categories, plus each named criterion's completion flag,
+  quantity and required quantity. This includes individual Dalaran fishing coins,
+  collection lists, progress counters and meta-achievement objectives. Credit
+  remains visible after a collected item leaves your bags. Asset IDs are kept
+  with their criterion type; they are not automatically treated as item IDs.
+  The reader follows earlier/later achievement tiers and meta objectives, uses
+  your own character's APIs, and ignores the achievement window's display filter
+  and comparison view. You do not need to open the achievement window.
+  Missing values remain unknown, and incomplete criteria are marked per achievement.
+  Overall completion does not imply every optional criterion is complete. Hidden
+  achievements not enumerated by the client are not inferred to be unearned.
 
 Pet APIs and return values follow the original 3.3.5 interface code:
 [collection and active-pet UI](https://github.com/wowgaming/3.3.5-interface-files/blob/main/PetPaperDollFrame.lua)
 and [hunter stable UI](https://github.com/wowgaming/3.3.5-interface-files/blob/main/PetStable.lua).
+Achievement enumeration and criterion fields follow the
+[3.3.5 achievement UI](https://github.com/wowgaming/3.3.5-interface-files/blob/main/Blizzard_AchievementUI/Blizzard_AchievementUI.lua).
 
 Gear and bag scans are triggered by events, debounced, and spread over frames;
 they pause during combat. Recipe scans also run incrementally while their window
 is open. Partial scans preserve previously observed recipes, and never claim that
-an omitted recipe is unlearned. Recipe, mount, companion-pet and stable caches survive `/reload` and are scoped to
+an omitted recipe is unlearned. Recipe, mount, companion-pet, stable and achievement caches survive `/reload` and are scoped to
 realm and character. Unlearning a profession removes its cache from future prompt
-references. Use `/ab context show`, or hover over **Sync**, to see record counts,
+references. Use `/ab context show` to see record counts,
 coverage, freshness, scan age and the recorded reason for any partial scan.
 `complete, cached` means a complete scan from the last time that profession was
 open; it does not mean a filter was active. Each question's snapshot references
@@ -342,7 +356,9 @@ supersede older files and filter warnings in the agent conversation.
 
 Click **Sync** in the bottom button row, just left of **Retry**, or type `/ab sync`, to
 rescan and upload character data without starting an agent or spending a prompt.
-It refreshes gear, carried bags, mounts, companion pets and the active combat pet.
+It refreshes gear, carried bags, mounts, companion pets, the active combat pet,
+and achievements with their individual criteria. Achievement progress also
+refreshes on login, achievement-earned and criteria-update events.
 Keep your own profession window open to refresh its recipes, and keep the hunter
 stable open to refresh stable pets. Other saved recipes and stable observations
 are uploaded as cached; unopened professions cannot be scanned remotely. The
@@ -351,22 +367,36 @@ Wait for the chat message confirming how many snapshots were uploaded, then send
 your question. Repeated sync clicks and prompts wait for that transfer to finish;
 the input draft is preserved. Context sharing must be enabled. A failed scan or
 upload reports the problem and allows retrying; `/ab context off` cancels a sync.
+Sync first checks the companion's cache and matching saved snapshots, so repeated
+clicks transfer only probes for unchanged data. Missing revisions use row patches
+against the last snapshot the companion confirmed receiving, even after multiple
+scans or `/reload`. The addon saves one revision and compact row fingerprints per
+character/section in `characterSynced`; scans do not advance that cache. Only a
+complete snapshot/probe acknowledgement or an accepted prompt confirms a baseline.
+Partial page acknowledgements, failures and cancellations do not. If the companion
+loses its baseline or rejects a patch, sync retries once with a full document.
+Patch preparation is spread across frames. Large achievement
+baselines can take longer over the pixel channel. Let the scan finish and then
+`/reload` to write it to SavedVariables for a faster file import on the next sync.
+After installing this feature, restart the companion once and `/reload` the addon;
+the companion must recognize achievement snapshots and cache probes.
 
 Sending a prompt also starts data transfer. The prompt identifies the exact
 snapshot revisions it needs. Before requesting uploads, the companion checks
 `WTF/Account/*/SavedVariables/AgentBridge.lua` in the selected game installation
-for matching recipe and collection snapshots. WoW writes these files on `/reload` or logout;
+for matching recipe, collection and achievement snapshots. WoW writes these files on `/reload` or logout;
 letting the scans finish and then reloading lets a large baseline travel
 through the saved file instead of the strip. The companion parses bounded Lua
 literals as data (never executes Lua) and checks the character, section, revision,
-JSON schema and checksum. Only recipe/collection snapshots referenced by the prompt are imported;
+JSON schema and checksum. Only recipe/collection/achievement snapshots referenced by the prompt or manual sync are imported;
 freshness and coverage still come from the prompt and validated snapshot. A
 missing, outdated, malformed or oversized file falls back to the optical channel.
 No extra reload is required when a matching saved snapshot already exists.
 
 The companion requests the remaining missing revisions, receives
 checked `CPBC` pages, and commits each full section atomically. Changes can use
-row patches; a missing patch baseline automatically falls back to a full section.
+row patches based on the confirmed sync cache; a missing patch baseline
+automatically falls back to a full section.
 The original prompt pauses its retransmissions during its snapshot uploads,
 then resumes so a fresh prompt starts the agent after synchronization.
 The companion does not start the agent until every referenced section is present.
@@ -378,6 +408,16 @@ prompts send revision references and changed rows. Each data page remains below
 the existing 8,000-byte packet-message limit, separately from the typed prompt.
 Sections are capped at 2,000 records and 160 KB; a limit or incomplete game data
 is explicitly labelled partial. `/ab perf` includes `character-context` timings.
+Achievements use eight stable partitions to fit those existing document limits;
+prompts support up to 32 snapshot references. The scan is bounded to 256 categories,
+4,096 achievements, 128 criteria per achievement and 20,000 criteria in total,
+with explicit partial coverage on any limit. It yields over frames, pauses in
+combat and invalidates an interrupted scan when newer progress arrives. Saved
+achievement snapshots are scoped to realm/character and imported as validated data.
+Large transfers retain partial packets while new fragments are arriving. After
+two unacknowledged sweeps, character-page fragments stay visible for 0.35 seconds
+to accommodate slow capture; healthy transfers keep their normal cadence.
+Stalled assemblies still expire after 180 seconds without progress.
 
 All three agents receive freshness summaries and absolute paths to immutable
 UTF-8 snapshot files under the companion's `state/characters` directory. They

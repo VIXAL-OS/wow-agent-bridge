@@ -52,6 +52,7 @@ class ManualSync(unittest.TestCase):
         self.assertEqual(self.document('bags')[0][4][0][3], '77')
         self.assertEqual(len(self.document('recipes:Alchemy')[0][4]), 210)
         self.assertTrue(self.sim.ns.SyncButton.IsEnabled(self.sim.ns.SyncButton))
+        self.sim.run(.3)  # Allow the already painted final packet to clear.
         frames = self.sim.character_frames
         self.sim.send('fresh recipes')
         self.assertTrue(self.sim.run(90, until=lambda: self.sim.last_reply() == 'Echo: fresh recipes'))

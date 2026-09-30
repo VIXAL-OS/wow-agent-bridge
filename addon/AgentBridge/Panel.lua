@@ -311,11 +311,9 @@ end)
 sync:SetScript('OnEnter', function(self)
     GameTooltip:SetOwner(self, 'ANCHOR_TOP')
     GameTooltip:SetText('Sync character data', 1, 1, 1)
-    GameTooltip:AddLine('Rescan and upload gear, carried bags, mounts, pets and saved recipes. No agent question is sent.', .8, .8, .8, true)
-    GameTooltip:AddLine('Keep your profession open to refresh recipes. Clear filters and expand categories for a complete scan. Visit a stable to refresh hunter stable pets.', .8, .8, .8, true)
-    if NS.CharacterStatus then
-        for line in NS.CharacterStatus():gmatch('[^\n]+') do GameTooltip:AddLine(line, .8, .8, .8, true) end
-    end
+    GameTooltip:AddLine('Update bags, pets, achievements and more.', .8, .8, .8, true)
+    GameTooltip:AddLine('Open a profession to refresh its recipes.', .8, .8, .8, true)
+    GameTooltip:AddLine('Scan details: /ab context show', .6, .6, .6, true)
     GameTooltip:Show()
 end)
 sync:SetScript('OnLeave', function() GameTooltip:Hide() end)

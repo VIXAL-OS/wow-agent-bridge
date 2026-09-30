@@ -91,6 +91,7 @@ end
 -- sends revisions for prompts or an explicit manual sync. No background I/O.
 local MAX_ROWS, MAX_BYTES = 2000, 160000
 local documents, dirty, generation, tasks = {}, {}, {}, {}
+local synced, confirmations, confirming = {}, {}, nil
 local scanErrors = {}
 local requests, uploads, active = {}, {}, nil
 local manual
@@ -98,6 +99,13 @@ local owner, recipeOpen = nil, false
 local stableOpen = false
 local COLLECTIONS = {mounts = 'MOUNT', pets = 'CRITTER'}
 local SAVED_COLLECTIONS = {mounts = true, pets = true, stablepets = true}
+-- Fixed partitions bound each document and keep small progress changes local.
+local ACHIEVEMENT_PARTS = 8
+local function achievementSection(section) return section:match('^achievements:[1-8]$') ~= nil end
+local function achievementAPIs()
+    return GetCategoryList and GetCategoryNumAchievements and GetAchievementInfo
+        and GetAchievementNumCriteria and GetAchievementCriteriaInfo
+end
 local recipeEpoch = 0
 local function clean(value, limit)
     local text = tostring(value or ''):gsub('[%c|]', ' ')
@@ -127,6 +135,61 @@ local function checksum(body)
     end
     return string.format('%08x-%d', b*65536+a, #body)
 end
+local function rowHashes(doc)
+    if doc.hashes then return doc.hashes end
+    local hashes = {}
+    for key, row in pairs(doc.rows) do
+        hashes[key] = checksum(json(row)); coroutine.yield()
+    end
+    doc.hashes = hashes
+    return hashes
+end
+local function advance(task)
+    local started = debugprofilestop and debugprofilestop()
+    for _ = 1, 32 do
+        local ok, error = coroutine.resume(task)
+        if not ok then return false, error end
+        if coroutine.status(task) == 'dead' then return true end
+        if started and debugprofilestop() - started >= .5 then break end
+    end
+end
+local function saveSynced(section, doc)
+    local baseline = {revision = doc.revision, hashes = doc.hashes}
+    synced[section] = baseline
+    if type(NS.S.characterSynced) ~= 'table' then NS.S.characterSynced = {} end
+    if type(NS.S.characterSynced[owner]) ~= 'table' then NS.S.characterSynced[owner] = {} end
+    NS.S.characterSynced[owner][section] = baseline
+end
+local function rememberSynced(identity, section, doc)
+    if identity ~= owner then return end
+    if doc.hashes then
+        saveSynced(section, doc); confirmations[section] = nil
+    else confirmations[section] = {owner = identity, doc = doc} end
+end
+local function confirmStep()
+    if not confirming then
+        local section, entry = next(confirmations)
+        if not section then return end
+        confirming = {section = section, entry = entry, task = coroutine.create(function()
+            rowHashes(entry.doc)
+            if owner ~= entry.owner or confirmations[section] ~= entry then return end
+            -- Persist only one confirmed revision and compact row fingerprints.
+            -- Scans never move this baseline; only a complete acknowledgement can.
+            saveSynced(section, entry.doc)
+        end)}
+    end
+    local done, error = advance(confirming.task)
+    if done ~= nil then
+        if confirmations[confirming.section] == confirming.entry then confirmations[confirming.section] = nil end
+        confirming = nil
+        if error then NS.Print('Sync cache unavailable: '..clean(error, 160)) end
+    end
+end
+local function forgetSynced(identity, section, revision)
+    if identity ~= owner or not synced[section] or synced[section].revision ~= revision then return end
+    synced[section] = nil
+    if NS.S.characterSynced and NS.S.characterSynced[owner] then NS.S.characterSynced[owner][section] = nil end
+end
 local function mark(section)
     generation[section] = (generation[section] or 0) + 1
     dirty[section] = GetTime() + .4
@@ -143,6 +206,7 @@ local function store(section, rows, status, detail, epoch)
     local body = '[1,'..json(section)..','..json(status)..','..json(clean(detail, 500))..',['..table.concat(encoded, ',')..']]'
     local rev = checksum(body)
     if section:sub(1, 8) == 'recipes:' and recipeEpoch ~= epoch then return end
+    if achievementSection(section) and generation.achievements ~= epoch then return end
     if epoch and generation[section] ~= epoch then return end
     local previous = documents[section]
     local doc = {body = body, revision = rev, rows = kept, seen = time(), session = NS.session,
@@ -164,11 +228,13 @@ local function store(section, rows, status, detail, epoch)
     elseif previous then doc.patch = previous.patch end
     if epoch and generation[section] ~= epoch then return end
     if section:sub(1, 8) == 'recipes:' and recipeEpoch ~= epoch then return end
+    if achievementSection(section) and generation.achievements ~= epoch then return end
     documents[section] = doc
     scanErrors[section] = nil
     if section:sub(1, 8) == 'recipes:' then scanErrors.recipes = nil end
     dirty[section] = nil
     local bucket = section:sub(1, 8) == 'recipes:' and 'characterRecipes'
+        or achievementSection(section) and 'characterAchievements'
         or SAVED_COLLECTIONS[section] and 'characterCollections'
     if bucket and NS.S then
         NS.S[bucket] = NS.S[bucket] or {}
@@ -302,6 +368,114 @@ local function stablepets(epoch)
     store('stablepets', rows, complete and 'complete' or 'partial',
         'Hunter stable observed while open; slot 0 is the current/dismissed pet; slots 1-4 are stabled. Slot 0 may duplicate the active pet.', epoch)
 end
+local function achievementNumber(value)
+    local n = tonumber(value)
+    return n and n >= 0 and n <= 9007199254740991 and n == math.floor(n) and string.format('%.0f', n) or ''
+end
+local function achievementFlag(value) return value and value ~= 0 and '1' or '0' end
+local function achievements(epoch)
+    local groups, sizes, queue, seen = {}, {}, {}, {}
+    for part = 1, ACHIEVEMENT_PARTS do groups[part], sizes[part] = {}, 0 end
+    local complete, criteriaRead = true, 0
+    local categories = GetCategoryList()
+    local ready = type(categories) == 'table' and #categories > 0
+    if not ready then categories = {}; complete = false end
+    local function enqueue(id, category)
+        id = positiveID(id)
+        if not id or seen[id] then return end
+        if #queue >= 4096 then complete = false; return end
+        seen[id] = true; queue[#queue+1] = {id, category}
+    end
+    if #categories > 256 then complete = false end
+    for index = 1, math.min(#categories, 256) do
+        if generation.achievements ~= epoch then return end
+        local category = categories[index]
+        local name = GetCategoryInfo and GetCategoryInfo(category) or tostring(category)
+        -- Capture only the total: the second return is completed count, which
+        -- tonumber would otherwise interpret as its optional numeric base.
+        local total = GetCategoryNumAchievements(category)
+        total = tonumber(total)
+        if not total or total < 0 or total ~= math.floor(total) or total > 4096 then
+            complete = false; total = 0
+        end
+        -- The API enumerates the category independent of the achievement UI's
+        -- All/Completed/Incomplete filter. Previous/next tiers are added below.
+        for entry = 1, total do
+            local id = GetAchievementInfo(category, entry)
+            if positiveID(id) then enqueue(id, clean(name)) else complete = false end
+            coroutine.yield()
+            if generation.achievements ~= epoch then return end
+        end
+    end
+    if not GetPreviousAchievement or not GetNextAchievement then complete = false end
+    local index = 1
+    while index <= #queue do
+        if generation.achievements ~= epoch then return end
+        local key, category = queue[index][1], queue[index][2]
+        local id, name, points, completed, month, day, year, description = GetAchievementInfo(tonumber(key))
+        if positiveID(id) == key and clean(name) ~= '' then
+            local count = tonumber(GetAchievementNumCriteria(id))
+            local coverage, criteria = 'complete', {}
+            if not count or count < 0 or count ~= math.floor(count) or count > 128 then coverage = 'partial' end
+            local expected = achievementNumber(count)
+            for criterion = 1, math.min(count or 0, 128) do
+                if criteriaRead >= 20000 then coverage = 'partial'; break end
+                criteriaRead = criteriaRead + 1
+                local label, kind, done, quantity, required, _, flags, asset, quantityText = GetAchievementCriteriaInfo(id, criterion)
+                label = clean(label)
+                local progress, target, kindID = achievementNumber(quantity), achievementNumber(required), achievementNumber(kind)
+                if label == '' or progress == '' or target == '' or kindID == '' then coverage = 'partial' end
+                -- Preserve unknown values as blank, not zero/not collected.
+                local state = label ~= '' and achievementFlag(done) or ''
+                criteria[#criteria+1] = {tostring(criterion), label, state, progress, target,
+                    kindID, achievementNumber(asset), clean(quantityText)}
+                -- Meta-achievement criteria can point to otherwise hidden tiers.
+                if kind == 8 and positiveID(asset) then enqueue(asset, category) end
+                coroutine.yield()
+                if generation.achievements ~= epoch then return end
+            end
+            if GetPreviousAchievement then enqueue(GetPreviousAchievement(id), category) end
+            if GetNextAchievement then enqueue(GetNextAchievement(id), category) end
+            local date = ''
+            if completed and tonumber(year) and tonumber(month) and tonumber(day) then
+                date = string.format('%04d-%02d-%02d', year < 100 and year + 2000 or year, month, day)
+            end
+            local pointText = achievementNumber(points)
+            if pointText == '' then coverage = 'partial' end
+            local row = {key, clean(name), achievementFlag(completed), pointText, clean(description, 500),
+                category, date, expected, coverage, json(criteria)}
+            local part = tonumber(key) % ACHIEVEMENT_PARTS + 1
+            local bytes = #json(row)
+            if sizes[part] + bytes <= MAX_BYTES - 2000 then
+                groups[part][key] = row; sizes[part] = sizes[part] + bytes
+            else complete = false end
+            if coverage ~= 'complete' then complete = false end
+        else complete = false end
+        index = index + 1
+        coroutine.yield()
+    end
+    -- An empty startup response cannot erase a prior character's observations.
+    if #queue == 0 then complete = false; ready = false end
+    for part = 1, ACHIEVEMENT_PARTS do
+        if generation.achievements ~= epoch then return end
+        local section = 'achievements:'..part
+        local detail = 'API-listed player achievements and individual criteria; part '..part..'/'..ACHIEVEMENT_PARTS
+            ..'. Criteria completion is earned credit, not current bag contents. Blank progress is unknown; hidden/unlisted achievements are not inferred.'
+        if not complete then
+            detail = detail..' Incomplete API data or scan limit; includes prior observations. Absence does not prove incomplete.'
+            for key, row in pairs(documents[section] and documents[section].rows or {}) do
+                if not groups[part][key] then
+                    local previous = {}; for i, value in ipairs(row) do previous[i] = value end
+                    previous[9] = 'partial'; groups[part][key] = previous
+                end
+                coroutine.yield()
+            end
+        end
+        generation[section] = epoch
+        store(section, groups[part], complete and 'complete' or ready and 'partial' or 'unavailable', detail, epoch)
+    end
+    if generation.achievements == epoch then dirty.achievements = nil; scanErrors.achievements = nil end
+end
 local function recipeIdentity()
     if not recipeOpen or not GetTradeSkillLine or not IsTradeSkillLinked or IsTradeSkillLinked() then return end
     local name, rank = GetTradeSkillLine()
@@ -384,6 +558,7 @@ function NS.CharacterFields(fields)
         if section:sub(1, 8) ~= 'recipes:' or professionKnown(section) then
             local isRecipe = section:sub(1, 8) == 'recipes:'
             local stale = dirty[section] or scanErrors[section] or (isRecipe and scanErrors.recipes)
+                or (achievementSection(section) and (dirty.achievements or scanErrors.achievements))
             local freshness = stale and 'stale' or doc.session ~= NS.session and 'cached' or 'current'
             if not stale and isRecipe and recipeIdentity() ~= section then freshness = 'cached' end
             if not stale and section == 'stablepets' and not stableOpen then freshness = 'cached' end
@@ -397,11 +572,18 @@ function NS.CharacterFields(fields)
         fields[#fields+1] = {'ctx', 'Mount and companion-pet collection APIs unavailable; do not infer an empty collection.'}
     end
     if not UnitExists then fields[#fields+1] = {'ctx', 'Active combat-pet API unavailable; do not infer no pet.'} end
+    if not achievementAPIs() then fields[#fields+1] = {'ctx', 'Achievement APIs unavailable; achievement progress is unknown.'} end
     if dirty.gear or dirty.bags then fields[#fields+1] = {'ctx', 'Inventory scan pending; cached inventory may be stale. Send again after the scan finishes.'} end
     for section in pairs(scanErrors) do fields[#fields+1] = {'ctx', section..' scan failed; do not treat cached data as current.'} end
     return bundle
 end
 function NS.RememberCharacter(request, bundle) requests[request] = bundle end
+function NS.CharacterConfirmed(request)
+    local bundle = requests[request]
+    if bundle then
+        for section, doc in pairs(bundle.docs) do rememberSynced(bundle.owner, section, doc) end
+    end
+end
 function NS.CharacterAck(request) requests[request] = nil end
 function NS.CharacterSyncBusy() return manual ~= nil end
 local function finishManual(message)
@@ -419,8 +601,31 @@ local function failSync(request, reason)
     NS.ShowReply(request, 'Character sync failed: '..reason..' Send the prompt again to retry.', 5, true)
     NS.SetStatus('Character sync failed. The agent was not started; send again to retry.')
 end
-local function uploadBody(section, doc, full)
-    return not full and doc.patch or doc.body
+local function uploadBody(job)
+    local doc, section = job.doc, job.section
+    if job.full then return doc.body end
+    local baseline = job.owner == owner and synced[section]
+    if baseline and baseline.revision == doc.revision then return doc.body end
+    if baseline and baseline.revision ~= doc.revision then
+        local hashes, changes, removed = rowHashes(doc), {}, {}
+        for _, key in ipairs(keys(doc.rows)) do
+            if hashes[key] ~= baseline.hashes[key] then changes[#changes+1] = doc.rows[key] end
+            coroutine.yield()
+        end
+        for _, key in ipairs(keys(baseline.hashes)) do
+            if not hashes[key] then removed[#removed+1] = key end
+            coroutine.yield()
+        end
+        local patch = json({2, section, doc.status, doc.detail, baseline.revision, changes, removed})
+        if #patch < #doc.body then
+            job.usedPatch, job.baseRevision = true, baseline.revision
+            return patch
+        end
+        return doc.body
+    end
+    -- Older installations may not yet have an acknowledged baseline.
+    job.usedPatch = doc.patch ~= nil
+    return doc.patch or doc.body
 end
 function NS.CharacterNeed(request, text)
     if text:sub(1, 8) ~= '\1ABCTX1\n' then return false end
@@ -456,45 +661,68 @@ local function resumeParent(request)
     NS.HoldPrompt(request, false)
 end
 local function uploadStep()
-    if active then return end
+    if active then
+        if active.prepare then
+            local job = active
+            local done, error = advance(job.prepare)
+            if done == false then active = nil; failSync(job.parent, 'Could not prepare snapshot: '..clean(error, 160))
+            elseif done then job.prepare = nil; job.start() end
+        end
+        return
+    end
     local job = table.remove(uploads, 1)
     if not job then return end
     if not requests[job.parent] or not NS.S.context then return end
     active = job
-    local payload = uploadBody(job.section, job.doc, job.full)
-    local pages, pos = {}, 1
-    while pos <= #payload do
-        local chunk = NS.TrimUTF8(payload:sub(pos, pos+4999))
-        pages[#pages+1] = chunk; pos = pos + #chunk
-    end
+    local pages = {}
     local function sendPage(index)
         if not requests[job.parent] then active = nil; return end
         NS.StripTransferProgress(job.parent)
         local seq = NS.NextRequest(); job.request = seq
         local fields = {{'character', job.owner}, {'section', job.section}, {'revision', job.doc.revision},
                         {'page', index}, {'total', #pages}}
+        if job.probe then fields[#fields+1] = {'probe', '1'} end
         -- Leave room for several retransmissions when capture misses fragments.
         local ok = NS.BeginRequest(seq, nil, function(reply, state)
+            if not requests[job.parent] then active = nil; return end
             NS.StripTransferProgress(job.parent)
             if state ~= 4 or reply ~= 'ABCTX_OK' then
                 active = nil
-                if reply == 'ABCTX_BASE_MISSING' and not job.full then
+                if reply == 'ABCTX_BASE_MISSING' and job.probe then
+                    job.probe = nil; table.insert(uploads, 1, job)
+                elseif reply == 'ABCTX_BASE_MISSING' and not job.full then
+                    forgetSynced(job.owner, job.section, job.baseRevision)
+                    job.full = true; table.insert(uploads, 1, job)
+                elseif state == 5 and job.usedPatch and not job.full and reply:find('Character data rejected:', 1, true) == 1 then
+                    forgetSynced(job.owner, job.section, job.baseRevision)
                     job.full = true; table.insert(uploads, 1, job)
                 else failSync(job.parent, reply) end
             elseif index < #pages then sendPage(index+1)
-            else active = nil end
+            else rememberSynced(job.owner, job.section, job.doc); active = nil end
             resumeParent(job.parent)
         end, 240)
         if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
         NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, pages[index]), NS.session, seq), true)
         NS.SetStatus('Syncing '..job.section..' ('..index..'/'..#pages..')...')
     end
-    sendPage(1)
+    job.start = function() sendPage(1) end
+    job.prepare = coroutine.create(function()
+        rowHashes(job.doc)
+        job.usedPatch, job.baseRevision = nil, nil
+        local payload = job.probe and 'ABCTX_PROBE' or uploadBody(job)
+        local pos = 1
+        while pos <= #payload do
+            local chunk = NS.TrimUTF8(payload:sub(pos, pos+4999))
+            pages[#pages+1] = chunk; pos = pos + #chunk
+            coroutine.yield()
+        end
+    end)
 end
 function NS.CharacterContextOff()
     for request in pairs(requests) do failSync(request, 'Context sharing was turned off.') end
     if manual then finishManual('Character sync cancelled: context sharing was turned off.') end
-    if active then NS.AckPrompt(active.request); NS.ForgetRequest(active.request); active = nil end
+    if active and active.request then NS.AckPrompt(active.request); NS.ForgetRequest(active.request) end
+    active = nil
     uploads, tasks = {}, {}
 end
 function NS.CharacterStatus()
@@ -503,6 +731,7 @@ function NS.CharacterStatus()
         local doc = documents[section]
         local isRecipe = section:sub(1, 8) == 'recipes:'
         local stale = dirty[section] or scanErrors[section] or (isRecipe and scanErrors.recipes)
+            or (achievementSection(section) and (dirty.achievements or scanErrors.achievements))
         local freshness = stale and 'stale' or doc.session ~= NS.session and 'cached' or 'current'
         if not stale and isRecipe and recipeIdentity() ~= section then freshness = 'cached' end
         if not stale and section == 'stablepets' and not stableOpen then freshness = 'cached' end
@@ -521,13 +750,39 @@ local function loadOwner()
     if owner then NS.CharacterContextOff() end
     owner = identity
     documents, dirty, generation, tasks, scanErrors = {}, {}, {}, {}, {}
+    synced, confirmations, confirming = {}, {}, nil
+    local savedSync = type(NS.S.characterSynced) == 'table' and NS.S.characterSynced[owner]
+    if type(savedSync) == 'table' then
+        local sections = 0
+        for section, baseline in pairs(savedSync) do
+            sections = sections + 1; if sections > 32 then break end
+            local allowed = type(section) == 'string' and #section <= 120 and
+                (section == 'gear' or section == 'bags' or section == 'combatpet' or SAVED_COLLECTIONS[section]
+                    or achievementSection(section) or section:sub(1, 8) == 'recipes:')
+            if allowed and type(baseline) == 'table' and type(baseline.revision) == 'string'
+                and #baseline.revision <= 32 and baseline.revision:match('^%x+%-%d+$')
+                and type(baseline.hashes) == 'table' then
+                local hashes, count, bytes, valid = {}, 0, 0, true
+                for key, value in pairs(baseline.hashes) do
+                    count = count + 1
+                    if count > MAX_ROWS or type(key) ~= 'string' or #key > 512 or type(value) ~= 'string'
+                        or #value > 32 or not value:match('^%x+%-%d+$') then valid = false; break end
+                    bytes = bytes + #key + #value
+                    if bytes > MAX_BYTES then valid = false; break end
+                    hashes[key] = value
+                end
+                if valid then synced[section] = {revision = baseline.revision, hashes = hashes} end
+            end
+        end
+    end
     stableOpen = false
-    for _, bucket in ipairs({'characterRecipes', 'characterCollections'}) do
+    for _, bucket in ipairs({'characterRecipes', 'characterCollections', 'characterAchievements'}) do
         local saved = type(NS.S[bucket]) == 'table' and NS.S[bucket][owner]
         if type(saved) == 'table' then
             for section, doc in pairs(saved) do
                 local allowed = type(section) == 'string' and (bucket == 'characterRecipes' and section:sub(1, 8) == 'recipes:'
-                    or bucket == 'characterCollections' and SAVED_COLLECTIONS[section])
+                    or bucket == 'characterCollections' and SAVED_COLLECTIONS[section]
+                    or bucket == 'characterAchievements' and achievementSection(section))
                 if allowed and type(doc) == 'table'
                     and type(doc.body) == 'string' and #doc.body <= MAX_BYTES and type(doc.rows) == 'table'
                     and type(doc.revision) == 'string' and type(doc.seen) == 'number'
@@ -537,16 +792,20 @@ local function loadOwner()
             end
         end
     end
-    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet')
+    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet'); mark('achievements')
 end
 local driver = CreateFrame('Frame')
 for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UNIT_INVENTORY_CHANGED', 'BAG_UPDATE',
     'GET_ITEM_INFO_RECEIVED', 'TRADE_SKILL_SHOW', 'TRADE_SKILL_UPDATE', 'TRADE_SKILL_FILTER_UPDATE',
     'TRADE_SKILL_CLOSE', 'SKILL_LINES_CHANGED', 'COMPANION_LEARNED', 'COMPANION_UNLEARNED', 'COMPANION_UPDATE',
     'UNIT_PET', 'UNIT_NAME_UPDATE', 'UNIT_LEVEL', 'PET_UI_UPDATE', 'PET_UI_CLOSE', 'PET_TALENT_UPDATE',
-    'PET_STABLE_SHOW', 'PET_STABLE_UPDATE', 'PET_STABLE_UPDATE_PAPERDOLL', 'PET_STABLE_CLOSED'}) do pcall(driver.RegisterEvent, driver, event) end
+    'PET_STABLE_SHOW', 'PET_STABLE_UPDATE', 'PET_STABLE_UPDATE_PAPERDOLL', 'PET_STABLE_CLOSED',
+    'ACHIEVEMENT_EARNED', 'CRITERIA_UPDATE', 'RECEIVED_ACHIEVEMENT_LIST'}) do pcall(driver.RegisterEvent, driver, event) end
 driver:SetScript('OnEvent', function(_, event, unit)
     if event == 'PLAYER_ENTERING_WORLD' then loadOwner() end
+    if event == 'ACHIEVEMENT_EARNED' or event == 'CRITERIA_UPDATE' or event == 'RECEIVED_ACHIEVEMENT_LIST' then
+        mark('achievements'); return
+    end
     if event == 'UNIT_INVENTORY_CHANGED' and unit ~= 'player' then return end
     if event:find('COMPANION_') == 1 then
         if unit == 'MOUNT' then mark('mounts')
@@ -579,19 +838,20 @@ driver:SetScript('OnEvent', function(_, event, unit)
     elseif event == 'BAG_UPDATE' then mark('bags')
     else
         mark('gear'); mark('bags')
-        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet') end
+        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet'); mark('achievements') end
         if event == 'SKILL_LINES_CHANGED' then
             for section in pairs(documents) do if section:sub(1, 8) == 'recipes:' then dirty[section] = GetTime() end end
             recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5
         end
     end
 end)
-local scanners = {gear = gear, bags = bags, recipes = recipes,
+local scanners = {gear = gear, bags = bags, recipes = recipes, achievements = achievements,
     mounts = function(epoch) companions('mounts', epoch) end,
     pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets}
 local function scannerAvailable(section)
     return section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
         or section == 'recipes' and recipeIdentity()
+        or section == 'achievements' and achievementAPIs()
         or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
         or section == 'combatpet' and UnitExists
         or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
@@ -602,7 +862,8 @@ function NS.SyncCharacter()
     if manual or active or #uploads > 0 or next(requests) then
         return false, 'Character sync is already pending. Wait for it to finish before syncing again.'
     end
-    manual = {targets = {}, deadline = GetTime() + 60}
+    local scanWait = achievementAPIs() and 120 or 60
+    manual = {targets = {}, deadline = GetTime() + scanWait, scanWait = scanWait}
     for section in pairs(scanners) do
         if scannerAvailable(section) then
             local target = section == 'recipes' and recipeIdentity() or section
@@ -617,7 +878,7 @@ function NS.SyncCharacter()
     local message = 'Scanning character data for sync...'
     if InCombatLockdown and InCombatLockdown() then message = 'Character sync queued; scanning will start after combat.' end
     NS.SetStatus(message)
-    NS.Print('Sync includes gear, bags, mounts, pets and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
+    NS.Print('Sync includes gear, bags, mounts, pets, achievements with criteria, and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
     return true, message
 end
 local function manualStep()
@@ -630,7 +891,7 @@ local function manualStep()
         if scanErrors[section] and not dirty[section] and not tasks[section] then
             finishManual('Character sync stopped: '..section..' scan failed. Click Sync to retry.'); return
         end
-        if dirty[section] or dirty[target] or tasks[section] or not documents[target] then pending = true end
+        if dirty[section] or dirty[target] or tasks[section] or (section ~= 'achievements' and not documents[target]) then pending = true end
     end
     if pending then
         if GetTime() >= manual.deadline then
@@ -642,20 +903,23 @@ local function manualStep()
     local sections = keys(bundle.docs)
     if #sections == 0 then finishManual('No character snapshots are available to sync yet.'); return end
     -- A local parent groups ordinary character pages; it is never a chat prompt
-    -- and never launches an agent. Full bodies also work after companion cache loss.
+    -- and never launches an agent. Probe saved/cached revisions first, then use
+    -- patches or full bodies when the companion is missing that revision.
     local request = NS.NextRequest()
     manual.request, manual.count = request, #sections
     requests[request] = bundle
     for _, section in ipairs(sections) do
-        uploads[#uploads+1] = {parent = request, section = section, doc = bundle.docs[section], owner = bundle.owner, full = true}
+        uploads[#uploads+1] = {parent = request, section = section, doc = bundle.docs[section], owner = bundle.owner, probe = true}
     end
     NS.SetStatus('Uploading '..#sections..' character snapshots...')
 end
 local function work()
-    if not NS.S or not NS.S.context or not owner then return end
+    if not NS.S or not owner then return end
+    confirmStep()
+    if not NS.S.context then return end
     uploadStep()
     if InCombatLockdown and InCombatLockdown() then
-        if manual and not manual.request then manual.deadline = GetTime() + 60 end
+        if manual and not manual.request then manual.deadline = GetTime() + manual.scanWait end
         return
     end
     local now = GetTime()
@@ -669,7 +933,7 @@ local function work()
         local task = tasks[section]
         if task then
             local started = debugprofilestop and debugprofilestop()
-            for _ = 1, 8 do
+            for _ = 1, section == 'achievements' and 32 or 8 do
                 local ok, error = coroutine.resume(task)
                 if not ok then
                     tasks[section] = nil; dirty[section] = nil; scanErrors[section] = true

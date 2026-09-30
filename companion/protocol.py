@@ -313,6 +313,10 @@ class Assembler:
         if total != expected or (part in chunks and chunks[part] != chunk):
             del self.pending[key]
             raise ValueError('Conflicting fragments')
+        if part not in chunks:
+            # A large page can take several retransmission sweeps when capture
+            # is slow. Expire stalled assemblies, not ones still making progress.
+            self.pending[key] = (now, expected, chunks)
         chunks[part] = chunk
         if len(chunks) == total:
             del self.pending[key]

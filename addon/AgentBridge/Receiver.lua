@@ -266,6 +266,7 @@ local function settle(job, reason, text, state, complete)
         job.due = now + POLL_WINDOW
         return
     end
+    if state >= 1 and state <= 4 and NS.CharacterConfirmed then NS.CharacterConfirmed(job.request) end
     if state >= 1 then NS.AckPrompt(job.request) end
     if job.callback then
         if complete and state >= 4 then
