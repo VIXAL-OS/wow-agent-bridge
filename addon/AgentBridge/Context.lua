@@ -88,11 +88,12 @@ function NS.LinkTooltip(data)
 end
 
 -- Character snapshots. Work is debounced and spread across frames; the strip
--- sends missing revisions only when a prompt asks for them. No background I/O.
+-- sends revisions for prompts or an explicit manual sync. No background I/O.
 local MAX_ROWS, MAX_BYTES = 2000, 160000
 local documents, dirty, generation, tasks = {}, {}, {}, {}
 local scanErrors = {}
 local requests, uploads, active = {}, {}, nil
+local manual
 local owner, recipeOpen = nil, false
 local stableOpen = false
 local COLLECTIONS = {mounts = 'MOUNT', pets = 'CRITTER'}
@@ -311,8 +312,10 @@ local function recipeFilters()
     -- Never clear filters or expand headers behind the user's back. Missing
     -- filter introspection is partial coverage, not an assertion of completeness.
     local reasons = {}
-    if not GetTradeSkillSubClassFilter or not GetTradeSkillSubClassFilter(0) then reasons[#reasons+1] = 'category filter' end
-    if not GetTradeSkillInvSlotFilter or not GetTradeSkillInvSlotFilter(0) then reasons[#reasons+1] = 'slot filter' end
+    if not GetTradeSkillSubClassFilter then reasons[#reasons+1] = 'category state unavailable'
+    elseif not GetTradeSkillSubClassFilter(0) then reasons[#reasons+1] = 'category filter' end
+    if not GetTradeSkillInvSlotFilter then reasons[#reasons+1] = 'slot state unavailable'
+    elseif not GetTradeSkillInvSlotFilter(0) then reasons[#reasons+1] = 'slot filter' end
     local edit, available = TradeSkillFrameEditBox, TradeSkillFrameAvailableFilterCheckButton
     local search = edit and edit:GetText()
     -- The stock 3.3.5 UI writes localized SEARCH into an empty edit box on
@@ -389,6 +392,7 @@ function NS.CharacterFields(fields)
         end
     end
     fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts are event-cached observations. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
+    fields[#fields+1] = {'ctx', 'Snapshot labels: coverage and freshness are separate. Complete + cached means a complete scan from when that profession was last open, NOT a filtered scan. Active recipe filters, if any, are recorded in that snapshot detail. Older files can describe a different filter state.'}
     if not GetNumCompanions or not GetCompanionInfo then
         fields[#fields+1] = {'ctx', 'Mount and companion-pet collection APIs unavailable; do not infer an empty collection.'}
     end
@@ -399,7 +403,17 @@ function NS.CharacterFields(fields)
 end
 function NS.RememberCharacter(request, bundle) requests[request] = bundle end
 function NS.CharacterAck(request) requests[request] = nil end
+function NS.CharacterSyncBusy() return manual ~= nil end
+local function finishManual(message)
+    if manual and manual.request then requests[manual.request] = nil end
+    manual = nil
+    if NS.SyncButton then NS.SyncButton:SetText('Sync'); NS.SyncButton:Enable() end
+    NS.SetStatus(message); NS.Print(message)
+end
 local function failSync(request, reason)
+    if manual and manual.request == request then
+        finishManual('Character sync failed: '..reason..' Click Sync to retry.'); return
+    end
     requests[request] = nil
     NS.AckPrompt(request); NS.ForgetRequest(request)
     NS.ShowReply(request, 'Character sync failed: '..reason..' Send the prompt again to retry.', 5, true)
@@ -430,8 +444,15 @@ function NS.CharacterNeed(request, text)
     return true
 end
 local function resumeParent(request)
+    if not requests[request] then return end
     if active and active.parent == request then return end
     for _, job in ipairs(uploads) do if job.parent == request then return end end
+    if manual and manual.request == request then
+        local count = manual.count
+        finishManual('Character sync complete: '..count..' snapshots uploaded. Send your question to use them.')
+        for line in NS.CharacterStatus():gmatch('[^\n]+') do NS.Print('  '..NS.Escape(line)) end
+        return
+    end
     NS.HoldPrompt(request, false)
 end
 local function uploadStep()
@@ -472,6 +493,7 @@ local function uploadStep()
 end
 function NS.CharacterContextOff()
     for request in pairs(requests) do failSync(request, 'Context sharing was turned off.') end
+    if manual then finishManual('Character sync cancelled: context sharing was turned off.') end
     if active then NS.AckPrompt(active.request); NS.ForgetRequest(active.request); active = nil end
     uploads, tasks = {}, {}
 end
@@ -479,8 +501,15 @@ function NS.CharacterStatus()
     local out = {}
     for _, section in ipairs(keys(documents)) do
         local doc = documents[section]
-        out[#out+1] = section..': '..doc.count..' records, '..doc.status..', scanned '..math.max(0, time()-doc.seen)..'s ago'
+        local isRecipe = section:sub(1, 8) == 'recipes:'
+        local stale = dirty[section] or scanErrors[section] or (isRecipe and scanErrors.recipes)
+        local freshness = stale and 'stale' or doc.session ~= NS.session and 'cached' or 'current'
+        if not stale and isRecipe and recipeIdentity() ~= section then freshness = 'cached' end
+        if not stale and section == 'stablepets' and not stableOpen then freshness = 'cached' end
+        out[#out+1] = section..': '..doc.count..' records, '..doc.status..', '..freshness..', scanned '
+            ..math.max(0, time()-doc.seen)..'s ago. '..doc.detail
     end
+    for section in pairs(scanErrors) do out[#out+1] = section..': scan failed; cached data may be stale.' end
     return table.concat(out, '\n')
 end
 local function loadOwner()
@@ -560,17 +589,78 @@ end)
 local scanners = {gear = gear, bags = bags, recipes = recipes,
     mounts = function(epoch) companions('mounts', epoch) end,
     pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets}
+local function scannerAvailable(section)
+    return section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
+        or section == 'recipes' and recipeIdentity()
+        or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
+        or section == 'combatpet' and UnitExists
+        or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
+end
+function NS.SyncCharacter()
+    if not NS.S or not NS.S.context then return false, 'Context sharing is off. Use /ab context on before syncing.' end
+    if not owner then return false, 'Character is still loading. Try Sync again in a moment.' end
+    if manual or active or #uploads > 0 or next(requests) then
+        return false, 'Character sync is already pending. Wait for it to finish before syncing again.'
+    end
+    manual = {targets = {}, deadline = GetTime() + 60}
+    for section in pairs(scanners) do
+        if scannerAvailable(section) then
+            local target = section == 'recipes' and recipeIdentity() or section
+            manual.targets[section] = target
+            tasks[section] = nil
+            if section == 'recipes' then
+                recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5; dirty[target] = GetTime()
+            else mark(section) end
+        end
+    end
+    if NS.SyncButton then NS.SyncButton:SetText('Syncing...'); NS.SyncButton:Disable() end
+    local message = 'Scanning character data for sync...'
+    if InCombatLockdown and InCombatLockdown() then message = 'Character sync queued; scanning will start after combat.' end
+    NS.SetStatus(message)
+    NS.Print('Sync includes gear, bags, mounts, pets and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
+    return true, message
+end
+local function manualStep()
+    if not manual or manual.request then return end
+    local pending = false
+    for section, target in pairs(manual.targets) do
+        if not scannerAvailable(section) or (section == 'recipes' and recipeIdentity() ~= target) then
+            finishManual('Character sync stopped: '..target..' closed or changed during scanning. Keep it open and click Sync again.'); return
+        end
+        if scanErrors[section] and not dirty[section] and not tasks[section] then
+            finishManual('Character sync stopped: '..section..' scan failed. Click Sync to retry.'); return
+        end
+        if dirty[section] or dirty[target] or tasks[section] or not documents[target] then pending = true end
+    end
+    if pending then
+        if GetTime() >= manual.deadline then
+            finishManual('Character scan did not settle. Keep the profession open and click Sync again.'); return
+        end
+        return
+    end
+    local bundle = NS.CharacterFields({})
+    local sections = keys(bundle.docs)
+    if #sections == 0 then finishManual('No character snapshots are available to sync yet.'); return end
+    -- A local parent groups ordinary character pages; it is never a chat prompt
+    -- and never launches an agent. Full bodies also work after companion cache loss.
+    local request = NS.NextRequest()
+    manual.request, manual.count = request, #sections
+    requests[request] = bundle
+    for _, section in ipairs(sections) do
+        uploads[#uploads+1] = {parent = request, section = section, doc = bundle.docs[section], owner = bundle.owner, full = true}
+    end
+    NS.SetStatus('Uploading '..#sections..' character snapshots...')
+end
 local function work()
     if not NS.S or not NS.S.context or not owner then return end
     uploadStep()
-    if InCombatLockdown and InCombatLockdown() then return end
+    if InCombatLockdown and InCombatLockdown() then
+        if manual and not manual.request then manual.deadline = GetTime() + 60 end
+        return
+    end
     local now = GetTime()
     for section, fn in pairs(scanners) do
-        local available = section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
-            or section == 'recipes' and recipeIdentity()
-            or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
-            or section == 'combatpet' and UnitExists
-            or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
+        local available = scannerAvailable(section)
         if available and dirty[section] and now >= dirty[section] and not tasks[section] then
             local epoch = section == 'recipes' and recipeEpoch or generation[section]
             tasks[section] = coroutine.create(function() fn(epoch) end)
@@ -590,6 +680,7 @@ local function work()
             end
         end
     end
+    manualStep()
 end
 driver:SetScript('OnUpdate', function() NS.Profile('character-context', work) end)
 NS.OnLoad(function(S)

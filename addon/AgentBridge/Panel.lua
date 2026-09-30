@@ -302,8 +302,25 @@ local send = button('Send', 84, 'LEFT', edit, 'RIGHT', 8, 0)
 local pause = button('Pause', 90, 'BOTTOMLEFT', 20, 18)
 local copy = button('Select text', 90, 'LEFT', pause, 'RIGHT', 6, 0)
 local test = button('Self-test', 90, 'LEFT', copy, 'RIGHT', 6, 0)
-local retry = button('Retry', 64, 'LEFT', test, 'RIGHT', 6, 0)
-local hide = button('Hide', 70, 'BOTTOMRIGHT', -94, 18)
+local sync = button('Sync', 64, 'LEFT', test, 'RIGHT', 6, 0)
+NS.SyncButton = sync
+sync:SetScript('OnClick', function()
+    local ok, message = NS.SyncCharacter()
+    if not ok then NS.SetStatus(message); NS.Print(message) end
+end)
+sync:SetScript('OnEnter', function(self)
+    GameTooltip:SetOwner(self, 'ANCHOR_TOP')
+    GameTooltip:SetText('Sync character data', 1, 1, 1)
+    GameTooltip:AddLine('Rescan and upload gear, carried bags, mounts, pets and saved recipes. No agent question is sent.', .8, .8, .8, true)
+    GameTooltip:AddLine('Keep your profession open to refresh recipes. Clear filters and expand categories for a complete scan. Visit a stable to refresh hunter stable pets.', .8, .8, .8, true)
+    if NS.CharacterStatus then
+        for line in NS.CharacterStatus():gmatch('[^\n]+') do GameTooltip:AddLine(line, .8, .8, .8, true) end
+    end
+    GameTooltip:Show()
+end)
+sync:SetScript('OnLeave', function() GameTooltip:Hide() end)
+local retry = button('Retry', 64, 'LEFT', sync, 'RIGHT', 6, 0)
+local hide = button('Hide', 70, 'BOTTOMRIGHT', -42, 18)
 NS.SendButton = send
 NS.RetryButton = retry
 retry:Disable()

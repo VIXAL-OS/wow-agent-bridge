@@ -334,9 +334,25 @@ they pause during combat. Recipe scans also run incrementally while their window
 is open. Partial scans preserve previously observed recipes, and never claim that
 an omitted recipe is unlearned. Recipe, mount, companion-pet and stable caches survive `/reload` and are scoped to
 realm and character. Unlearning a profession removes its cache from future prompt
-references. Use `/ab context show` to see record counts, coverage and scan age.
+references. Use `/ab context show`, or hover over **Sync**, to see record counts,
+coverage, freshness, scan age and the recorded reason for any partial scan.
+`complete, cached` means a complete scan from the last time that profession was
+open; it does not mean a filter was active. Each question's snapshot references
+supersede older files and filter warnings in the agent conversation.
 
-Only sending a prompt starts data transfer. The prompt identifies the exact
+Click **Sync** in the bottom button row, just left of **Retry**, or type `/ab sync`, to
+rescan and upload character data without starting an agent or spending a prompt.
+It refreshes gear, carried bags, mounts, companion pets and the active combat pet.
+Keep your own profession window open to refresh its recipes, and keep the hunter
+stable open to refresh stable pets. Other saved recipes and stable observations
+are uploaded as cached; unopened professions cannot be scanned remotely. The
+button does not clear filters or expand categories. Scans wait until combat ends.
+Wait for the chat message confirming how many snapshots were uploaded, then send
+your question. Repeated sync clicks and prompts wait for that transfer to finish;
+the input draft is preserved. Context sharing must be enabled. A failed scan or
+upload reports the problem and allows retrying; `/ab context off` cancels a sync.
+
+Sending a prompt also starts data transfer. The prompt identifies the exact
 snapshot revisions it needs. Before requesting uploads, the companion checks
 `WTF/Account/*/SavedVariables/AgentBridge.lua` in the selected game installation
 for matching recipe and collection snapshots. WoW writes these files on `/reload` or logout;

@@ -30,6 +30,7 @@ end
 -- false and a reason when nothing was sent.
 function NS.Send(raw)
     if type(raw) ~= 'string' or not raw:find('%S') then return false, 'Type a message first.' end
+    if NS.CharacterSyncBusy() then return false, 'Character sync is in progress. Send your question when it finishes.' end
     local chat = NS.CurrentChat()
     -- An unnamed chat is titled by its first message.
     local title = chat.name or chat.auto or NS.ShortTitle(select(2, NS.MakePromptText(raw)))
@@ -144,6 +145,7 @@ local HELP = {
     '/ab copy [all] - copy the last reply (or the whole chat) out of the game',
     '/ab echo off|short|full|<n> - copy finished replies you are not reading into chat',
     '/ab context on|off|show - share character, gear, bags and scanned recipes; show scan status',
+    '/ab sync - rescan and upload character data without sending an agent question',
     '/ab pause | resume - stop or restart reply checks',
     '/ab test - run the font self-test and print results',
     '/ab status - show channel state',
@@ -160,6 +162,9 @@ SlashCmdList.AGENTBRIDGE = function(arg)
     if cmd == '' then NS.Toggle()
     elseif cmd == 'show' then NS.Panel:Show()
     elseif cmd == 'hide' then NS.Panel:Hide()
+    elseif cmd == 'sync' then
+        local ok, message = NS.SyncCharacter()
+        if not ok then NS.SetStatus(message); NS.Print(message) end
     elseif cmd == 'retry' then
         local ok, why = NS.RetryLastPrompt()
         if ok then NS.Print('resent the last prompt to "'..NS.Escape(NS.ChatTitle(NS.S.chat))..'".')
