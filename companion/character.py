@@ -161,6 +161,40 @@ class CharacterStore:
         owner, refs = manifest(fields)
         return [(s, r) for s, r, _, _ in refs if self.body(owner, s, r) is None]
 
+    def import_inline(self, fields):
+        """Apply small prompt-attached changes; invalid/missing bases use normal sync.
+
+        Only revisions explicitly referenced by this prompt can be imported.
+        This shares the page reader's schema, ownership and checksum validation.
+        """
+        owner, refs = manifest(fields)
+        wanted = {section: rev for section, rev, _, _ in refs}
+        payloads = fields.get('snapshotdata', [])
+        if len(payloads) > 32 or sum(len(p.encode('utf-8')) + 14 for p in payloads) > 1800:
+            return 0
+        imported, seen = 0, set()
+        for payload in payloads:
+            try:
+                value = json.loads(payload)
+                if not isinstance(value, list) or len(value) not in (5, 7):
+                    continue
+                section = value[1]
+                if not isinstance(section, str) or section not in wanted or section in seen:
+                    continue
+                seen.add(section)
+                rev = wanted[section]
+                if self.body(owner, section, rev) is not None:
+                    continue
+                blob = (f'\x01AB1\ncharacter={owner}\nsection={section}\nrevision={rev}'
+                        f'\npage=1\ntotal=1\n\x02{payload}')
+                self._page(blob)
+                imported += 1
+            except (ValueError, TypeError, KeyError, IndexError, RecursionError):
+                # A stale acknowledgement, cache loss or rejected shortcut must
+                # not block the normal, checked patch/full-snapshot fallback.
+                continue
+        return imported
+
     def import_saved(self, fields):
         """Import only recipes/collections explicitly referenced by this fresh prompt.
 
@@ -201,8 +235,8 @@ class CharacterStore:
         if previous:
             return previous
         try:
-            self._page(blob)
-            state, reply = 'done', 'ABCTX_OK'
+            reply = self._page(blob) or 'ABCTX_OK'
+            state = 'done'
         except (ValueError, TypeError, KeyError, IndexError, RecursionError) as error:
             state, reply = 'failed', 'ABCTX_BASE_MISSING' if str(error) == 'base missing' else 'Character data rejected: ' + str(error)[:160]
         with self.db:
@@ -211,6 +245,14 @@ class CharacterStore:
 
     def _page(self, blob):
         fields, chunk = parse_envelope(blob)
+        if fields.get('probe') == ['manifest']:
+            if (set(fields) != {'character', 'snapshot', 'probe'} or chunk != 'ABCTX_PROBE'
+                    or not fields.get('snapshot')):
+                raise ValueError('Invalid character cache manifest')
+            manifest(fields)  # Bound and validate everything before importing.
+            self.import_saved(fields)
+            missing = self.missing(fields)
+            return NEED + '\n'.join(s + '|' + r for s, r in missing) if missing else 'ABCTX_OK'
         required = ('character', 'section', 'revision', 'page', 'total')
         if any(len(fields.get(k, [])) != 1 for k in required):
             raise ValueError('Invalid character page header')

@@ -80,6 +80,7 @@ class Job:
     history: list = field(default_factory=list)  # [(user, assistant), ...] oldest first
     fork: bool = False  # continue a conversation without writing back into it
     context: str = ''  # the player's character and whereabouts when the prompt was sent
+    resources: str = ''  # companion-owned lookup instructions, never auction data
 
 
 def context_block(job):
@@ -99,7 +100,7 @@ def guidance_for(cfg, job):
     The standing guidance, plus the game state when the prompt carried it. Runs in
     different chats overlap, so each gets its own file.
     """
-    block = context_block(job)
+    block = '\n\n'.join(part for part in (context_block(job), job.resources) if part)
     if not cfg.guidance_file or not block:
         return cfg.guidance_file, False
     base = Path(cfg.guidance_file)
@@ -421,6 +422,8 @@ def codex_prompt(job):
     game state is new each turn.
     """
     parts = [] if job.resume else [GUIDANCE]
+    if job.resources:
+        parts.append(job.resources)
     if job.context:
         parts.append(context_block(job))
     parts.append(job.prompt if job.resume else history_prompt(job))

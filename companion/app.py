@@ -19,6 +19,7 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
 from .agents import BACKENDS, GUIDANCE, AgentConfig, Job, run_agent
+from .auctions import AuctionCache, auction_guidance
 from .browser import BrowserRequests
 from .character import CharacterStore
 from .capture import grab, grab_window
@@ -269,6 +270,7 @@ class App:
         self.last_frame_at = self.last_attempt = self.window_at = -1e9
         self.capture_mode = 'screen'
         self.native = self.epoch = self.locator = None
+        self.auctions, self.auction_stop = None, threading.Event()
         self.banner = ReplyBanner(root, self.open_window)
         self.build()
         self.attach_addon(self.settings.get('addon'))
@@ -489,6 +491,10 @@ class App:
             self.epoch = EpochKeeper(addon)
             self.locator = StripLocator(game_dir_for(addon))
             self.character.saved_snapshots = SavedSnapshots(game_dir_for(addon))
+            if self.auctions is None:
+                self.auctions = AuctionCache(game_dir_for(addon), self.args.state / 'auctions')
+                threading.Thread(target=self.auctions.run, args=(self.auction_stop,
+                    lambda message: self.events.put((None, 'notice', message, None))), daemon=True).start()
             self.write(f'Addon: {addon}')
         except (OSError, ValueError) as exc:
             self.write(f'Reply channel unavailable: {exc}')
@@ -538,6 +544,8 @@ class App:
                     job = Job(key, request.prompt, resume=chosen[0], history=job.history,
                               fork=chosen[2] and cfg.backend == 'claude', context=request.context)
                     self.root.after(0, lambda: self.conversation.set('In-game conversation: continuing the last one'))
+                if self.auctions:
+                    job.resources = auction_guidance(self.auctions.index)
                 result = run_agent(cfg, job, on_update=lambda text: self.events.put((key, 'streaming', text, None)),
                                    on_activity=activity)
                 self.context.remember(key, cfg.backend, result)
@@ -772,6 +780,7 @@ class App:
                                           self.settings.get('models') or {})
         error, extra = None, ''
         try:
+            self.character.import_inline(fields)
             imported = self.character.import_saved(fields)
             if imported:
                 self.write(f'Loaded {imported} matching recipe/collection snapshot(s) from saved addon data.')
@@ -810,6 +819,7 @@ class App:
 
     def _shutdown(self):
         self.closed = True
+        self.auction_stop.set()
         self.banner.dismiss()
         self.inbox.db.close()
         self.root.destroy()

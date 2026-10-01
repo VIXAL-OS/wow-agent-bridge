@@ -358,17 +358,27 @@ Click **Sync** in the bottom button row, just left of **Retry**, or type `/ab sy
 rescan and upload character data without starting an agent or spending a prompt.
 It refreshes gear, carried bags, mounts, companion pets, the active combat pet,
 and achievements with their individual criteria. Achievement progress also
-refreshes on login, achievement-earned and criteria-update events.
+refreshes on login, achievement-earned and criteria-update events. Login, manual
+sync and a received achievement list perform full audits. Achievement-earned events
+refresh the named achievement, its tier chain and dependent meta achievements.
+Criteria-update events have no achievement ID on 3.3.5, so they sweep the cached
+catalog, including completed achievements that may have optional criteria. This
+avoids re-enumerating categories and rebuilding unchanged partitions. Bursts are
+coalesced; events during a scan schedule a follow-up pass instead of restarting it.
+Incomplete API results fall back to the full reader to preserve coverage labels.
 Keep your own profession window open to refresh its recipes, and keep the hunter
 stable open to refresh stable pets. Other saved recipes and stable observations
 are uploaded as cached; unopened professions cannot be scanned remotely. The
 button does not clear filters or expand categories. Scans wait until combat ends.
-Wait for the chat message confirming how many snapshots were uploaded, then send
+Wait for the chat message reporting uploaded and reused snapshots, then send
 your question. Repeated sync clicks and prompts wait for that transfer to finish;
 the input draft is preserved. Context sharing must be enabled. A failed scan or
 upload reports the problem and allows retrying; `/ab context off` cancels a sync.
-Sync first checks the companion's cache and matching saved snapshots, so repeated
-clicks transfer only probes for unchanged data. Missing revisions use row patches
+Sync checks every revision against the companion's cache and matching saved
+snapshots in **one manifest exchange**, then uploads only missing revisions.
+An unchanged manual sync needs one cache check, rather than a separate round trip
+per section. An older companion falls back to individual probes until restarted.
+Unchanged sections send no document bodies. Missing revisions use row patches
 against the last snapshot the companion confirmed receiving, even after multiple
 scans or `/reload`. The addon saves one revision and compact row fingerprints per
 character/section in `characterSynced`; scans do not advance that cache. Only a
@@ -381,8 +391,39 @@ baselines can take longer over the pixel channel. Let the scan finish and then
 After installing this feature, restart the companion once and `/reload` the addon;
 the companion must recognize achievement snapshots and cache probes.
 
-Sending a prompt also starts data transfer. The prompt identifies the exact
-snapshot revisions it needs. Before requesting uploads, the companion checks
+**Aux auction history stays on the companion.** A background worker checks the
+selected game's `WTF/Account/*/SavedVariables/aux-addon.lua` every 15 seconds and
+imports changed files into `state/auctions`. No auction data uses the pixel strip,
+character Sync button, or prompt snapshot manifests. Prompts do not wait for an
+import. Agents receive only a short local lookup instruction; for auction questions
+they read `index.json` and search the indicated JSONL market file by item ID or name.
+This works through existing read/search tools in Claude, Codex and Hermes.
+
+The cache separates accounts, realms, factions and random-suffix variants. It
+contains Aux's recorded unit buyout lows, up to 11 prior daily samples and Aux's
+weighted historical value. It is not a live listing feed or evidence of completed
+sales. WoW writes new observations to disk on `/reload` or logout; the index records
+the saved-file timestamp, and each price records its daily bucket boundary.
+An old daily bucket must not be presented as today's price. Missing values stay
+unknown. Saved Lua is parsed as bounded literal data, never executed; incomplete
+or invalid files are retried while the last good cache is labelled stale, including after companion restarts.
+Cache files are immutable so an in-flight answer can finish reading its version.
+No addon change or game input is needed to read an already-saved Aux history file.
+
+**Automatic prompt transfers are incremental for every section**, including
+recipes, bags, gear, pets, mounts and achievements. If only recipes changed, only
+recipe changes transfer; unchanged sections are referenced by revision and reused.
+Small changes can travel with the initial prompt, avoiding the separate cache
+reply, upload acknowledgement and prompt retransmission. These optional attachments
+share a 1,800-byte budget and use only space left after the user's message and
+link details. Patch preparation runs during background scanning, not on Send.
+Each patch is based on the last confirmed revision, even after multiple unsent scans.
+The companion validates the owner, section, schema and final checksum before use.
+An old companion, missing baseline, rejected patch or larger change falls back to
+the normal upload path for only the missing sections. Context off omits attachments.
+
+The prompt identifies the exact snapshot revisions it needs. Before requesting
+uploads, the companion checks
 `WTF/Account/*/SavedVariables/AgentBridge.lua` in the selected game installation
 for matching recipe, collection and achievement snapshots. WoW writes these files on `/reload` or logout;
 letting the scans finish and then reloading lets a large baseline travel
@@ -395,7 +436,10 @@ No extra reload is required when a matching saved snapshot already exists.
 
 The companion requests the remaining missing revisions, receives
 checked `CPBC` pages, and commits each full section atomically. Changes can use
-row patches based on the confirmed sync cache; a missing patch baseline
+row patches based on the confirmed sync cache. For example, one changed achievement
+transfers its row in the affected partition; unchanged achievements, recipes, bags,
+pets and other sections stay cached. If several achievements change (such as a
+completed achievement and its meta), their changed rows all transfer. A missing patch baseline
 automatically falls back to a full section.
 The original prompt pauses its retransmissions during its snapshot uploads,
 then resumes so a fresh prompt starts the agent after synchronization.

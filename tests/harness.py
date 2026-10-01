@@ -232,6 +232,7 @@ class Sim:
                 # says which chat it belongs to and carries the game context.
                 fields, body = parse_envelope(result[1])
                 key = result[0]
+                self.character.import_inline(fields)
                 if self.character.missing(fields):
                     self.character_pending[key] = (fields, body)
                 else:

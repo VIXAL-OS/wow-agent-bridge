@@ -21,7 +21,7 @@ function GetAchievementInfo(id, index)
     if index then id = index <= 3 and ({1001, 1002, 1004})[index] or 1001 + (index - 3) * 8 end
     return originalInfo(id)
 end
-STUB.fire('CRITERIA_UPDATE')
+STUB.fire('RECEIVED_ACHIEVEMENT_LIST')
 '''
 
 
@@ -86,7 +86,7 @@ class ConfirmedSyncCache(unittest.TestCase):
     def payloads(self):
         result, pages = [], []
         for fields, chunk in self.accepted.values():
-            if fields['section'] != [self.SECTION] or 'probe' in fields:
+            if fields.get('section') != [self.SECTION] or 'probe' in fields:
                 continue
             if fields['page'] == ['1']:
                 pages = []
@@ -110,8 +110,8 @@ class ConfirmedSyncCache(unittest.TestCase):
         self.assertEqual(self.sim.character.body(self.OWNER, self.SECTION, self.baseline_revision()), self.doc()[b'body'].decode())
         self.accepted.clear()
         self.sync()
-        self.assertEqual(len(self.accepted), 8)
-        self.assertTrue(all(fields.get('probe') == ['1'] for fields, _ in self.accepted.values()))
+        self.assertEqual(len(self.accepted), 1)
+        self.assertTrue(all(fields.get('probe') == ['manifest'] for fields, _ in self.accepted.values()))
         self.assertEqual(len(self.sim.jobs), 1, 'manual sync must not launch an agent')
 
     def test_reload_preserves_confirmed_baseline_not_latest_unsynced_scan(self):
@@ -170,12 +170,12 @@ class ConfirmedSyncCache(unittest.TestCase):
             if index then id = index <= 3 and ({1001, 1002, 1004})[index] or 1001 + (index - 3) * 8 end
             return originalInfo(id)
         end
-        STUB.fire('CRITERIA_UPDATE')
+        STUB.fire('RECEIVED_ACHIEVEMENT_LIST')
         ''')
         self.sim.run(5)
         self.assertTrue(self.sim.ns.SyncCharacter()[0])
         def second_page():
-            return any(fields['section'] == [self.SECTION] and fields['page'] == ['2']
+            return any(fields.get('section') == [self.SECTION] and fields['page'] == ['2']
                        for fields, _ in self.accepted.values())
         self.assertTrue(self.sim.run(300, until=second_page))
         self.assertEqual(self.baseline_revision(), baseline, 'first page ACK is not a snapshot ACK')
@@ -211,11 +211,81 @@ class ConfirmedSyncCache(unittest.TestCase):
             original(text)
         self.sim.ns.SetStatus = remember
         self.assertTrue(self.sim.ns.SyncCharacter()[0])
-        self.assertTrue(self.sim.run(10, until=lambda: b'Uploading' in status[0]))
+        self.assertTrue(self.sim.run(10, until=lambda: b'Checking' in status[0]))
         self.sim.run(self.sim.FRAME)
         self.sim.g.SlashCmdList.AGENTBRIDGE(b'context off')
         self.sim.run(2)
         self.assertFalse(self.sim.ns.CharacterSyncBusy())
+
+
+
+    def test_only_changed_achievement_transfers_on_prompt_with_other_sections_cached(self):
+        from tests.test_character import FIXTURES
+        from tests.test_pet_context import PETS
+        self.sim.lua.execute((FIXTURES + PETS).encode())
+        self.sim.run(3)
+        self.prime()
+        before = {s: d[b'revision'] for s, d in self.docs().items()}
+        self.change(2)
+        self.sim.send('one achievement changed')
+        self.assertTrue(self.sim.run(180, until=lambda: self.sim.last_reply() == 'Echo: one achievement changed'))
+        self.assertEqual(self.accepted, {}, 'small changes arrive with the prompt, without an upload handshake')
+        job = next(job for job in self.sim.jobs.values() if job['prompt'] == 'one achievement changed')
+        payloads = [json.loads(p) for p in job['fields']['snapshotdata']]
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0][0], 2)
+        self.assertEqual([r[0] for r in payloads[0][5]], ['1001'])
+        self.assertLess(len(canonical(payloads[0])), len(self.doc()[b'body']) / 2)
+        self.assertEqual([s for s, d in self.docs().items() if d[b'revision'] != before[s]], [self.SECTION.encode()])
+        self.accepted.clear()
+        self.sync()
+        self.assertEqual(len(self.accepted), 1, 'unchanged manual sync needs one cache check')
+        self.assertEqual(next(iter(self.accepted.values()))[0]['probe'], ['manifest'])
+
+    def test_manual_change_uses_one_manifest_and_one_row_patch(self):
+        self.prime(); self.change(2); self.sync()
+        self.assertEqual(len(self.accepted), 2)
+        self.assertEqual(sum(f.get('probe') == ['manifest'] for f, _ in self.accepted.values()), 1)
+        self.assertEqual([r[0] for r in self.payloads()[0][5]], ['1001'])
+        messages = '\n'.join(v.decode() for v in self.sim.g.STUB.prints.values())
+        self.assertIn('1 snapshots uploaded, 7 unchanged snapshots reused', messages)
+
+    def test_old_companion_falls_back_to_individual_probes(self):
+        self.prime(); self.change(2)
+        original = self.sim.character._page
+        def old_page(blob):
+            if parse_envelope(blob)[0].get('probe') == ['manifest']:
+                raise ValueError('Invalid character page header')
+            return original(blob)
+        self.sim.character._page = old_page
+        self.sync()
+        self.assertEqual(sum(f.get('probe') == ['1'] for f, _ in self.accepted.values()), 8)
+        self.assertEqual([r[0] for r in self.payloads()[0][5]], ['1001'])
+        self.assertEqual(self.baseline_revision(), self.doc()[b'revision'].decode())
+
+    def test_manifest_missing_unchanged_section_recovers_cache_loss(self):
+        self.prime()
+        with self.sim.character.db:
+            self.sim.character.db.execute('DELETE FROM character_snapshots WHERE owner=? AND section=?', (self.OWNER, self.SECTION))
+        self.sync()
+        self.assertEqual(len(self.accepted), 2)
+        self.assertEqual([p[0] for p in self.payloads()], [1])
+        self.assertEqual(self.sim.character.body(self.OWNER, self.SECTION, self.baseline_revision()), self.doc()[b'body'].decode())
+
+    def test_invalid_manifest_response_does_not_confirm_or_upload(self):
+        baseline = self.prime(); self.change(2)
+        original = self.sim.character._page
+        def wrong_manifest(blob):
+            if parse_envelope(blob)[0].get('probe') == ['manifest']:
+                return '\x01ABCTX1\nachievements:2|00000001-100'
+            return original(blob)
+        self.sim.character._page = wrong_manifest
+        self.assertTrue(self.sim.ns.SyncCharacter()[0])
+        self.assertTrue(self.sim.run(120, until=lambda: not self.sim.ns.CharacterSyncBusy()))
+        self.assertEqual(self.baseline_revision(), baseline)
+        self.assertEqual(self.payloads(), [])
+        messages = '\n'.join(v.decode() for v in self.sim.g.STUB.prints.values())
+        self.assertIn('Invalid cache response', messages)
 
 
 if __name__ == '__main__':

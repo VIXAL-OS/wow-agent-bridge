@@ -105,7 +105,7 @@ class AchievementSnapshots(unittest.TestCase):
                 self.sim.g.STUB.categoryCompleted = completed
                 self.sim.lua.execute(b'''
                 for id, row in pairs(STUB.achievements) do row[2] = id - 2000 <= STUB.categoryCompleted end
-                STUB.fire('CRITERIA_UPDATE')
+                STUB.fire('RECEIVED_ACHIEVEMENT_LIST')
                 ''')
                 self.sim.run(3)
                 docs = [validate_document(json.loads(doc[b'body']), section) for section, doc in self.docs().items()]
@@ -143,8 +143,8 @@ class AchievementSnapshots(unittest.TestCase):
             return original(key, blob)
         self.sim.character.accept = record
         self.sync()
-        self.assertEqual(len(accepted), 8)
-        self.assertTrue(all(fields.get('probe') == ['1'] and body == 'ABCTX_PROBE' for fields, body in accepted.values()))
+        self.assertEqual(len(accepted), 1)
+        self.assertTrue(all(fields.get('probe') == ['manifest'] and body == 'ABCTX_PROBE' for fields, body in accepted.values()))
         self.sim.run(.3)
         frames = self.sim.character_frames
         self.sim.send('which coins remain?')
@@ -185,7 +185,7 @@ class AchievementSnapshots(unittest.TestCase):
         function GetAchievementInfo(id, index) return oldInfo(index or id) end
         function GetNextAchievement() end
         function GetPreviousAchievement() end
-        STUB.fire('CRITERIA_UPDATE')
+        STUB.fire('RECEIVED_ACHIEVEMENT_LIST')
         ''')
         self.sim.run(20)
         docs = self.docs()
@@ -207,6 +207,74 @@ class AchievementSnapshots(unittest.TestCase):
         self.assertEqual(reads, self.sim.g.STUB.achievementReads)
         self.sim.g.SlashCmdList.AGENTBRIDGE(b'context on'); self.sim.run(4)
         self.assertGreater(self.sim.g.STUB.achievementReads, reads)
+
+
+
+    def test_earned_event_reads_only_affected_achievement_and_meta_parent(self):
+        before = {k: d[b'revision'] for k, d in self.docs().items()}
+        reads = self.sim.g.STUB.achievementReads
+        self.sim.lua.execute(b'''
+        function GetCategoryList() error('must reuse the known catalog') end
+        local original = GetAchievementInfo
+        function GetAchievementInfo(id, index)
+            assert(not index and (id == 1001 or id == 1004), 'unrelated achievement read')
+            return original(id)
+        end
+        STUB.achievements[1001][2] = true
+        STUB.achievements[1001][3][2][3] = true
+        STUB.achievements[1001][3][2][4] = 1
+        STUB.achievements[1004][3][1][3] = true
+        STUB.achievements[1004][3][1][4] = 1
+        STUB.fire('ACHIEVEMENT_EARNED', 1001)
+        ''')
+        self.sim.run(3)
+        self.assertEqual(self.sim.g.STUB.achievementReads - reads, 3)
+        self.assertEqual(self.row(1001)[2], '1')
+        self.assertEqual(json.loads(self.row(1004)[9])[0][2:4], ['1', '1'])
+        self.assertEqual({k for k, d in self.docs().items() if d[b'revision'] != before[k]}, {'achievements:2', 'achievements:5'})
+        self.assertNotIn(b'failed', self.sim.ns.CharacterStatus())
+
+    def test_criteria_burst_reuses_catalog_and_preserves_untouched_documents(self):
+        docs = self.docs()
+        reads = self.sim.g.STUB.achievementReads
+        self.sim.lua.execute(b'''
+        function GetCategoryList() error('must reuse the known catalog') end
+        STUB.achievements[1001][3][2][4] = 1
+        for i = 1, 100 do STUB.fire('CRITERIA_UPDATE') end
+        ''')
+        self.sim.run(3)
+        self.assertEqual(self.sim.g.STUB.achievementReads - reads, 5)
+        self.assertEqual(json.loads(self.row(1001)[9])[1][3], '1')
+        for section, doc in docs.items():
+            if section != 'achievements:2':
+                self.assertTrue(self.sim.lua.eval(b'function(a, b) return rawequal(a, b) end')(doc, self.docs()[section]))
+
+    def test_update_during_running_sweep_is_not_lost(self):
+        self.sim.lua.execute(b'''
+        local original = GetAchievementCriteriaInfo
+        local fired = false
+        function GetAchievementCriteriaInfo(id, index)
+            if not fired and id == 1001 and index == 2 then
+                fired = true
+                -- Change a criterion that this pass has already read.
+                STUB.achievements[1001][3][1][4] = 9
+                STUB.fire('CRITERIA_UPDATE')
+            end
+            return original(id, index)
+        end
+        STUB.fire('CRITERIA_UPDATE')
+        ''')
+        self.sim.run(4)
+        self.assertEqual(json.loads(self.row(1001)[9])[0][3], '9')
+        self.assertNotIn(b'stale', self.sim.ns.CharacterStatus())
+
+    def test_completed_achievement_optional_criteria_can_still_change(self):
+        self.sim.lua.execute(b'''
+        STUB.achievements[1002][3][1][4] = 11
+        STUB.fire('CRITERIA_UPDATE')
+        ''')
+        self.sim.run(3)
+        self.assertEqual(json.loads(self.row(1002)[9])[0][3], '11')
 
 
 class AchievementCache(unittest.TestCase):
@@ -266,6 +334,37 @@ class AchievementCache(unittest.TestCase):
         clock[0] = 385
         self.assertIsNone(assembler.accept(frames[1]))
         self.assertIsNone(assembler.accept(frames[2]), 'stalled first fragment was discarded')
+
+
+
+    def test_manifest_checks_all_sections_once_and_imports_only_requested_owner(self):
+        path = self.root / 'WTF/Account/TEST/SavedVariables/AgentBridge.lua'
+        path.parent.mkdir(parents=True)
+        path.write_text('AgentBridgeState = ' + literal({'characterAchievements': {'owner': {
+            'achievements:2': {'revision': self.rev, 'body': self.body}}}}), encoding='utf-8')
+        empty = canonical([1, 'achievements:3', 'complete', '', []])
+        missing_rev = revision(empty)
+        blob = (f'\x01AB1\ncharacter=owner\nprobe=manifest\nsnapshot=achievements:2|{self.rev}|1|cached'
+                f'\nsnapshot=achievements:3|{missing_rev}|1|cached\n\x02ABCTX_PROBE')
+        result = self.store.accept('manifest', blob)
+        self.assertEqual(result['state'], 'done')
+        self.assertEqual(result['reply'], f'\x01ABCTX1\nachievements:3|{missing_rev}')
+        self.assertEqual(self.store.body('owner', 'achievements:2', self.rev), self.body)
+        other = self.store.accept('other-manifest', blob.replace('character=owner', 'character=other'))
+        self.assertIn(f'achievements:2|{self.rev}', other['reply'])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM character_pages').fetchone()[0], 0)
+
+    def test_manifest_rejects_invalid_identity_duplicates_and_extra_headers(self):
+        blob = f'\x01AB1\ncharacter=owner\nprobe=manifest\nsnapshot=achievements:2|{self.rev}|1|cached\n\x02ABCTX_PROBE'
+        cases = [blob.replace('character=owner\n', ''),
+                 blob.replace('snapshot=', 'character=other\nsnapshot='),
+                 blob.replace('snapshot=', 'section=bags\nsnapshot='),
+                 blob.replace('snapshot=', f'snapshot=achievements:2|{self.rev}|1|cached\nsnapshot='),
+                 blob.replace('ABCTX_PROBE', 'anything'),
+                 blob.replace('achievements:2', 'achievements:99')]
+        for index, value in enumerate(cases):
+            with self.subTest(index=index):
+                self.assertEqual(self.store.accept('invalid-' + str(index), value)['state'], 'failed')
 
 
 if __name__ == '__main__':

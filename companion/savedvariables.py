@@ -24,10 +24,11 @@ def saved_section(section):
 
 
 class _Reader:
-    def __init__(self, data):
-        if len(data) > MAX_FILE:
+    def __init__(self, data, *, max_file=None, max_values=None):
+        if len(data) > (MAX_FILE if max_file is None else max_file):
             raise ValueError('SavedVariables file too large')
         self.data, self.pos, self.values = data.removeprefix(b'\xef\xbb\xbf'), 0, 0
+        self.max_values = MAX_VALUES if max_values is None else max_values
 
     def skip(self):
         while self.pos < len(self.data):
@@ -95,7 +96,7 @@ class _Reader:
 
     def value(self, depth=0):
         self.values += 1
-        if depth > MAX_DEPTH or self.values > MAX_VALUES:
+        if depth > MAX_DEPTH or self.values > self.max_values:
             raise ValueError('SavedVariables complexity limit')
         self.skip()
         if self.pos == len(self.data):

@@ -46,6 +46,7 @@ function NS.Send(raw)
         character = NS.CharacterFields(fields)
     end
     local body, display = NS.MakePromptText(raw, NS.MAX_PROMPT - #NS.Envelope(fields, ''))
+    if character then NS.AppendCharacterChanges(fields, character, NS.MAX_PROMPT - #NS.Envelope(fields, body)) end
     local text = NS.Envelope(fields, body)
     if #text > NS.MAX_PROMPT then
         return false, 'Message plus link details is too long ('..#text..'/'..NS.MAX_PROMPT..' bytes). Shorten it.'
