@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ from tests.test_savedvariables import literal
 
 
 ACHIEVEMENTS = r'''
+-- These tests exercise scanning, not the criteria-sweep throttle (its own test sets it).
+AgentBridge.ACHIEVEMENT_SWEEP_INTERVAL = 0
 STUB.achievementReads = 0
 STUB.achievements = {
     [1001] = {'Dalaran copper coins', false, {{'First copper coin', 42, true, 1, 1, '', 0, 43001, '1/1'},
@@ -47,6 +50,21 @@ function GetComparisonAchievementInfo() error('another player must not be read')
 ACHIEVEMENTUI_SELECTEDFILTER = function() error('display filter must not be read') end
 STUB.fire('PLAYER_ENTERING_WORLD')
 '''
+
+
+def listed_ids(docs):
+    """Every achievement ID the documents list (achievements with no progress are left out)."""
+    return {row[0] for doc in docs.values() for row in json.loads(doc[b'body'])[4]}
+
+
+def omitted_counts(docs):
+    """Per part, how many achievements with no progress the detail says were left out (non-zero only)."""
+    counts = {}
+    for section, doc in docs.items():
+        match = re.search(r'(\d+) listed achievements with no progress', json.loads(doc[b'body'])[3])
+        if match and int(match.group(1)):
+            counts[section] = int(match.group(1))
+    return counts
 
 
 class AchievementSnapshots(unittest.TestCase):
@@ -86,7 +104,10 @@ class AchievementSnapshots(unittest.TestCase):
         self.assertEqual([row[2] for row in criteria], ['1', '0'])
         self.assertEqual(self.row(1002)[6], '2026-09-30')
         self.assertEqual(json.loads(self.row(1003)[9])[0][3:5], ['12', '100'])
-        self.assertEqual(json.loads(self.row(1004)[9])[0][6], '1001')
+        # The meta achievement has no progress yet: left out, counted, and no descriptions anywhere.
+        self.assertNotIn('1004', listed_ids(self.docs()))
+        self.assertEqual(omitted_counts(self.docs()), {'achievements:5': 1})
+        self.assertEqual({row[4] for doc in self.docs().values() for row in json.loads(doc[b'body'])[4]}, {''})
         text = CharacterStore.render('owner', 'achievements:2', 'complete', '', [coins])
         self.assertIn('First copper coin\tcomplete\t1\t1', text)
         self.assertIn('Second copper coin\tincomplete\t0\t1', text)
@@ -112,8 +133,10 @@ class AchievementSnapshots(unittest.TestCase):
                 self.assertEqual(len(docs), 8)
                 self.assertTrue(all(doc[2] == 'complete' for doc in docs))
                 rows = [row for doc in docs for row in doc[4]]
-                self.assertEqual({row[0] for row in rows}, {str(i) for i in range(2001, 2013)})
+                # Only the completed ones have progress; the rest are counted, not listed.
+                self.assertEqual({row[0] for row in rows}, {str(i) for i in range(2001, 2001 + completed)})
                 self.assertEqual(sum(row[2] == '1' for row in rows), completed)
+                self.assertEqual(sum(omitted_counts(self.docs()).values()), 12 - completed)
 
     def test_criteria_event_rescans_and_small_delta_keeps_unchanged_revisions(self):
         before = {key: doc[b'revision'] for key, doc in self.docs().items()}
@@ -177,7 +200,9 @@ class AchievementSnapshots(unittest.TestCase):
         for id = 1, 1800 do
             STUB.achievements[id] = {'Achievement '..id, false, {}}
             for criterion = 1, 5 do
-                STUB.achievements[id][3][criterion] = {'Objective '..criterion, 42, false, 0, 1, '', 0, id, '0/1'}
+                -- Some progress on each, so every one is uploaded and the partitions fill up.
+                local count = criterion == 1 and 1 or 0
+                STUB.achievements[id][3][criterion] = {'Objective '..criterion, 42, false, count, 2, '', 0, id, count..'/2'}
             end
         end
         function GetCategoryNumAchievements() return 1800, 0 end
@@ -268,6 +293,47 @@ class AchievementSnapshots(unittest.TestCase):
         self.assertEqual(json.loads(self.row(1001)[9])[0][3], '9')
         self.assertNotIn(b'stale', self.sim.ns.CharacterStatus())
 
+    def test_criteria_ticks_rescan_at_most_every_30_seconds(self):
+        self.sim.g.AgentBridge.ACHIEVEMENT_SWEEP_INTERVAL = 30
+        self.sim.run(31)  # well past the start-up pass
+        reads = self.sim.g.STUB.achievementReads
+        # The first tick after a quiet spell is read at once.
+        self.sim.g.STUB.fire(b'CRITERIA_UPDATE'); self.sim.run(3)
+        swept = self.sim.g.STUB.achievementReads
+        self.assertGreater(swept, reads)
+        # Ticks within 30 s of that sweep wait for its interval, however many arrive.
+        for _ in range(20):
+            self.sim.g.STUB.fire(b'CRITERIA_UPDATE'); self.sim.run(1)
+        self.assertEqual(self.sim.g.STUB.achievementReads, swept)
+        self.sim.run(15)
+        self.assertGreater(self.sim.g.STUB.achievementReads, swept)
+        # An earned achievement is read at once, interval or not.
+        self.sim.g.STUB.fire(b'CRITERIA_UPDATE'); self.sim.run(1)
+        waiting = self.sim.g.STUB.achievementReads
+        self.sim.lua.execute(b"STUB.achievements[1003][2] = true; STUB.fire('ACHIEVEMENT_EARNED', 1003)")
+        self.sim.run(2)
+        self.assertGreater(self.sim.g.STUB.achievementReads, waiting)
+        self.assertEqual(self.row(1003)[2], '1')
+
+    def test_sweep_finds_first_progress_on_a_left_out_achievement(self):
+        self.assertNotIn('1004', listed_ids(self.docs()))
+        self.sim.lua.execute(b"STUB.achievements[1004][3][1][4] = 1; STUB.fire('CRITERIA_UPDATE')")
+        self.sim.run(3)
+        self.assertEqual(json.loads(self.row(1004)[9])[0][3], '1')
+        self.assertEqual(omitted_counts(self.docs()), {}, 'the part no longer counts it as left out')
+
+    def test_manual_sync_completes_during_constant_criteria_ticks(self):
+        self.sim.g.AgentBridge.ACHIEVEMENT_SWEEP_INTERVAL = 30
+        ok, message = self.sim.ns.SyncCharacter()
+        self.assertTrue(ok, message)
+        for _ in range(150):
+            self.sim.g.STUB.fire(b'CRITERIA_UPDATE')
+            if self.sim.run(1, until=lambda: not self.sim.ns.CharacterSyncBusy()):
+                break
+        prints = '\n'.join(v.decode() for v in self.sim.g.STUB.prints.values())
+        self.assertIn('Character sync complete:', prints)
+        self.assertNotIn('did not settle', prints)
+
     def test_completed_achievement_optional_criteria_can_still_change(self):
         self.sim.lua.execute(b'''
         STUB.achievements[1002][3][1][4] = 11
@@ -353,6 +419,52 @@ class AchievementCache(unittest.TestCase):
         other = self.store.accept('other-manifest', blob.replace('character=owner', 'character=other'))
         self.assertIn(f'achievements:2|{self.rev}', other['reply'])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM character_pages').fetchone()[0], 0)
+
+    def window_pages(self, count=3):
+        """The test body split into `count` pages, as envelopes for one section revision."""
+        size = -(-len(self.body) // count)
+        chunks = [self.body[i:i + size] for i in range(0, len(self.body), size)]
+        self.assertEqual(len(chunks), count)
+        return [envelope('owner', 'achievements:2', self.rev, i + 1, count, chunk) for i, chunk in enumerate(chunks)]
+
+    def test_upload_window_is_queued_until_every_page_then_ok(self):
+        first, second, last = self.window_pages()
+        # The window's last page, watched by the addon, names the other two.
+        result = self.store.accept('abc:3', last.replace('\npage=', '\nwindow=1,2\npage='))
+        self.assertEqual((result['state'], result['reply']), ('queued', 'Receiving character pages: 1 of 3.'))
+        self.store.accept('abc:1', first)
+        self.assertEqual(self.store.get('abc:3')['state'], 'queued')
+        self.store.accept('abc:2', second)
+        self.assertEqual((self.store.get('abc:3')['state'], self.store.get('abc:3')['reply']), ('done', 'ABCTX_OK'))
+        self.assertEqual(self.store.body('owner', 'achievements:2', self.rev), self.body)
+        # Another session's requests with the same numbers are not this window's pages.
+        self.store.accept('xyz:3', last.replace('\npage=', '\nwindow=1,2\npage='))
+        self.assertEqual(self.store.get('xyz:3')['state'], 'done', 'a complete snapshot counts as stored')
+
+    def test_upload_window_reports_the_first_failure_and_rejects_bad_windows(self):
+        first, second, last = self.window_pages()
+        self.store.accept('abc:3', last.replace('\npage=', '\nwindow=1,2\npage='))
+        self.store.accept('abc:1', first)
+        rejected = self.store.accept('abc:2', second.replace('page=2', 'page=9'))
+        self.assertEqual(rejected['state'], 'failed')
+        self.assertEqual((self.store.get('abc:3')['state'], self.store.get('abc:3')['reply']), ('failed', rejected['reply']))
+        for spec in ('', '0', '1,1', 'a', ','.join(str(i) for i in range(1, 9)), '4294967296'):
+            with self.subTest(spec=spec):
+                result = self.store.accept('bad-' + spec, last.replace('\npage=', f'\nwindow={spec}\npage='))
+                self.assertEqual((result['state'], result['reply']), ('failed', 'Character data rejected: Invalid upload window'))
+
+    def test_manifest_offers_a_window_only_when_asked(self):
+        empty = canonical([1, 'achievements:3', 'complete', '', []])
+        blob = (f'\x01AB1\ncharacter=owner\nprobe=manifest\nsnapshot=achievements:3|{revision(empty)}|1|cached'
+                f'\n\x02ABCTX_PROBE')
+        self.assertEqual(self.store.accept('plain', blob)['reply'], f'\x01ABCTX1\nachievements:3|{revision(empty)}')
+        windowed = self.store.accept('windowed', blob.replace('probe=manifest', 'probe=manifest\nwindow=6'))
+        self.assertEqual(windowed['reply'], f'\x01ABCTX1\nachievements:3|{revision(empty)}\nwindow|6')
+        capped = self.store.accept('capped', blob.replace('probe=manifest', 'probe=manifest\nwindow=99'))
+        self.assertTrue(capped['reply'].endswith('\nwindow|8'))
+        for value in ('0', 'x', '100'):
+            with self.subTest(value=value):
+                self.assertEqual(self.store.accept('bad' + value, blob.replace('probe=manifest', f'probe=manifest\nwindow={value}'))['state'], 'failed')
 
     def test_manifest_rejects_invalid_identity_duplicates_and_extra_headers(self):
         blob = f'\x01AB1\ncharacter=owner\nprobe=manifest\nsnapshot=achievements:2|{self.rev}|1|cached\n\x02ABCTX_PROBE'

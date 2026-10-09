@@ -16,6 +16,10 @@ from .savedvariables import saved_section
 MAX_DOCUMENT = 160000
 MAX_PAGES = 40
 NEED = '\x01ABCTX1\n'
+# Upload windows: the addon sends up to WINDOW pages at once and watches only the last,
+# which names the others (window=<request>,<request>,...). Its reply stays "queued" until
+# every page of the window is stored, so the game loads one confirmation per window.
+WINDOW = 8
 SLOTS = ['Ammo', 'Head', 'Neck', 'Shoulders', 'Shirt', 'Chest', 'Waist', 'Legs',
          'Feet', 'Wrists', 'Hands', 'Finger 1', 'Finger 2', 'Trinket 1', 'Trinket 2',
          'Back', 'Main hand', 'Off hand', 'Ranged', 'Tabard']
@@ -61,6 +65,22 @@ def manifest(fields):
         seen.add(section)
         parsed.append((section, rev, int(captured), freshness))
     return chars[0], parsed
+
+
+def window_size(fields):
+    """The upload window an addon offers (window=N), or 0 for none: then one page per reply."""
+    values = fields.get('window', [])
+    if len(values) == 1 and re.fullmatch(r'[1-9][0-9]?', values[0]):
+        return min(int(values[0]), WINDOW)
+    return 0
+
+
+def need_reply(missing, window=0):
+    """The snapshots to upload; a window line only for an addon that offered one."""
+    lines = [s + '|' + r for s, r in missing]
+    if window:
+        lines.append(f'window|{window}')
+    return NEED + '\n'.join(lines)
 
 
 def achievement_number(value, maximum=9007199254740991, blank=True):
@@ -150,7 +170,26 @@ class CharacterStore:
 
     def get(self, key):
         row = self.db.execute('SELECT state,reply FROM character_requests WHERE id=?', (key,)).fetchone()
+        if row and row[0] == 'window':
+            return self._window(key, json.loads(row[1]))
         return {'id': key, 'state': row[0], 'reply': row[1]} if row else None
+
+    def _window(self, key, window):
+        """A window's last page: queued until every page of the window is stored, then the
+        first failure among them or ABCTX_OK. A snapshot that is already complete counts as
+        stored (a page that arrived after it did not need recording)."""
+        prefix = key.rsplit(':', 1)[0]
+        stored = 0
+        for request in window['others']:
+            row = self.db.execute('SELECT state,reply FROM character_requests WHERE id=?',
+                                  (f'{prefix}:{request}',)).fetchone()
+            if row and row[0] == 'failed':
+                return {'id': key, 'state': 'failed', 'reply': row[1]}
+            stored += 1 if row else 0
+        if stored == len(window['others']) or self.body(window['owner'], window['section'], window['revision']) is not None:
+            return {'id': key, 'state': 'done', 'reply': 'ABCTX_OK'}
+        return {'id': key, 'state': 'queued',
+                'reply': f'Receiving character pages: {stored + 1} of {len(window["others"]) + 1}.'}
 
     def body(self, owner, section, rev):
         row = self.db.execute('SELECT body FROM character_snapshots WHERE owner=? AND section=? AND revision=?',
@@ -228,7 +267,7 @@ class CharacterStore:
     def waiting(self, key, fields):
         missing = self.missing(fields)
         if missing:
-            return {'id': key, 'state': 'waiting', 'reply': NEED + '\n'.join(s + '|' + r for s, r in missing)}
+            return {'id': key, 'state': 'waiting', 'reply': need_reply(missing, window_size(fields))}
 
     def accept(self, key, blob):
         previous = self.get(key)
@@ -237,22 +276,41 @@ class CharacterStore:
         try:
             reply = self._page(blob) or 'ABCTX_OK'
             state = 'done'
+            window = self._window_spec(blob)
+            if window:
+                state, reply = 'window', canonical(window)
         except (ValueError, TypeError, KeyError, IndexError, RecursionError) as error:
             state, reply = 'failed', 'ABCTX_BASE_MISSING' if str(error) == 'base missing' else 'Character data rejected: ' + str(error)[:160]
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO character_requests VALUES (?,?,?,?)', (key, state, reply, time.time()))
         return self.get(key)
 
+    @staticmethod
+    def _window_spec(blob):
+        """The other pages a window's last page names, with the snapshot they build; None for
+        a page outside a window. Called after the page itself was accepted."""
+        fields, _ = parse_envelope(blob)
+        if 'window' not in fields or fields.get('probe'):
+            return None
+        values = fields['window']
+        if len(values) != 1 or not re.fullmatch(r'[1-9][0-9]{0,9}(,[1-9][0-9]{0,9}){0,%d}' % (WINDOW - 2), values[0]):
+            raise ValueError('Invalid upload window')
+        others = values[0].split(',')
+        if len(set(others)) != len(others) or any(int(r) >= 2**32 for r in others):
+            raise ValueError('Invalid upload window')
+        return {'others': others, 'owner': fields['character'][0], 'section': fields['section'][0],
+                'revision': fields['revision'][0]}
+
     def _page(self, blob):
         fields, chunk = parse_envelope(blob)
         if fields.get('probe') == ['manifest']:
-            if (set(fields) != {'character', 'snapshot', 'probe'} or chunk != 'ABCTX_PROBE'
-                    or not fields.get('snapshot')):
+            if (set(fields) - {'window'} != {'character', 'snapshot', 'probe'} or chunk != 'ABCTX_PROBE'
+                    or not fields.get('snapshot') or ('window' in fields and not window_size(fields))):
                 raise ValueError('Invalid character cache manifest')
             manifest(fields)  # Bound and validate everything before importing.
             self.import_saved(fields)
             missing = self.missing(fields)
-            return NEED + '\n'.join(s + '|' + r for s, r in missing) if missing else 'ABCTX_OK'
+            return need_reply(missing, window_size(fields)) if missing else 'ABCTX_OK'
         required = ('character', 'section', 'revision', 'page', 'total')
         if any(len(fields.get(k, [])) != 1 for k in required):
             raise ValueError('Invalid character page header')
@@ -383,7 +441,8 @@ class CharacterStore:
                 out.append(f'\nAchievement {row[0]}: {row[1]} [{state}]; points={row[3] or "unknown"}; '
                            f'category={row[5]}; earned={row[6] or "not recorded"}; '
                            f'criteria coverage={row[8]}; reported criteria={row[7] or "unknown"}')
-                out.append('Description: ' + row[4])
+                if row[4]:  # Newer addons leave descriptions out; the name identifies it.
+                    out.append('Description: ' + row[4])
                 out.append('Criterion\tName\tCredit\tProgress\tRequired\tType\tAsset ID\tDisplay progress')
                 for criterion in criteria:
                     credit = {'1': 'complete', '0': 'incomplete', '': 'unknown'}[criterion[2]]

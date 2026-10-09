@@ -13,8 +13,9 @@ from tests.test_e2e import agent
 CATALOG = r'''
 local originalInfo = GetAchievementInfo
 for i = 1, 8 do
+    -- Some progress on each, so they are uploaded and the partition is big enough for row patches.
     STUB.achievements[1001 + i * 8] = {'Additional objective '..i, false,
-        {{'Collect an objective', 42, false, 0, 1, '', 0, 0, '0/1'}}}
+        {{'Collect an objective', 42, false, 1, 2, '', 0, 0, '1/2'}}}
 end
 function GetCategoryNumAchievements() return 11, 1 end
 function GetAchievementInfo(id, index)
@@ -163,7 +164,8 @@ class ConfirmedSyncCache(unittest.TestCase):
         self.sim.lua.execute(b'''
         local originalInfo = GetAchievementInfo
         for i = 1, 40 do
-            STUB.achievements[1001 + i * 8] = {'Long achievement '..i..string.rep('x', 90), false, {}}
+            -- Completed, so each has progress and is uploaded: the document spans pages.
+            STUB.achievements[1001 + i * 8] = {'Long achievement '..i..string.rep('x', 90), true, {}}
         end
         function GetCategoryNumAchievements() return 43, 1 end
         function GetAchievementInfo(id, index)
@@ -271,6 +273,74 @@ class ConfirmedSyncCache(unittest.TestCase):
         self.assertEqual(len(self.accepted), 2)
         self.assertEqual([p[0] for p in self.payloads()], [1])
         self.assertEqual(self.sim.character.body(self.OWNER, self.SECTION, self.baseline_revision()), self.doc()[b'body'].decode())
+
+    def big_section(self):
+        """150 completed achievements with long names in achievements:2: about 7 pages."""
+        self.sim.lua.execute(b'''
+        local originalInfo = GetAchievementInfo
+        for i = 1, 150 do
+            STUB.achievements[1001 + i * 8] = {'Long achievement '..i..' '..string.rep('x', 140), true, {}}
+        end
+        function GetCategoryNumAchievements() return 153, 1 end
+        function GetAchievementInfo(id, index)
+            if index then id = index <= 3 and ({1001, 1002, 1004})[index] or 1001 + (index - 3) * 8 end
+            return originalInfo(id)
+        end
+        STUB.fire('RECEIVED_ACHIEVEMENT_LIST')
+        ''')
+        self.sim.run(10)
+
+    def section_pages(self):
+        return [fields for fields, _ in self.accepted.values()
+                if fields.get('section') == [self.SECTION] and 'probe' not in fields]
+
+    def reads_for_sync(self):
+        """Reply slots the addon reads (each one a font load) for one manual sync."""
+        before = self.sim.status()[b'slot']
+        self.sync()
+        return self.sim.status()[b'slot'] - before
+
+    def forget_section(self):
+        """The companion loses this section's snapshot: the next sync uploads it alone."""
+        with self.sim.character.db:
+            self.sim.character.db.execute('DELETE FROM character_snapshots WHERE owner=? AND section=?', (self.OWNER, self.SECTION))
+        self.accepted.clear()
+
+    def test_large_upload_goes_in_windows_with_far_fewer_reply_reads(self):
+        self.big_section()
+        self.sync()  # Everything once, so both measured syncs below upload just this section.
+        self.forget_section()
+        windowed = self.reads_for_sync()
+        pages = self.section_pages()
+        total = int(pages[0]['total'][0])
+        self.assertGreaterEqual(total, 7)
+        self.assertEqual(sorted(int(f['page'][0]) for f in pages), list(range(1, total + 1)))
+        # Pages 1-6 share one window, watched through page 6, which names the other five.
+        self.assertEqual([(f['page'], f['window'][0].count(',') + 1) for f in pages if 'window' in f], [(['6'], 5)])
+        self.assertEqual(self.sim.character.body(self.OWNER, self.SECTION, self.baseline_revision()), self.doc()[b'body'].decode())
+        # The same upload to a companion from before windows: it rejects the window field, the
+        # addon asks again without one, and every page needs its own confirmation.
+        original = self.sim.character._page
+        def old_page(blob):
+            fields = parse_envelope(blob)[0]
+            if fields.get('probe') == ['manifest'] and 'window' in fields:
+                raise ValueError('Invalid character cache manifest')
+            return original(blob)
+        self.sim.character._page = old_page
+        self.forget_section()
+        single = self.reads_for_sync()
+        self.assertEqual(len(self.section_pages()), total)
+        self.assertFalse(any('window' in f for f in self.section_pages()))
+        manifests = [f for f, _ in self.accepted.values() if f.get('probe') == ['manifest']]
+        self.assertEqual(['window' in f for f in manifests], [True, False])
+        self.assertLess(windowed * 2, single, f'{windowed} reply reads with windows, {single} without')
+
+    def test_prompt_triggered_upload_uses_windows_too(self):
+        self.big_section()
+        self.sim.send('big achievements question')
+        self.assertTrue(self.sim.run(1200, until=lambda: self.sim.last_reply() == 'Echo: big achievements question'))
+        windows = [f for f in self.section_pages() if 'window' in f]
+        self.assertTrue(windows and windows[0]['page'] == ['6'])
 
     def test_invalid_manifest_response_does_not_confirm_or_upload(self):
         baseline = self.prime(); self.change(2)

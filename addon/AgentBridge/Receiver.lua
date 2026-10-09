@@ -189,14 +189,21 @@ function NS.Resume()
     for _, job in pairs(jobs) do job.failures, job.missed, job.due = 0, 0, now end
     NS.OnReceiveState(true); NS.SetStatus('Checking for replies...')
 end
-function NS.BeginRequest(sequence, chat, callback, timeout)
+-- pace (optional): seconds until the next look while the reply is not final yet. Each look
+-- loads a font file, so an upload whose pages are still on the strip should not poll.
+function NS.BeginRequest(sequence, chat, callback, timeout, pace)
     if slot > SIZE then return false, exhausted() end
     local now = GetTime()
     session, paused = NS.session, false
     jobs[sequence] = {request = sequence, chat = chat, assembly = NS.NewAssembly(), due = now + FIRST_WINDOW,
-        expires = now + (timeout or WATCH_LIMIT), callback = callback, failures = 0, missed = 0, unchanged = 0}
+        expires = now + (timeout or WATCH_LIMIT), callback = callback, pace = pace, failures = 0, missed = 0, unchanged = 0}
     NS.OnReceiveState(true)
     return true
+end
+-- Put off the next look at a request's reply by this many seconds.
+function NS.PaceRequest(sequence, seconds)
+    local job = jobs[sequence]
+    if job and not (reading and reading.job == job) then job.due = GetTime() + seconds end
 end
 -- Stop watching a request (its chat was deleted); the companion keeps the reply.
 function NS.ForgetRequest(sequence)
@@ -274,7 +281,7 @@ local function settle(job, reason, text, state, complete)
             if not next(jobs) then NS.OnReceiveState(false) end
             job.callback(text, state)
         else
-            job.due = now + POLL_WINDOW
+            job.due = now + (job.pace and math.max(POLL_WINDOW, job.pace()) or POLL_WINDOW)
         end
         return
     end

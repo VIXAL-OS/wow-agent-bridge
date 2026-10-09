@@ -258,7 +258,9 @@ class App:
         self.url_assembler = Assembler(parser=parse_url_frame)
         self.browser = BrowserRequests(self.inbox.db)
         self.character = CharacterStore(self.inbox.db, args.state / 'characters')
-        self.character_assembler = Assembler(parser=parse_character_frame)
+        # An upload window queues several pages one after another on the strip, so a page's
+        # missed fragment comes round again only after the whole window: allow several sweeps.
+        self.character_assembler = Assembler(parser=parse_character_frame, expiry=900)
         self.character_pending = {}
         self.scheduler, self.context, self.events = Scheduler(), Context(self.inbox.path), queue.Queue()
         self.activity, self.names, self.capturing, self.closed = {}, {}, False, False

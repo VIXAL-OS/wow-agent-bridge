@@ -90,6 +90,8 @@ end
 -- Character snapshots. Work is debounced and spread across frames; the strip
 -- sends revisions for prompts or an explicit manual sync. No background I/O.
 local MAX_ROWS, MAX_BYTES = 2000, 160000
+-- Pages per upload window (one confirmation for all of them), if the companion supports it.
+local UPLOAD_WINDOW = 6
 local documents, dirty, generation, tasks = {}, {}, {}, {}
 local synced, confirmations, confirming = {}, {}, nil
 local scanErrors = {}
@@ -102,6 +104,23 @@ local SAVED_COLLECTIONS = {mounts = true, pets = true, stablepets = true}
 -- Fixed partitions bound each document and keep small progress changes local.
 local ACHIEVEMENT_PARTS = 8
 local achievementPending, achievementDependents, achievementCatalogReady = {}, {}, false
+-- Every API-listed achievement (ID -> category), uploaded or not: only achievements with
+-- some progress are uploaded, but a criteria sweep must still notice a first step.
+local achievementCatalog = {}
+-- CRITERIA_UPDATE names no achievement on this client, so it means re-reading the whole
+-- catalog. Such sweeps start at most every NS.ACHIEVEMENT_SWEEP_INTERVAL seconds; an earned
+-- achievement or a fresh achievement list is read at once.
+NS.ACHIEVEMENT_SWEEP_INTERVAL = 30
+local lastSweep = -1000
+-- Per part, how many listed achievements with no progress were left out (for the detail).
+local achievementOmitted = {}
+local INCOMPLETE_NOTE = ' Incomplete API data or scan limit; includes prior observations. Absence does not prove incomplete.'
+local function achievementDetail(part, complete)
+    return 'Part '..part..'/'..ACHIEVEMENT_PARTS..': achievements with progress (completed, or a criterion credited or counted), with criteria. '
+        ..(achievementOmitted[part] or 0)..' listed achievements with no progress are left out of this part (most likely not started). No descriptions. '
+        ..'Criteria completion is earned credit, not bag contents. Blank progress is unknown; hidden achievements are not inferred.'
+        ..(complete and '' or INCOMPLETE_NOTE)
+end
 local function achievementSection(section) return section:match('^achievements:[1-8]$') ~= nil end
 local function achievementAPIs()
     return GetCategoryList and GetCategoryNumAchievements and GetAchievementInfo
@@ -195,13 +214,22 @@ local function mark(section)
     generation[section] = (generation[section] or 0) + 1
     dirty[section] = GetTime() + .4
 end
+-- Only a catalog sweep is pending (criteria ticks), nothing earned or reloaded.
+local function sweepOnly()
+    for key in pairs(achievementPending) do if key ~= 'sweep' then return false end end
+    return achievementPending.sweep == true
+end
+local function achievementsDue(now)
+    return sweepOnly() and math.max(now + .4, lastSweep + NS.ACHIEVEMENT_SWEEP_INTERVAL) or now + .4
+end
 local function markAchievements(full, id)
     if full then achievementPending.full = true
     elseif id then achievementPending[id] = true
     else achievementPending.sweep = true end
     -- Do not invalidate a running sweep on every catch/kill. Finish it, then
     -- consume any events received during that pass in one follow-up pass.
-    if not dirty.achievements then mark('achievements') end
+    if not dirty.achievements then mark('achievements'); dirty.achievements = achievementsDue(GetTime())
+    elseif not tasks.achievements then dirty.achievements = math.min(dirty.achievements, achievementsDue(GetTime())) end
 end
 local function deltaBody(section, doc, baseline)
     local hashes, changes, removed = rowHashes(doc), {}, {}
@@ -406,13 +434,14 @@ local function achievements(epoch)
     local pending = achievementPending; achievementPending = {}
     local full = pending.full or not achievementCatalogReady or scanErrors.achievements
     if full then achievementDependents = {} end
+    lastSweep = GetTime()
     local function finish()
         if generation.achievements ~= epoch then return end
-        dirty.achievements = next(achievementPending) and GetTime() + .4 or nil
+        dirty.achievements = next(achievementPending) and achievementsDue(GetTime()) or nil
         scanErrors.achievements = nil
     end
-    local groups, sizes, queue, seen = {}, {}, {}, {}
-    for part = 1, ACHIEVEMENT_PARTS do groups[part], sizes[part] = {}, 0 end
+    local groups, sizes, omitted, untouched, queue, seen = {}, {}, {}, {}, {}, {}
+    for part = 1, ACHIEVEMENT_PARTS do groups[part], sizes[part], omitted[part] = {}, 0, 0 end
     local complete, criteriaRead = true, 0
     local categories = full and GetCategoryList() or {}
     local ready = not full or type(categories) == 'table' and #categories > 0
@@ -423,21 +452,15 @@ local function achievements(epoch)
         if #queue >= 4096 then complete = false; return end
         seen[id] = true; queue[#queue+1] = {id, category}
     end
-    if not full then
+    if not full and pending.sweep then
         -- CRITERIA_UPDATE supplies no achievement ID on this client. Reuse the
-        -- catalog, including completed achievements with optional criteria.
-        for part = 1, ACHIEVEMENT_PARTS do
-            for key, row in pairs(documents['achievements:'..part].rows) do
-                if pending.sweep or pending[key] then enqueue(key, row[6]) end
-            end
-        end
+        -- catalog: every listed achievement, uploaded or not (an untouched one may
+        -- have just made its first progress), including completed ones with
+        -- optional criteria.
+        for key, category in pairs(achievementCatalog) do enqueue(key, category) end
     end
     for key in pairs(pending) do
-        if positiveID(key) then
-            local doc = documents['achievements:'..(tonumber(key) % ACHIEVEMENT_PARTS + 1)]
-            local row = doc and doc.rows[key]
-            enqueue(key, row and row[6] or '')
-        end
+        if positiveID(key) then enqueue(key, achievementCatalog[key] or '') end
     end
     if #categories > 256 then complete = false end
     for index = 1, math.min(#categories, 256) do
@@ -466,9 +489,8 @@ local function achievements(epoch)
         if generation.achievements ~= epoch then return end
         local key, category = queue[index][1], queue[index][2]
         for dependent in pairs(achievementDependents[key] or {}) do
-            local doc = documents['achievements:'..(tonumber(dependent) % ACHIEVEMENT_PARTS + 1)]
-            local row = doc and doc.rows[dependent]
-            if row then enqueue(dependent, row[6]) end
+            local dependentCategory = achievementCatalog[dependent]
+            if dependentCategory then enqueue(dependent, dependentCategory) end
         end
         local id, name, points, completed, month, day, year, description = GetAchievementInfo(tonumber(key))
         if positiveID(id) == key and clean(name) ~= '' then
@@ -494,8 +516,7 @@ local function achievements(epoch)
                     achievementDependents[related][key] = true
                     -- Known objectives need not be scanned just because their
                     -- parent changed; new hidden objectives still get discovered.
-                    local doc = documents['achievements:'..(tonumber(related) % ACHIEVEMENT_PARTS + 1)]
-                    if full or not doc or not doc.rows[related] then enqueue(related, category) end
+                    if full or not achievementCatalog[related] then enqueue(related, category) end
                 end
                 coroutine.yield()
                 if generation.achievements ~= epoch then return end
@@ -508,13 +529,23 @@ local function achievements(epoch)
             end
             local pointText = achievementNumber(points)
             if pointText == '' then coverage = 'partial' end
-            local row = {key, clean(name), achievementFlag(completed), pointText, clean(description, 500),
-                category, date, expected, coverage, json(criteria)}
+            achievementCatalog[key] = category
+            -- Upload only achievements with some progress: completed, or a criterion
+            -- credited or counted. Most of the list is untouched; those are counted in
+            -- the detail instead. Descriptions stay out (the name identifies each one).
+            local touched = completed and true or false
+            for _, c in ipairs(criteria) do
+                if c[3] == '1' or (c[4] ~= '' and c[4] ~= '0') then touched = true; break end
+            end
             local part = tonumber(key) % ACHIEVEMENT_PARTS + 1
-            local bytes = #json(row)
-            if sizes[part] + bytes <= MAX_BYTES - 2000 then
-                groups[part][key] = row; sizes[part] = sizes[part] + bytes
-            else complete = false end
+            if touched then
+                local row = {key, clean(name), achievementFlag(completed), pointText, '',
+                    category, date, expected, coverage, json(criteria)}
+                local bytes = #json(row)
+                if sizes[part] + bytes <= MAX_BYTES - 2000 then
+                    groups[part][key] = row; sizes[part] = sizes[part] + bytes
+                else complete = false end
+            else omitted[part], untouched[key] = omitted[part] + 1, true end
             if coverage ~= 'complete' then complete = false end
         else complete = false end
         index = index + 1
@@ -532,6 +563,8 @@ local function achievements(epoch)
             local rows = {}
             for key, row in pairs(groups[part]) do
                 if json(row) ~= json(previous.rows[key] or {}) then changed = true end
+                -- A first step on a left-out achievement: one fewer left out.
+                if not previous.rows[key] then achievementOmitted[part] = math.max(0, (achievementOmitted[part] or 1) - 1) end
                 rows[key] = row; coroutine.yield()
             end
             if changed then
@@ -540,7 +573,7 @@ local function achievements(epoch)
                     coroutine.yield()
                 end
                 generation[section] = epoch
-                store(section, rows, previous.status, previous.detail, epoch)
+                store(section, rows, previous.status, achievementDetail(part, not previous.detail:find(INCOMPLETE_NOTE, 1, true)), epoch)
             end
         end
         finish(); return
@@ -550,12 +583,11 @@ local function achievements(epoch)
     for part = 1, ACHIEVEMENT_PARTS do
         if generation.achievements ~= epoch then return end
         local section = 'achievements:'..part
-        local detail = 'API-listed player achievements and individual criteria; part '..part..'/'..ACHIEVEMENT_PARTS
-            ..'. Criteria completion is earned credit, not current bag contents. Blank progress is unknown; hidden/unlisted achievements are not inferred.'
+        achievementOmitted[part] = omitted[part]
+        local detail = achievementDetail(part, complete)
         if not complete then
-            detail = detail..' Incomplete API data or scan limit; includes prior observations. Absence does not prove incomplete.'
             for key, row in pairs(documents[section] and documents[section].rows or {}) do
-                if not groups[part][key] then
+                if not groups[part][key] and not untouched[key] then
                     local previous = {}; for i, value in ipairs(row) do previous[i] = value end
                     previous[9] = 'partial'; groups[part][key] = previous
                 end
@@ -660,6 +692,8 @@ function NS.CharacterFields(fields)
             bundle.docs[section] = doc
         end
     end
+    -- Missing snapshots may upload in windows (an older companion ignores the field).
+    if next(bundle.docs) then fields[#fields+1] = {'window', UPLOAD_WINDOW} end
     fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts are event-cached observations. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
     fields[#fields+1] = {'ctx', 'Snapshot labels: coverage and freshness are separate. Complete + cached means a complete scan from when that profession was last open, NOT a filtered scan. Active recipe filters, if any, are recorded in that snapshot detail. Older files can describe a different filter state.'}
     if not GetNumCompanions or not GetCompanionInfo then
@@ -724,22 +758,45 @@ local function uploadBody(job)
         end
         return doc.body
     end
-    -- Older installations may not yet have an acknowledged baseline.
-    job.usedPatch = doc.patch ~= nil
-    return doc.patch or doc.body
+    -- Older installations may not yet have an acknowledged baseline. The companion can only
+    -- tell it lacks the patch's base once every page has arrived, and then the whole document
+    -- follows anyway: try the patch only when it is much smaller than the document.
+    job.usedPatch = doc.patch ~= nil and #doc.patch * 2 < #doc.body
+    return job.usedPatch and doc.patch or doc.body
+end
+-- The upload window a companion that supports them accepts: a "window|N" line among the
+-- snapshots it lacks. Nil means one page per confirmation.
+local function windowOf(text)
+    local size = tonumber(text:match('\nwindow|(%d+)\n') or text:match('\nwindow|(%d+)$'))
+    return size and math.max(1, math.min(UPLOAD_WINDOW, size)) or nil
+end
+-- A manifest's list of the snapshots the companion lacks ("\1ABCTX1\n", then section|revision
+-- lines): the missing sections and the window, or nil and why the list is invalid.
+local function neededSections(reply, bundle)
+    local missing = {}
+    for line in reply:sub(9):gmatch('[^\n]+') do
+        if not line:match('^window|%d+$') then
+            local section, rev = line:match('^([^|]+)|([%x]+%-%d+)$')
+            local doc = section and bundle.docs[section]
+            if not doc or doc.revision ~= rev or missing[section] then return nil, 'Invalid cache response.' end
+            missing[section] = true
+        end
+    end
+    if not next(missing) then return nil, 'Empty cache response.' end
+    return missing, windowOf(reply)
 end
 function NS.CharacterNeed(request, text)
     if text:sub(1, 8) ~= '\1ABCTX1\n' then return false end
     local bundle = requests[request]
     if not bundle or not NS.S.context then return true end
     bundle.queued = bundle.queued or {}
-    local added = false
+    local added, window = false, windowOf(text)
     for line in text:sub(9):gmatch('[^\n]+') do
         local section, rev = line:match('^([^|]+)|([%x]+%-%d+)$')
         local doc = section and bundle.docs[section]
         if doc and doc.revision == rev and not bundle.queued[section] then
             bundle.queued[section] = true
-            uploads[#uploads+1] = {parent = request, section = section, doc = doc, owner = bundle.owner}
+            uploads[#uploads+1] = {parent = request, section = section, doc = doc, owner = bundle.owner, window = window}
             added = true
         end
     end
@@ -764,6 +821,8 @@ end
 local function probeManifest(job)
     local bundle = requests[job.parent]
     local fields = {{'character', bundle.owner}, {'probe', 'manifest'}}
+    -- Ask for upload windows; a companion from before them rejects the field (see below).
+    if not job.noWindow then fields[#fields+1] = {'window', UPLOAD_WINDOW} end
     for _, section in ipairs(keys(bundle.docs)) do
         local doc = bundle.docs[section]
         fields[#fields+1] = {'snapshot', section..'|'..doc.revision..'|'..doc.seen..'|cached'}
@@ -773,30 +832,27 @@ local function probeManifest(job)
     local ok = NS.BeginRequest(seq, nil, function(reply, state)
         if not requests[job.parent] then active = nil; return end
         active = nil
-        if state == 5 and reply == 'Character data rejected: Invalid character page header' then
+        if state == 5 and reply == 'Character data rejected: Invalid character cache manifest' and not job.noWindow then
+            -- A companion from before upload windows: ask again without one.
+            table.insert(uploads, 1, {parent = job.parent, manifest = true, noWindow = true})
+            return
+        elseif state == 5 and reply == 'Character data rejected: Invalid character page header' then
             -- An older companion can still sync safely until it is restarted.
             manual.count, manual.cached = 0, 0
             for _, section in ipairs(keys(bundle.docs)) do
                 uploads[#uploads+1] = {parent = job.parent, section = section, doc = bundle.docs[section], owner = bundle.owner, probe = true}
             end
         elseif state == 4 and (reply == 'ABCTX_OK' or reply:sub(1, 8) == '\1ABCTX1\n') then
-            local missing = {}
+            local missing, window = {}, nil
             if reply ~= 'ABCTX_OK' then
-                for line in reply:sub(9):gmatch('[^\n]+') do
-                    local section, rev = line:match('^([^|]+)|([%x]+%-%d+)$')
-                    local doc = section and bundle.docs[section]
-                    if not doc or doc.revision ~= rev or missing[section] then
-                        failSync(job.parent, 'Invalid cache response.'); return
-                    end
-                    missing[section] = true
-                end
-                if not next(missing) then failSync(job.parent, 'Empty cache response.'); return end
+                missing, window = neededSections(reply, bundle)
+                if not missing then failSync(job.parent, window); return end
             end
             manual.count, manual.cached = 0, 0
             for _, section in ipairs(keys(bundle.docs)) do
                 local doc = bundle.docs[section]
                 if missing[section] then
-                    uploads[#uploads+1] = {parent = job.parent, section = section, doc = doc, owner = bundle.owner}
+                    uploads[#uploads+1] = {parent = job.parent, section = section, doc = doc, owner = bundle.owner, window = window}
                 else
                     rememberSynced(bundle.owner, section, doc)
                     manual.cached = manual.cached + 1
@@ -825,15 +881,39 @@ local function uploadStep()
     active = job
     if job.manifest then probeManifest(job); return end
     local pages = {}
-    local function sendPage(index)
+    -- Pages go out in windows: up to job.window pages share the strip, and only the last
+    -- one is watched. A companion that supports windows confirms that page once all of
+    -- the window's pages are stored (or reports the first failure), so a window costs one
+    -- confirmation instead of one per page; each confirmation loads a font file.
+    local function sendWindow(first)
         if not requests[job.parent] then active = nil; return end
         NS.StripTransferProgress(job.parent)
-        local seq = NS.NextRequest(); job.request = seq
-        local fields = {{'character', job.owner}, {'section', job.section}, {'revision', job.doc.revision},
-                        {'page', index}, {'total', #pages}}
-        if job.probe then fields[#fields+1] = {'probe', '1'} end
-        -- Leave room for several retransmissions when capture misses fragments.
+        local last = math.min(#pages, first + (job.probe and 1 or job.window or 1) - 1)
+        local seqs, prompts, frameCount = {}, {}, 0
+        for index = first, last do seqs[#seqs+1] = NS.NextRequest() end
+        for i, s in ipairs(seqs) do
+            local page = first + i - 1
+            local fields = {{'character', job.owner}, {'section', job.section}, {'revision', job.doc.revision},
+                            {'page', page}, {'total', #pages}}
+            if job.probe then fields[#fields+1] = {'probe', '1'} end
+            if page == last and #seqs > 1 then fields[#fields+1] = {'window', table.concat(seqs, ',', 1, #seqs - 1)} end
+            prompts[i] = NS.EncodeCharacter(NS.Envelope(fields, pages[page]), NS.session, s)
+            frameCount = frameCount + #prompts[i]
+        end
+        local seq = seqs[#seqs]
+        job.request, job.windowSeqs = seq, seqs
+        -- The first look comes once every queued fragment has been on screen (with a margin);
+        -- if the window is still arriving then, look again soon (the last page was probably just
+        -- landing), and after that once per sweep, when missed fragments come round again.
+        local looks = 0
+        local function pace()
+            looks = looks + 1
+            return looks == 1 and 8 or NS.StripSweepSeconds() + 1
+        end
+        -- Leave room for several retransmissions when capture misses fragments: a
+        -- sweep of the window at the slow, stalled pace, and then some.
         local ok = NS.BeginRequest(seq, nil, function(reply, state)
+            for _, s in ipairs(seqs) do NS.AckPrompt(s) end
             if not requests[job.parent] then active = nil; return end
             NS.StripTransferProgress(job.parent)
             if state ~= 4 or reply ~= 'ABCTX_OK' then
@@ -847,7 +927,7 @@ local function uploadStep()
                     forgetSynced(job.owner, job.section, job.baseRevision)
                     job.full = true; table.insert(uploads, 1, job)
                 else failSync(job.parent, reply) end
-            elseif index < #pages then sendPage(index+1)
+            elseif last < #pages then sendWindow(last + 1)
             else
                 rememberSynced(job.owner, job.section, job.doc); active = nil
                 if manual and manual.request == job.parent then
@@ -856,12 +936,13 @@ local function uploadStep()
                 end
             end
             resumeParent(job.parent)
-        end, 240)
+        end, 240 + frameCount * .35 * 4 / 3, pace)
         if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
-        NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, pages[index]), NS.session, seq), true)
-        NS.SetStatus('Syncing '..job.section..' ('..index..'/'..#pages..')...')
+        for i, s in ipairs(seqs) do NS.QueuePrompt(s, prompts[i], true) end
+        NS.PaceRequest(seq, NS.StripSweepSeconds() * 1.1 + 3)
+        NS.SetStatus('Syncing '..job.section..' ('..(first == last and first or first..'-'..last)..'/'..#pages..')...')
     end
-    job.start = function() sendPage(1) end
+    job.start = function() sendWindow(1) end
     job.prepare = coroutine.create(function()
         rowHashes(job.doc)
         job.usedPatch, job.baseRevision = nil, nil
@@ -877,7 +958,10 @@ end
 function NS.CharacterContextOff()
     for request in pairs(requests) do failSync(request, 'Context sharing was turned off.') end
     if manual then finishManual('Character sync cancelled: context sharing was turned off.') end
-    if active and active.request then NS.AckPrompt(active.request); NS.ForgetRequest(active.request) end
+    if active and active.request then
+        for _, s in ipairs(active.windowSeqs or {active.request}) do NS.AckPrompt(s) end
+        NS.ForgetRequest(active.request)
+    end
     active = nil
     if tasks.achievements then achievementPending.full = true end
     uploads, tasks = {}, {}
@@ -1050,7 +1134,11 @@ local function manualStep()
         if scanErrors[section] and not dirty[section] and not tasks[section] then
             finishManual('Character sync stopped: '..section..' scan failed. Click Sync to retry.'); return
         end
-        if dirty[section] or dirty[target] or tasks[section] or (section ~= 'achievements' and not documents[target]) then pending = true end
+        local waiting = dirty[section] or dirty[target]
+        -- A criteria sweep waiting out its interval does not hold up a sync: the last pass
+        -- finished, and in busy play another tick always arrives before it settles.
+        if section == 'achievements' and waiting and not tasks[section] and sweepOnly() and dirty.achievements > GetTime() then waiting = false end
+        if waiting or tasks[section] or (section ~= 'achievements' and not documents[target]) then pending = true end
     end
     if pending then
         if GetTime() >= manual.deadline then

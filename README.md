@@ -324,9 +324,13 @@ character snapshots using ordinary game APIs:
   pet; slots 1–4 are stabled pets. Names, families, levels and talent trees are
   recorded. Closing the stable stops scanning and marks the observation cached.
   An unopened stable is unscanned, never assumed empty.
-- **Achievements and criteria:** achievement names, descriptions, completion,
-  points, dates and categories, plus each named criterion's completion flag,
-  quantity and required quantity. This includes individual Dalaran fishing coins,
+- **Achievements and criteria:** achievement names, completion, points, dates
+  and categories, plus each named criterion's completion flag, quantity and
+  required quantity, for every achievement with some progress (completed, or a
+  criterion credited or counted). Achievements with no progress at all, usually
+  most of the list, are counted per partition rather than uploaded, and
+  descriptions are left out; the name identifies each achievement. This keeps a
+  first sync to roughly a seventh of the full catalog. Criteria include individual Dalaran fishing coins,
   collection lists, progress counters and meta-achievement objectives. Credit
   remains visible after a collected item leaves your bags. Asset IDs are kept
   with their criterion type; they are not automatically treated as item IDs.
@@ -362,9 +366,13 @@ refreshes on login, achievement-earned and criteria-update events. Login, manual
 sync and a received achievement list perform full audits. Achievement-earned events
 refresh the named achievement, its tier chain and dependent meta achievements.
 Criteria-update events have no achievement ID on 3.3.5, so they sweep the cached
-catalog, including completed achievements that may have optional criteria. This
-avoids re-enumerating categories and rebuilding unchanged partitions. Bursts are
+catalog, including completed achievements that may have optional criteria and
+achievements that were left out for having no progress yet. This avoids
+re-enumerating categories and rebuilding unchanged partitions. Such sweeps start
+at most every 30 seconds, since kills, loot and quest steps fire the event
+constantly; earned achievements and login audits run at once. Bursts are
 coalesced; events during a scan schedule a follow-up pass instead of restarting it.
+A sweep waiting out its 30 seconds does not hold up a manual sync.
 Incomplete API results fall back to the full reader to preserve coverage labels.
 Keep your own profession window open to refresh its recipes, and keep the hunter
 stable open to refresh stable pets. Other saved recipes and stable observations
@@ -385,7 +393,20 @@ character/section in `characterSynced`; scans do not advance that cache. Only a
 complete snapshot/probe acknowledgement or an accepted prompt confirms a baseline.
 Partial page acknowledgements, failures and cancellations do not. If the companion
 loses its baseline or rejects a patch, sync retries once with a full document.
-Patch preparation is spread across frames. Large achievement
+Without a confirmed baseline, a patch is tried only when it is under half the
+document's size, because a rejected patch is only detected after all its pages.
+Patch preparation is spread across frames.
+
+**Upload windows.** Documents travel in 5 KB pages, and every confirmation the
+game reads costs a font load (a brief stall). So pages go up to six at a time:
+the window shares the strip, and only its last page is watched. That page names
+the others, and the companion confirms it once all of them are stored, or reports
+the first failure. The addon waits until every queued fragment has been on
+screen before looking, looks once more shortly after if the window is still
+arriving, and after that once per strip sweep. A seven-page section that used to
+take about 90 reply reads now takes about five. A companion from before windows
+rejects the offer in the manifest; the addon then asks again without it and
+confirms page by page. Large achievement
 baselines can take longer over the pixel channel. Let the scan finish and then
 `/reload` to write it to SavedVariables for a faster file import on the next sync.
 After installing this feature, restart the companion once and `/reload` the addon;

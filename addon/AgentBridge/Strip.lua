@@ -88,6 +88,17 @@ function NS.AckPrompt(request)
     end
 end
 function NS.ClearPrompts() pending, recovery = {}, {}; rebuild() end
+-- Seconds one full sweep of everything queued takes: a step every .15 s (.35 s once a page
+-- has stalled), three of every four carrying a fragment.
+function NS.StripSweepSeconds()
+    local interval, now = .15, GetTime()
+    for _, item in ipairs(pending) do
+        if item.character and not item.held and now - item.started >= math.max(12, #frames * .4 + 8) then
+            interval = .35; break
+        end
+    end
+    return #frames * interval * 4 / 3
+end
 
 local function wanted()
     return NS.IsReceiving() or (#frames > 0 and GetTime() - lastSubmit < 120)

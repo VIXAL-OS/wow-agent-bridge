@@ -296,15 +296,16 @@ def render_frame(frame, cell=4, alpha=1.0, background=None):
 class Assembler:
     """Collect typed fragments; repeated optical frames are expected and harmless."""
 
-    def __init__(self, clock=time.monotonic, parser=parse_prompt):
+    def __init__(self, clock=time.monotonic, parser=parse_prompt, expiry=180):
         self.parser = parser
         self.pending = {}
         self.clock = clock
+        self.expiry = expiry
 
     def accept(self, frame):
         key, part, total, chunk = self.parser(frame)
         now = self.clock()
-        self.pending = {k: v for k, v in self.pending.items() if now - v[0] < 180}
+        self.pending = {k: v for k, v in self.pending.items() if now - v[0] < self.expiry}
         if key not in self.pending:
             if len(self.pending) >= 64:
                 self.pending.pop(next(iter(self.pending)))
