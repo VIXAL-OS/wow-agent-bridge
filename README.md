@@ -297,7 +297,7 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 
 Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes game state to Claude Code as part of the system prompt, and to Codex and Hermes ahead of your message, marked as data about your character rather than instructions.
 
-**Gear, bags, learned recipes, pets, mounts and achievements.** With context enabled, the addon maintains
+**Gear, bags, learned recipes, pets, mounts, reputations and achievements.** With context enabled, the addon maintains
 character snapshots using ordinary game APIs:
 
 - **Gear:** equipped slots 0–19, item names, full item strings (including enchant
@@ -324,6 +324,12 @@ character snapshots using ordinary game APIs:
   pet; slots 1–4 are stabled pets. Names, families, levels and talent trees are
   recorded. Closing the stable stops scanning and marks the observation cached.
   An unopened stable is unscanned, never assumed empty.
+- **Reputations:** every faction the Reputation pane lists, with its category
+  (and sub-group, such as Alliance Vanguard), standing, progress within the
+  standing, total reputation, and whether you are at war with it or watching it.
+  Updates follow reputation changes. A collapsed header hides its factions from
+  the game's API, and the addon never expands headers for you, so a collapsed
+  header makes the snapshot partial and keeps those factions as last seen.
 - **Achievements and criteria:** achievement names, completion, points, dates
   and categories, plus each named criterion's completion flag, quantity and
   required quantity, for every achievement with some progress (completed, or a
@@ -361,7 +367,7 @@ supersede older files and filter warnings in the agent conversation.
 Click **Sync** in the bottom button row, just left of **Retry**, or type `/ab sync`, to
 rescan and upload character data without starting an agent or spending a prompt.
 It refreshes gear, carried bags, mounts, companion pets, the active combat pet,
-and achievements with their individual criteria. Achievement progress also
+reputations and achievements with their individual criteria. Achievement progress also
 refreshes on login, achievement-earned and criteria-update events. Login, manual
 sync and a received achievement list perform full audits. Achievement-earned events
 refresh the named achievement, its tier chain and dependent meta achievements.

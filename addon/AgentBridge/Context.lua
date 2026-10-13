@@ -425,6 +425,66 @@ local function stablepets(epoch)
     store('stablepets', rows, complete and 'complete' or 'partial',
         'Hunter stable observed while open; slot 0 is the current/dismissed pet; slots 1-4 are stabled. Slot 0 may duplicate the active pet.', epoch)
 end
+-- Reputations: every faction the Reputation pane lists, by pane row, with its standing, its progress within the
+-- standing and its total. The pane's own state decides the list: a collapsed header hides its factions, and expanding
+-- headers behind the user's back would change their UI, so a collapsed header makes the scan partial and keeps the
+-- factions last seen under it.
+local REPUTATION_DETAIL = 'Reputation pane factions: standing (1 Hated .. 8 Exalted), progress within the standing '
+    ..'(earned of needed) and total reputation. Category is the pane header, a sub-group after " > ".'
+local function repNumber(value)
+    local n = tonumber(value)
+    return n and n == math.floor(n) and math.abs(n) <= 2147483647 and n or nil
+end
+local function reputations(epoch)
+    local total = tonumber(GetNumFactions())
+    if not total or total < 0 or total ~= math.floor(total) then
+        store('reputations', {}, 'unavailable', 'Faction count unavailable; absence does not mean no standing.', epoch); return
+    end
+    local rows, complete, collapsed, category, group = {}, total <= MAX_ROWS, {}, '', ''
+    for index = 1, math.min(total, MAX_ROWS) do
+        local name, _, standing, low, high, value, atWar, _, isHeader, isCollapsed, hasRep, isWatched, isChild = GetFactionInfo(index)
+        name = clean(name, 100)
+        if name == '' then complete = false
+        else
+            if isHeader then
+                if isChild then group = name else category, group = name, '' end
+                if isCollapsed then collapsed[#collapsed+1] = name end
+            elseif not isChild then group = '' end
+            if not isHeader or hasRep then
+                standing, low, high, value = repNumber(standing), repNumber(low), repNumber(high), repNumber(value)
+                if not standing or standing < 1 or standing > 8 or not low or not high or not value
+                    or high <= low or value < low or value > high or rows[name] then
+                    complete = false
+                else
+                    local flags = {}
+                    if isHeader then flags[#flags+1] = 'group' end
+                    if atWar then flags[#flags+1] = 'at war' end
+                    if isWatched then flags[#flags+1] = 'watched' end
+                    local where = (isChild and not isHeader and group ~= '') and category..' > '..group or category
+                    rows[name] = {name, clean(where, 200), tostring(standing), clean(_G['FACTION_STANDING_LABEL'..standing], 40),
+                        string.format('%.0f', value - low), string.format('%.0f', high - low), string.format('%.0f', value),
+                        table.concat(flags, ', ')}
+                end
+            end
+        end
+        coroutine.yield()
+    end
+    if tonumber(GetNumFactions()) ~= total then mark('reputations'); return end
+    local detail = REPUTATION_DETAIL
+    if #collapsed > 0 or not complete then
+        -- The note first: a long header list is what the detail's length limit cuts.
+        detail = detail..' Partial scan; includes factions last seen; absence does not mean no standing.'
+        if #collapsed > 0 then
+            detail = detail..' Collapsed in the Reputation pane, so their factions were not listed: '..table.concat(collapsed, ', ')..'.'
+        end
+        complete = false
+        for key, row in pairs(documents.reputations and documents.reputations.rows or {}) do
+            if not rows[key] then rows[key] = row end
+            coroutine.yield()
+        end
+    end
+    store('reputations', rows, complete and 'complete' or 'partial', detail, epoch)
+end
 local function achievementNumber(value)
     local n = tonumber(value)
     return n and n >= 0 and n <= 9007199254740991 and n == math.floor(n) and string.format('%.0f', n) or ''
@@ -694,12 +754,13 @@ function NS.CharacterFields(fields)
     end
     -- Missing snapshots may upload in windows (an older companion ignores the field).
     if next(bundle.docs) then fields[#fields+1] = {'window', UPLOAD_WINDOW} end
-    fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts are event-cached observations. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
+    fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts/reputations are event-cached observations. Reputations cover the factions the Reputation pane lists; a collapsed header hides its own. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
     fields[#fields+1] = {'ctx', 'Snapshot labels: coverage and freshness are separate. Complete + cached means a complete scan from when that profession was last open, NOT a filtered scan. Active recipe filters, if any, are recorded in that snapshot detail. Older files can describe a different filter state.'}
     if not GetNumCompanions or not GetCompanionInfo then
         fields[#fields+1] = {'ctx', 'Mount and companion-pet collection APIs unavailable; do not infer an empty collection.'}
     end
     if not UnitExists then fields[#fields+1] = {'ctx', 'Active combat-pet API unavailable; do not infer no pet.'} end
+    if not GetNumFactions or not GetFactionInfo then fields[#fields+1] = {'ctx', 'Reputation APIs unavailable; do not infer no standing.'} end
     if not achievementAPIs() then fields[#fields+1] = {'ctx', 'Achievement APIs unavailable; achievement progress is unknown.'} end
     if dirty.gear or dirty.bags then fields[#fields+1] = {'ctx', 'Inventory scan pending; cached inventory may be stale. Send again after the scan finishes.'} end
     for section in pairs(scanErrors) do fields[#fields+1] = {'ctx', section..' scan failed; do not treat cached data as current.'} end
@@ -999,7 +1060,7 @@ local function loadOwner()
         for section, baseline in pairs(savedSync) do
             sections = sections + 1; if sections > 32 then break end
             local allowed = type(section) == 'string' and #section <= 120 and
-                (section == 'gear' or section == 'bags' or section == 'combatpet' or SAVED_COLLECTIONS[section]
+                (section == 'gear' or section == 'bags' or section == 'combatpet' or section == 'reputations' or SAVED_COLLECTIONS[section]
                     or achievementSection(section) or section:sub(1, 8) == 'recipes:')
             if allowed and type(baseline) == 'table' and type(baseline.revision) == 'string'
                 and #baseline.revision <= 32 and baseline.revision:match('^%x+%-%d+$')
@@ -1034,7 +1095,7 @@ local function loadOwner()
             end
         end
     end
-    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet'); markAchievements(true)
+    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); markAchievements(true)
 end
 local driver = CreateFrame('Frame')
 for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UNIT_INVENTORY_CHANGED', 'BAG_UPDATE',
@@ -1042,12 +1103,14 @@ for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UN
     'TRADE_SKILL_CLOSE', 'SKILL_LINES_CHANGED', 'COMPANION_LEARNED', 'COMPANION_UNLEARNED', 'COMPANION_UPDATE',
     'UNIT_PET', 'UNIT_NAME_UPDATE', 'UNIT_LEVEL', 'PET_UI_UPDATE', 'PET_UI_CLOSE', 'PET_TALENT_UPDATE',
     'PET_STABLE_SHOW', 'PET_STABLE_UPDATE', 'PET_STABLE_UPDATE_PAPERDOLL', 'PET_STABLE_CLOSED',
-    'ACHIEVEMENT_EARNED', 'CRITERIA_UPDATE', 'RECEIVED_ACHIEVEMENT_LIST'}) do pcall(driver.RegisterEvent, driver, event) end
+    'ACHIEVEMENT_EARNED', 'CRITERIA_UPDATE', 'RECEIVED_ACHIEVEMENT_LIST', 'UPDATE_FACTION'}) do pcall(driver.RegisterEvent, driver, event) end
 driver:SetScript('OnEvent', function(_, event, unit)
     if event == 'PLAYER_ENTERING_WORLD' then loadOwner() end
     if event == 'ACHIEVEMENT_EARNED' then markAchievements(false, positiveID(unit)); return end
     if event == 'CRITERIA_UPDATE' then markAchievements(false); return end
     if event == 'RECEIVED_ACHIEVEMENT_LIST' then markAchievements(true); return end
+    -- A standing changed, or a Reputation pane header was expanded or collapsed (the listed factions change).
+    if event == 'UPDATE_FACTION' then mark('reputations'); return end
     if event == 'UNIT_INVENTORY_CHANGED' and unit ~= 'player' then return end
     if event:find('COMPANION_') == 1 then
         if unit == 'MOUNT' then mark('mounts')
@@ -1080,7 +1143,7 @@ driver:SetScript('OnEvent', function(_, event, unit)
     elseif event == 'BAG_UPDATE' then mark('bags')
     else
         mark('gear'); mark('bags')
-        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet'); markAchievements(true) end
+        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); markAchievements(true) end
         if event == 'SKILL_LINES_CHANGED' then
             for section in pairs(documents) do if section:sub(1, 8) == 'recipes:' then dirty[section] = GetTime() end end
             recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5
@@ -1089,13 +1152,15 @@ driver:SetScript('OnEvent', function(_, event, unit)
 end)
 local scanners = {gear = gear, bags = bags, recipes = recipes, achievements = achievements,
     mounts = function(epoch) companions('mounts', epoch) end,
-    pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets}
+    pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets,
+    reputations = reputations}
 local function scannerAvailable(section)
     return section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
         or section == 'recipes' and recipeIdentity()
         or section == 'achievements' and achievementAPIs()
         or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
         or section == 'combatpet' and UnitExists
+        or section == 'reputations' and GetNumFactions and GetFactionInfo
         or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
 end
 function NS.SyncCharacter()
@@ -1121,7 +1186,7 @@ function NS.SyncCharacter()
     local message = 'Scanning character data for sync...'
     if InCombatLockdown and InCombatLockdown() then message = 'Character sync queued; scanning will start after combat.' end
     NS.SetStatus(message)
-    NS.Print('Sync includes gear, bags, mounts, pets, achievements with criteria, and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
+    NS.Print('Sync includes gear, bags, mounts, pets, reputations, achievements with criteria, and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
     return true, message
 end
 local function manualStep()
