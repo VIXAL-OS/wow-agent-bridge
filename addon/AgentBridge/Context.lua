@@ -485,6 +485,95 @@ local function reputations(epoch)
     end
     store('reputations', rows, complete and 'complete' or 'partial', detail, epoch)
 end
+-- Currencies: every token the Currency tab lists (emblems, badges, marks, seals, honor and arena points...) with
+-- the count held, plus money. A collapsed header hides its tokens from the API, so collapsed headers are expanded,
+-- read and collapsed again within the same frame: the tab looks as the player left it. That fires currency events
+-- of its own, which are ignored for a moment so the scan does not repeat itself.
+local CURRENCY_DETAIL = 'Currency tab tokens with the counts held, plus money (count in copper). Category is the tab header.'
+local currencyList, currencyQuiet = true, -1000
+local function currencyCount(value, limit)
+    local n = tonumber(value)
+    return n and n >= 0 and n <= (limit or 2147483647) and n == math.floor(n) and string.format('%.0f', n) or nil
+end
+local function readCurrencies(rows)
+    local complete, expanded, total = true, {}, tonumber(GetCurrencyListSize())
+    if not total or total < 0 or total > 400 or total ~= math.floor(total) then return false end
+    -- Expand top-down (each header's tokens then follow it), restore bottom-up (indices above stay put).
+    local index = 1
+    while index <= math.min(tonumber(GetCurrencyListSize()) or 0, 400) do
+        local name, isHeader, isExpanded = GetCurrencyListInfo(index)
+        if isHeader and not isExpanded and ExpandCurrencyList and name then
+            -- Before expanding: the client may fire its currency event at once.
+            currencyQuiet, expanded[name] = GetTime(), true
+            ExpandCurrencyList(index, 1)
+        end
+        index = index + 1
+    end
+    local category, count = '', tonumber(GetCurrencyListSize()) or 0
+    if count > 400 then complete, count = false, 400 end
+    for i = 1, count do
+        local name, isHeader, isExpanded, isUnused, isWatched, held, extra, _, itemID = GetCurrencyListInfo(i)
+        name = clean(name, 100)
+        if name == '' then complete = false
+        elseif isHeader then
+            category = name
+            if not isExpanded then complete = false end
+        else
+            local id = currencyCount(itemID)
+            local key = extra == 1 and 'arena' or extra == 2 and 'honor' or id and id ~= '0' and 'item:'..id or 'name:'..name
+            local amount = currencyCount(held)
+            if not amount or rows[key] then complete = false
+            else
+                local flags = {}
+                if isWatched then flags[#flags+1] = 'watched' end
+                if isUnused then flags[#flags+1] = 'unused' end
+                rows[key] = {key, name, clean(category, 100), amount, key:sub(1, 5) == 'item:' and key:sub(6) or '',
+                    table.concat(flags, ', ')}
+            end
+        end
+    end
+    for i = math.min(tonumber(GetCurrencyListSize()) or 0, 400), 1, -1 do
+        local name, isHeader, isExpanded = GetCurrencyListInfo(i)
+        if isHeader and isExpanded and name and expanded[name] then ExpandCurrencyList(i, 0) end
+    end
+    if next(expanded) then currencyQuiet = GetTime() end
+    return complete
+end
+local function currencies(epoch)
+    local rows, complete, detail = {}, true, CURRENCY_DETAIL
+    if GetCurrencyListSize and GetCurrencyListInfo then
+        if currencyList or not documents.currencies then
+            currencyList = false
+            -- One frame, no yields: the list is short, and expanded headers must not outlive it.
+            local ok, result = pcall(readCurrencies, rows)
+            if not ok or not result then complete = false end
+        else
+            -- Only money changed: keep the tokens as last read.
+            for key, row in pairs(documents.currencies.rows) do
+                if key ~= 'money' then rows[key] = row end
+            end
+            complete = documents.currencies.status == 'complete'
+        end
+    else complete, detail = false, detail..' Currency list API unavailable.' end
+    -- Honor and arena points are in the list on 3.3.5; read them directly if they are not.
+    if not rows.honor and GetHonorCurrency then
+        local amount = currencyCount(GetHonorCurrency())
+        if amount then rows.honor = {'honor', 'Honor Points', 'Player vs. Player', amount, '', ''} end
+    end
+    if not rows.arena and GetArenaCurrency then
+        local amount = currencyCount(GetArenaCurrency())
+        if amount then rows.arena = {'arena', 'Arena Points', 'Player vs. Player', amount, '', ''} end
+    end
+    local money = currencyCount(GetMoney and GetMoney(), 9007199254740991)
+    if money then rows.money = {'money', 'Money', '', money, '', ''} else complete = false end
+    if not complete then
+        detail = detail..' Partial scan; includes currencies last seen; absence does not mean none held.'
+        for key, row in pairs(documents.currencies and documents.currencies.rows or {}) do
+            if not rows[key] then rows[key] = row end
+        end
+    end
+    store('currencies', rows, complete and 'complete' or 'partial', detail, epoch)
+end
 local function achievementNumber(value)
     local n = tonumber(value)
     return n and n >= 0 and n <= 9007199254740991 and n == math.floor(n) and string.format('%.0f', n) or ''
@@ -754,13 +843,14 @@ function NS.CharacterFields(fields)
     end
     -- Missing snapshots may upload in windows (an older companion ignores the field).
     if next(bundle.docs) then fields[#fields+1] = {'window', UPLOAD_WINDOW} end
-    fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts/reputations are event-cached observations. Reputations cover the factions the Reputation pane lists; a collapsed header hides its own. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
+    fields[#fields+1] = {'ctx', 'Gear/bags/pets/mounts/reputations/currencies are event-cached observations. Reputations cover the factions the Reputation pane lists; a collapsed header hides its own. Currencies cover the Currency tab and money. Unlisted recipe professions are unscanned; open each profession to scan. Bank/mail/keyring are not included. Combat pet is the active pet only; an unopened hunter stable is unscanned.'}
     fields[#fields+1] = {'ctx', 'Snapshot labels: coverage and freshness are separate. Complete + cached means a complete scan from when that profession was last open, NOT a filtered scan. Active recipe filters, if any, are recorded in that snapshot detail. Older files can describe a different filter state.'}
     if not GetNumCompanions or not GetCompanionInfo then
         fields[#fields+1] = {'ctx', 'Mount and companion-pet collection APIs unavailable; do not infer an empty collection.'}
     end
     if not UnitExists then fields[#fields+1] = {'ctx', 'Active combat-pet API unavailable; do not infer no pet.'} end
     if not GetNumFactions or not GetFactionInfo then fields[#fields+1] = {'ctx', 'Reputation APIs unavailable; do not infer no standing.'} end
+    if not GetCurrencyListSize or not GetCurrencyListInfo then fields[#fields+1] = {'ctx', 'Currency list API unavailable; do not infer no currencies.'} end
     if not achievementAPIs() then fields[#fields+1] = {'ctx', 'Achievement APIs unavailable; achievement progress is unknown.'} end
     if dirty.gear or dirty.bags then fields[#fields+1] = {'ctx', 'Inventory scan pending; cached inventory may be stale. Send again after the scan finishes.'} end
     for section in pairs(scanErrors) do fields[#fields+1] = {'ctx', section..' scan failed; do not treat cached data as current.'} end
@@ -1087,7 +1177,8 @@ local function loadOwner()
         for section, baseline in pairs(savedSync) do
             sections = sections + 1; if sections > 32 then break end
             local allowed = type(section) == 'string' and #section <= 120 and
-                (section == 'gear' or section == 'bags' or section == 'combatpet' or section == 'reputations' or SAVED_COLLECTIONS[section]
+                (section == 'gear' or section == 'bags' or section == 'combatpet' or section == 'reputations'
+                    or section == 'currencies' or SAVED_COLLECTIONS[section]
                     or achievementSection(section) or section:sub(1, 8) == 'recipes:')
             if allowed and type(baseline) == 'table' and type(baseline.revision) == 'string'
                 and #baseline.revision <= 32 and baseline.revision:match('^%x+%-%d+$')
@@ -1122,7 +1213,9 @@ local function loadOwner()
             end
         end
     end
-    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); markAchievements(true)
+    currencyList = true
+    mark('gear'); mark('bags'); mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); mark('currencies')
+    markAchievements(true)
 end
 local driver = CreateFrame('Frame')
 for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UNIT_INVENTORY_CHANGED', 'BAG_UPDATE',
@@ -1130,7 +1223,10 @@ for _, event in ipairs({'PLAYER_ENTERING_WORLD', 'PLAYER_EQUIPMENT_CHANGED', 'UN
     'TRADE_SKILL_CLOSE', 'SKILL_LINES_CHANGED', 'COMPANION_LEARNED', 'COMPANION_UNLEARNED', 'COMPANION_UPDATE',
     'UNIT_PET', 'UNIT_NAME_UPDATE', 'UNIT_LEVEL', 'PET_UI_UPDATE', 'PET_UI_CLOSE', 'PET_TALENT_UPDATE',
     'PET_STABLE_SHOW', 'PET_STABLE_UPDATE', 'PET_STABLE_UPDATE_PAPERDOLL', 'PET_STABLE_CLOSED',
-    'ACHIEVEMENT_EARNED', 'CRITERIA_UPDATE', 'RECEIVED_ACHIEVEMENT_LIST', 'UPDATE_FACTION'}) do pcall(driver.RegisterEvent, driver, event) end
+    'ACHIEVEMENT_EARNED', 'CRITERIA_UPDATE', 'RECEIVED_ACHIEVEMENT_LIST', 'UPDATE_FACTION',
+    'CURRENCY_DISPLAY_UPDATE', 'KNOWN_CURRENCY_TYPES_UPDATE', 'HONOR_CURRENCY_UPDATE', 'PLAYER_MONEY'}) do
+    pcall(driver.RegisterEvent, driver, event)
+end
 driver:SetScript('OnEvent', function(_, event, unit)
     if event == 'PLAYER_ENTERING_WORLD' then loadOwner() end
     if event == 'ACHIEVEMENT_EARNED' then markAchievements(false, positiveID(unit)); return end
@@ -1138,6 +1234,12 @@ driver:SetScript('OnEvent', function(_, event, unit)
     if event == 'RECEIVED_ACHIEVEMENT_LIST' then markAchievements(true); return end
     -- A standing changed, or a Reputation pane header was expanded or collapsed (the listed factions change).
     if event == 'UPDATE_FACTION' then mark('reputations'); return end
+    -- Money alone needs no list read; a token change does. Our own header expansion fires these too.
+    if event == 'PLAYER_MONEY' then mark('currencies'); return end
+    if event == 'CURRENCY_DISPLAY_UPDATE' or event == 'KNOWN_CURRENCY_TYPES_UPDATE' or event == 'HONOR_CURRENCY_UPDATE' then
+        if GetTime() - currencyQuiet > 1 then currencyList = true; mark('currencies') end
+        return
+    end
     if event == 'UNIT_INVENTORY_CHANGED' and unit ~= 'player' then return end
     if event:find('COMPANION_') == 1 then
         if unit == 'MOUNT' then mark('mounts')
@@ -1170,7 +1272,10 @@ driver:SetScript('OnEvent', function(_, event, unit)
     elseif event == 'BAG_UPDATE' then mark('bags')
     else
         mark('gear'); mark('bags')
-        if event == 'PLAYER_ENTERING_WORLD' then mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); markAchievements(true) end
+        if event == 'PLAYER_ENTERING_WORLD' then
+            mark('mounts'); mark('pets'); mark('combatpet'); mark('reputations'); currencyList = true; mark('currencies')
+            markAchievements(true)
+        end
         if event == 'SKILL_LINES_CHANGED' then
             for section in pairs(documents) do if section:sub(1, 8) == 'recipes:' then dirty[section] = GetTime() end end
             recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5
@@ -1180,7 +1285,7 @@ end)
 local scanners = {gear = gear, bags = bags, recipes = recipes, achievements = achievements,
     mounts = function(epoch) companions('mounts', epoch) end,
     pets = function(epoch) companions('pets', epoch) end, combatpet = combatpet, stablepets = stablepets,
-    reputations = reputations}
+    reputations = reputations, currencies = currencies}
 local function scannerAvailable(section)
     return section == 'gear' and GetInventoryItemLink or section == 'bags' and GetContainerNumSlots
         or section == 'recipes' and recipeIdentity()
@@ -1188,6 +1293,7 @@ local function scannerAvailable(section)
         or COLLECTIONS[section] and GetNumCompanions and GetCompanionInfo
         or section == 'combatpet' and UnitExists
         or section == 'reputations' and GetNumFactions and GetFactionInfo
+        or section == 'currencies' and GetCurrencyListSize and GetCurrencyListInfo
         or section == 'stablepets' and stableOpen and GetNumStableSlots and GetStablePetInfo
 end
 function NS.SyncCharacter()
@@ -1206,14 +1312,17 @@ function NS.SyncCharacter()
             if section == 'recipes' then
                 recipeEpoch = recipeEpoch + 1; dirty.recipes = GetTime() + .5; dirty[target] = GetTime()
             elseif section == 'achievements' then mark(section); achievementPending.full = true
-            else mark(section) end
+            else
+                if section == 'currencies' then currencyList = true end
+                mark(section)
+            end
         end
     end
     if NS.SyncButton then NS.SyncButton:SetText('Syncing...'); NS.SyncButton:Disable() end
     local message = 'Scanning character data for sync...'
     if InCombatLockdown and InCombatLockdown() then message = 'Character sync queued; scanning will start after combat.' end
     NS.SetStatus(message)
-    NS.Print('Sync includes gear, bags, mounts, pets, reputations, achievements with criteria, and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
+    NS.Print('Sync includes gear, bags, mounts, pets, reputations, currencies, achievements with criteria, and saved recipes. Keep your own profession open to refresh its recipes; other professions stay cached. Hunter stable pets refresh only while the stable is open.')
     return true, message
 end
 local function manualStep()

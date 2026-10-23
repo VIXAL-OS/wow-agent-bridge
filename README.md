@@ -298,7 +298,7 @@ A reply that finishes while you are not reading it — the panel is closed, or y
 
 Anything you link is spelled out with its ID, followed by the text of its in-game tooltip (up to six links, 700 bytes each, as room allows), so the agent answers from the item's actual stats. The companion passes game state to Claude Code as part of the system prompt, and to Codex and Hermes ahead of your message, marked as data about your character rather than instructions.
 
-**Gear, bags, learned recipes, pets, mounts, reputations and achievements.** With context enabled, the addon maintains
+**Gear, bags, learned recipes, pets, mounts, reputations, currencies and achievements.** With context enabled, the addon maintains
 character snapshots using ordinary game APIs:
 
 - **Gear:** equipped slots 0–19, item names, full item strings (including enchant
@@ -331,6 +331,15 @@ character snapshots using ordinary game APIs:
   Updates follow reputation changes. A collapsed header hides its factions from
   the game's API, and the addon never expands headers for you, so a collapsed
   header makes the snapshot partial and keeps those factions as last seen.
+- **Currencies:** every token on the Currency tab with the count you hold (emblems of
+  Frost, Triumph, Conquest, Valor and Heroism, honor and arena points, Stone Keeper's
+  Shards, Wintergrasp marks, Champion's Seals, Dalaran Cooking Awards, Badges of
+  Justice, battleground marks...), its tab header and item ID, plus your money. A
+  collapsed header hides its tokens from the game's API, so the addon expands it,
+  reads it and collapses it again in the same frame: the tab looks as you left it.
+  Updates follow currency and money events; a money change rereads nothing else and
+  travels as a one-row patch. The agent sees every count in its context directly,
+  without opening the snapshot file.
 - **Achievements and criteria:** achievement names, completion, points, dates
   and categories, plus each named criterion's completion flag, quantity and
   required quantity, for every achievement with some progress (completed, or a
@@ -368,7 +377,7 @@ supersede older files and filter warnings in the agent conversation.
 Click **Sync** in the bottom button row, just left of **Retry**, or type `/ab sync`, to
 rescan and upload character data without starting an agent or spending a prompt.
 It refreshes gear, carried bags, mounts, companion pets, the active combat pet,
-reputations and achievements with their individual criteria. Achievement progress also
+reputations, currencies and achievements with their individual criteria. Achievement progress also
 refreshes on login, achievement-earned and criteria-update events. Login, manual
 sync and a received achievement list perform full audits. Achievement-earned events
 refresh the named achievement, its tier chain and dependent meta achievements.
@@ -596,6 +605,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - selectable transcript snapshots, streaming selection stability and clickable source rows
 - native item/spell hyperlink events, Shift-click insertion, uncached items and link-row resizing
 - a sync whose confirmations are lost after every page arrived: it keeps waiting, shows the companion's out-of-sight note and finishes once the strip is visible; a held prompt never takes a slot announcement from its uploads; a silent companion fails with that reason
+- currency snapshots: collapsed headers expanded and restored without a rescan loop, money-only patches, partial scans
 - chats tagged with their character, the per-character list filter, and older chats placed by the companion (or left untagged by an older one)
 
 Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.
