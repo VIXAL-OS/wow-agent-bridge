@@ -10,6 +10,9 @@ can overwhelm low-opacity pairs, which the frame checksum then rejects.
   CPBN  receive control   20-byte header + 20-byte control + padding + Adler-32
 Companion -> WoW: 4096-byte packets carried by font glyph advance widths.
   CFN2  reply fragment    32-byte header + 4060-byte padded chunk + Adler-32
+        state 8 = companion status for request 0: written ahead into the slots the addon
+        reads next when the companion has lost sight of the strip, saying why. Older
+        addons treat request 0 as a stale packet.
 Multi-byte integers are big endian.
 """
 from dataclasses import dataclass
@@ -38,6 +41,8 @@ MAX_PARTS = 127
 MAX_TEXT = 60000
 BANK_SIZE = 65535
 STATES = {'waiting': 0, 'queued': 1, 'working': 2, 'streaming': 3, 'done': 4, 'failed': 5, 'interrupted': 6}
+STATUS_STATE = 8
+STATUS_CODES = ('minimized', 'nowindow', 'paused', 'printwindow', 'frozen')
 
 
 def adler(data):
@@ -217,13 +222,27 @@ def make_reply_packet(session, request, slot, part, state, encoded):
     return body + adler(body)
 
 
+def status_text(code, message, now):
+    """A companion status: which problem (a STATUS_CODES entry), when, and what to tell the player."""
+    if code not in STATUS_CODES:
+        raise ValueError('Unknown status code')
+    return f'\x01status={code}\nat={int(now)}\x02{message}'.encode('utf-8')[:REPLY_CHUNK]
+
+
+def make_status_packet(session, slot, code, message, now):
+    """A status for whichever request reads this slot (request 0)."""
+    return make_reply_packet(session, 0, slot, 1, STATUS_STATE, status_text(code, message, now))
+
+
 def parse_reply_packet(data):
     """Reference parser mirroring the addon's Lua validation (used by tests)."""
     if len(data) != REPLY_SIZE or adler(data[:-4]) != data[-4:]:
         raise ValueError('Invalid reply checksum')
     magic, version, state, length, session, request, slot, revision, part, total = REPLY_HEADER.unpack(data[:32])
-    if magic != b'CFN2' or version != 2 or state > 7 or length > REPLY_CHUNK:
+    if magic != b'CFN2' or version != 2 or state > STATUS_STATE or length > REPLY_CHUNK:
         raise ValueError('Invalid reply header')
+    if state == STATUS_STATE and (request != 0 or part != 1 or total != 1):
+        raise ValueError('Invalid status packet')
     return dict(state=state, session=session.hex(), request=request, slot=slot, revision=revision,
                 part=part, total=total, text=data[32:32 + length])
 

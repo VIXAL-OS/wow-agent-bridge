@@ -122,7 +122,8 @@ class Sim:
         self.character = CharacterStore(self.browser.db, self.addon.parent / 'character-cache')
         self.character_pending, self.character_frames = {}, 0
         self.client = Client(self.addon, scale, rounding)
-        self.native = NativeBridge(self.addon, clock=lambda: self.t)
+        # The addon's time() is 1758000000 + GetTime() in the stub; companion status notes carry that clock.
+        self.native = NativeBridge(self.addon, clock=lambda: self.t, wall=lambda: 1758000000 + self.t)
         self.assembler = Assembler(clock=lambda: self.t)
         self.jobs, self.writes, self.companion_on = {}, 0, True
         self.optical_filter = None

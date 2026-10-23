@@ -192,6 +192,8 @@ class StripLocator:
         self.game_dir, self.clock = Path(game_dir), clock
         self.windows, self.locked, self.refreshed, self.last_ok = [], None, -1e9, -1e9
         self.aspect = None
+        # Why no window is usable: the game runs but every window is minimized, or none is found.
+        self.running = self.minimized = False
 
     def refresh(self, force=False):
         now = self.clock()
@@ -199,7 +201,11 @@ class StripLocator:
             return
         self.refreshed = now
         self.aspect = gx_aspect(self.game_dir)
-        self.windows = [w for w in game_windows(game_processes(self.game_dir)) if not w.minimized and w.height > 0]
+        pids = game_processes(self.game_dir)
+        found = game_windows(pids)
+        self.running = bool(pids)
+        self.minimized = bool(found) and all(w.minimized for w in found)
+        self.windows = [w for w in found if not w.minimized and w.height > 0]
         if self.locked and self.locked[0] not in self.windows:
             self.locked = None
 

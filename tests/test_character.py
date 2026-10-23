@@ -91,7 +91,7 @@ class CharacterCache(unittest.TestCase):
         assembler = Assembler(parser=parse_character_frame)
         app = SimpleNamespace(last_frame_at=0, last_attempt=0, frames=0, capture_mode='screen',
                               capture_status=Mock(), last_status='', character=self.store,
-                              character_assembler=assembler, assembler=Mock(), scheduler=Mock())
+                              character_assembler=assembler, assembler=Mock(), scheduler=Mock(), native=None)
         for frame in frames:
             self.assertEqual(frame_kind(frame), 'character')
             app.grab_frame = lambda frame=frame: (frame, (None, 'manual', (0, 0, 512, 32)))

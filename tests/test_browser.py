@@ -76,7 +76,7 @@ class Browser(unittest.TestCase):
         app = SimpleNamespace(last_frame_at=0, last_attempt=0, frames=0, capture_mode='screen',
                               capture_status=Mock(), last_status='', browser=self.browser,
                               url_assembler=Assembler(parser=parse_url_frame), assembler=Mock(),
-                              scheduler=Mock(), write=Mock())
+                              scheduler=Mock(), write=Mock(), native=None)
         for _ in range(3):
             for frame in encode_url('https://example.org/source', b'abcdefgh', 3):
                 app.grab_frame = lambda frame=frame: (frame, (None, 'manual', (0, 0, 512, 32)))

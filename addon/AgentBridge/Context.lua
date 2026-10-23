@@ -799,12 +799,30 @@ local function finishManual(message)
 end
 local function failSync(request, reason)
     if manual and manual.request == request then
-        finishManual('Character sync failed: '..reason..' Click Sync to retry.'); return
+        finishManual('Character sync failed: '..reason..' Click Sync to retry; snapshots already uploaded are kept.'); return
     end
     requests[request] = nil
     NS.AckPrompt(request); NS.ForgetRequest(request)
-    NS.ShowReply(request, 'Character sync failed: '..reason..' Send the prompt again to retry.', 5, true)
-    NS.SetStatus('Character sync failed. The agent was not started; send again to retry.')
+    NS.ShowReply(request, 'Character sync failed: '..reason..' Click Retry to send the prompt again; snapshots already uploaded are kept.', 5, true)
+    NS.SetStatus('Character sync failed. The agent was not started; click Retry to send again.')
+end
+-- How long a sync step waits for its confirmation. The companion keeps every page it has
+-- stored, so waiting longer never loses work: the step keeps its pages on the strip and looks
+-- again. It extends while the companion's answers show progress; a companion that reports it
+-- cannot see the strip is alive, so it gets more patience (the sync carries on by itself once
+-- WoW is visible again) than one that never answers.
+local SYNC_RETRIES, BLIND_RETRIES, SILENT_RETRIES = 2, 4, 1
+local function keepWaiting(step, base)
+    return function(job, reason)
+        if not requests[step.parent] then return nil end
+        if job.progressAt and GetTime() - job.progressAt < base then return base end
+        step.stalls = (step.stalls or 0) + 1
+        local limit = job.status and BLIND_RETRIES or job.answered > 0 and SYNC_RETRIES or SILENT_RETRIES
+        if step.stalls > limit then return nil end
+        local message = 'Character sync is still waiting ('..step.stalls..'/'..limit..'): '..reason
+        NS.SetStatus(NS.Escape(message)); NS.Print(NS.Escape(message))
+        return (job.answered > 0 or job.status) and base or base / 2
+    end
 end
 local function uploadBody(job)
     local doc, section = job.doc, job.section
@@ -864,6 +882,11 @@ function NS.CharacterNeed(request, text)
     -- The companion already has this prompt. Give snapshot pages the strip,
     -- then repeat the prompt after all its uploads so only a fresh send runs it.
     if added then NS.HoldPrompt(request, true) end
+    -- Nothing new comes from the prompt itself until its uploads are done: stop reading it, so
+    -- every slot announcement goes to the uploads' confirmations.
+    local uploading = active and active.parent == request
+    for _, job in ipairs(uploads) do uploading = uploading or job.parent == request end
+    if uploading then NS.HoldRequest(request, true) end
     NS.ShowReply(request, 'Syncing character snapshots with the companion...', 0, true)
     return true
 end
@@ -878,6 +901,7 @@ local function resumeParent(request)
         return
     end
     NS.HoldPrompt(request, false)
+    NS.HoldRequest(request, false)
 end
 local function probeManifest(job)
     local bundle = requests[job.parent]
@@ -921,7 +945,7 @@ local function probeManifest(job)
             end
         else failSync(job.parent, reply); return end
         resumeParent(job.parent)
-    end, 240)
+    end, 240, nil, keepWaiting({parent = job.parent}, 240))
     if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
     NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, 'ABCTX_PROBE'), NS.session, seq), true)
     NS.SetStatus('Checking character sync cache...')
@@ -972,7 +996,10 @@ local function uploadStep()
             return looks == 1 and 8 or NS.StripSweepSeconds() + 1
         end
         -- Leave room for several retransmissions when capture misses fragments: a
-        -- sweep of the window at the slow, stalled pace, and then some.
+        -- sweep of the window at the slow, stalled pace, and then some. Past that, the
+        -- window keeps waiting while the companion makes progress or reports why it cannot
+        -- see the strip (keepWaiting), instead of failing the whole sync.
+        local timeout = 240 + frameCount * .35 * 4 / 3
         local ok = NS.BeginRequest(seq, nil, function(reply, state)
             for _, s in ipairs(seqs) do NS.AckPrompt(s) end
             if not requests[job.parent] then active = nil; return end
@@ -997,7 +1024,7 @@ local function uploadStep()
                 end
             end
             resumeParent(job.parent)
-        end, 240 + frameCount * .35 * 4 / 3, pace)
+        end, timeout, pace, keepWaiting({parent = job.parent}, timeout))
         if not ok then active = nil; failSync(job.parent, 'Reply channel unavailable.'); return end
         for i, s in ipairs(seqs) do NS.QueuePrompt(s, prompts[i], true) end
         NS.PaceRequest(seq, NS.StripSweepSeconds() * 1.1 + 3)

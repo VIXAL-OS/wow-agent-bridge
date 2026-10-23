@@ -22,7 +22,7 @@ from .agents import BACKENDS, GUIDANCE, AgentConfig, Job, run_agent
 from .auctions import AuctionCache, auction_guidance
 from .browser import BrowserRequests
 from .character import CharacterStore
-from .capture import grab, grab_window
+from .capture import FrozenWatch, grab, grab_window
 from .launching import claude_models, codex_models, find_claude, find_codex, find_hermes
 from .hermes import model_choices as hermes_models
 from .native import NativeBridge, validate_addon
@@ -34,6 +34,20 @@ from .wow import EpochKeeper, StripLocator, game_dir_for
 
 LABELS = {'queued': 'Queued', 'working': 'Working', 'streaming': 'Writing', 'done': 'Done',
           'failed': 'Failed', 'interrupted': 'Interrupted'}
+
+# Why the strip is out of sight, as told to the game (see NativeBridge.blind) and shown here.
+# Only causes the companion can tell for certain; an idle addon simply hides its strip.
+BLIND = {
+    'minimized': 'WoW is minimized, so the companion cannot see the strip. Restore the game window; '
+                 'the transfer carries on by itself.',
+    'nowindow': 'The companion cannot find the WoW window.',
+    'paused': 'Capture is paused in the companion. Click Start capture there; the transfer carries on by itself.',
+    'printwindow': 'WoW is covered by another window and the companion cannot read it (window capture '
+                   'failed). Bring WoW to the front.',
+    'frozen': 'WoW is covered by another window and window capture shows a frozen picture. '
+              'Bring WoW to the front.',
+}
+BLIND_AFTER = 5  # seconds without a readable frame before telling the game why
 
 
 WORKERS, MAX_OPEN = 3, 16  # agents running at once; prompts accepted but not finished
@@ -269,8 +283,10 @@ class App:
         self.pending_resume = (resume, self.settings['backend'], True) if resume else None
         self.picker_lock = threading.Lock()
         self.frames, self.retry_at, self.last_status = 0, 0.0, None
-        self.last_frame_at = self.last_attempt = self.window_at = -1e9
+        self.last_frame_at = self.last_attempt = self.window_at = self.blind_posted = -1e9
         self.capture_mode = 'screen'
+        self.blind_reason, self.window_problem, self.frozen_watch = None, None, FrozenWatch()
+        self.pending_status = None
         self.native = self.epoch = self.locator = None
         self.auctions, self.auction_stop = None, threading.Event()
         self.banner = ReplyBanner(root, self.open_window)
@@ -605,6 +621,9 @@ class App:
                     self.banner.show('Agent replied' if state == 'done' else 'Agent needs attention', text)
 
     def grab_frame(self):
+        # Set whenever a cause of not seeing the strip is certain (see BLIND); None otherwise,
+        # including when the addon is idle and its strip is simply hidden.
+        self.blind_reason = None
         if self.manual.get():
             try:
                 x, y, w, h = map(int, self.crop.get().split(','))
@@ -616,7 +635,13 @@ class App:
             self.locator.refresh()
             crops = self.locator.crops()
             if not crops:
-                self.capture_status.set('WoW window not found (running, visible, not minimized?)'); return None
+                if self.locator.minimized:
+                    self.blind_reason = 'minimized'
+                    self.capture_status.set('WoW is minimized: the strip cannot be read until it is restored.')
+                else:
+                    self.blind_reason = 'nowindow' if self.locator.running else None
+                    self.capture_status.set('WoW window not found (running, visible, not minimized?)')
+                return None
         else:
             return None
         found = self.decode_from_screen(crops)
@@ -634,6 +659,7 @@ class App:
             if found:
                 self.capture_mode = 'window'
                 return found
+        self.blind_reason = self.window_problem
         if self.locator and not self.manual.get():
             self.locator.failure()
         return None
@@ -667,6 +693,7 @@ class App:
         try:
             image = grab_window(window.hwnd, window.width, window.height)
         except OSError:
+            self.window_problem = 'printwindow'
             return None
         for crop in crops:
             if crop[0] is not window:
@@ -677,8 +704,25 @@ class App:
             except ValueError:
                 continue
             self.locator.success(crop)
+            self.window_problem = None
             return frame, crop
+        # No strip in a live picture means the addon is not showing one; a black or frozen
+        # picture means window capture cannot see the game at all. Only worth checking while
+        # the addon may still be waiting for something.
+        recent = self.native is not None and self.native.was_active and \
+            time.monotonic() - self.native.control_at < self.native.STATUS_WINDOW
+        self.window_problem = 'frozen' if recent and self.frozen_watch.frozen(image) else None
         return None
+
+    def report_blind(self, reason, now):
+        """Tell the game why the strip is out of sight (at most once a second; the publisher
+        decides whether any slot needs writing)."""
+        if (self.native is None or reason not in BLIND or now - self.last_frame_at < BLIND_AFTER
+                or now - self.blind_posted < 1):
+            return
+        self.blind_posted = now
+        self.pending_status = reason
+        self.publish_wanted.set()
 
     def publish(self, control):
         """Hand the newest control frame to the publisher thread.
@@ -697,12 +741,18 @@ class App:
             self.publish_wanted.wait()
             self.publish_wanted.clear()
             item, self.pending_publish = self.pending_publish, None
-            if item is None or self.native is None:
+            blind, self.pending_status = self.pending_status, None
+            native = self.native
+            if native is None:
                 continue
-            control, snapshot = item
             try:
-                if self.native.accept(control, snapshot):
-                    self.last_status = f'wrote slot {control.slot} (part {control.part}) for prompt {control.request}'
+                if item is not None:
+                    control, snapshot = item
+                    if native.accept(control, snapshot):
+                        self.last_status = f'wrote slot {control.slot} (part {control.part}) for prompt {control.request}'
+                elif blind is not None:
+                    if native.blind(blind, BLIND[blind]):
+                        self.last_status = f'told the game why the strip is out of sight ({blind})'
             except OSError:
                 # A sharing violation while the game reads a file is transient.
                 self.retry_at = time.monotonic() + 1
@@ -717,6 +767,8 @@ class App:
                 self.epoch_tick()
             if self.capturing:
                 self.capture_tick()
+            else:
+                self.report_blind('paused', time.monotonic())
         except Exception as exc:  # Keep the loop alive; show what went wrong.
             self.capture_status.set(f'Capture error: {exc}')
         if not self.closed:
@@ -738,11 +790,17 @@ class App:
         self.last_attempt = now
         found = self.grab_frame()
         if not found:
-            if self.frames:
+            if self.blind_reason in ('printwindow', 'frozen'):
+                self.capture_status.set(BLIND[self.blind_reason])
+            elif self.frames and not self.blind_reason:
                 self.capture_status.set('Strip not visible (idle between prompts, or covered). Waiting…')
+            if self.blind_reason:
+                self.report_blind(self.blind_reason, now)
             return
         frame, crop = found
         self.frames, self.last_frame_at = self.frames + 1, now
+        if self.native is not None:
+            self.native.seen()
         where = crop[1] if crop[0] is None else f'{crop[1]} of WoW window'
         how = 'reading the window directly (WoW is covered)' if self.capture_mode == 'window' else 'on screen'
         self.capture_status.set(f'Strip at {where}, {how}; {self.frames} frames. {self.last_status or ""}')

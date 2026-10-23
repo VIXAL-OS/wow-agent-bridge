@@ -418,6 +418,39 @@ baselines can take longer over the pixel channel. Let the scan finish and then
 After installing this feature, restart the companion once and `/reload` the addon;
 the companion must recognize achievement snapshots and cache probes.
 
+**When the companion loses sight of the strip.** Uploads are confirmed through the
+font channel, which needs the companion to see the strip's control frame in time.
+WoW minimized, or covered while window capture cannot read it, breaks only that
+return leg: pages keep arriving whenever they can be read, but confirmations do not.
+Four things keep a sync alive through that:
+- A capture loop that runs in step with the strip (the companion polls every 0.3 s,
+  two strip steps, while it sees nothing) sees a fixed subset of positions. Each sweep
+  of the strip therefore repeats a few fragments until its length shares no factor
+  with 3, 5 or 7, so those positions walk over every fragment. The old one-fragment
+  shift per sweep missed fragments forever whenever there were 3k+1 of them.
+- While a prompt's snapshots upload, the prompt itself is not read (nothing new can
+  come from it until they are done), so every slot announcement goes to the upload's
+  confirmation, with up to 30 seconds' notice instead of a few.
+- A sync step that passes its timeout keeps waiting instead of failing: its pages stay
+  on the strip and everything the companion stored stays stored. It keeps waiting while
+  the companion's answers show progress, up to four more timeouts while the companion
+  reports it cannot see the strip (the sync carries on by itself once WoW is visible),
+  two when it answers without progress, and one short one when it never answers.
+- The companion tells the game why it cannot see the strip: WoW minimized, capture
+  paused, the game window not found, window capture failing, or window capture showing
+  a frozen picture. It writes that note into the next few font slots the addon will
+  read (the addon reads slots in order and loads each once), refreshing it while the
+  outage lasts; the addon shows it in the status line and under a waiting prompt, and
+  ignores notes more than two minutes old. These are request-0 status packets (state 8);
+  an older addon reads them as stale packets.
+
+If a sync does give up, the message says which of these happened: the companion's
+note, *the companion never answered*, unreadable replies, or a transfer that did not
+finish and what the companion last said. Snapshots already confirmed are kept, so
+**Retry** (or **Sync**) uploads only what is still missing.
+Install order: restart the companion with the new code first, then `/reload`. Only a new
+companion writes status notes, and an older one rejects a snapshot section it does not know.
+
 **Aux auction history stays on the companion.** A background worker checks the
 selected game's `WTF/Account/*/SavedVariables/aux-addon.lua` every 15 seconds and
 imports changed files into `state/auctions`. No auction data uses the pixel strip,
@@ -537,7 +570,7 @@ Reply text is escaped and cannot run as code or perform a game action. A web sou
 In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
 
 **Limits:**
-- WoW may be covered or in the background, but not minimized: a minimized window stops rendering, so nothing can be read.
+- WoW may be covered or in the background, but not minimized: a minimized window stops rendering, so nothing can be read. Transfers wait for it to be restored, and the companion tells the game why it is waiting.
 - If WoW starts while the companion is not running, that game session continues from the saved slot instead of recycling. With 65,535 slots, that is rarely a problem.
 
 ## Tests
@@ -561,6 +594,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - explicit browser-click delivery and acknowledgement, duplicate suppression, URL validation and offline timeout
 - selectable transcript snapshots, streaming selection stability and clickable source rows
 - native item/spell hyperlink events, Shift-click insertion, uncached items and link-row resizing
+- a sync whose confirmations are lost after every page arrived: it keeps waiting, shows the companion's out-of-sight note and finishes once the strip is visible; a held prompt never takes a slot announcement from its uploads; a silent companion fails with that reason
 
 Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.
 

@@ -59,6 +59,15 @@ end
 
 -- CFN2: 32-byte header, 4060-byte padded payload, Adler-32.
 -- State 7 is a 15-byte hybrid descriptor, only sent after v4 slot negotiation.
+-- State 8 is a companion status for request 0: the companion lost sight of the strip, so it
+-- wrote why into the slots read next, for whichever request reads them. Older addons see
+-- request 0 as a stale packet.
+local STATUS = 8
+local function addressed(head, session, request, slot)
+    local to = uint(head, 17, 4)
+    return head:sub(9, 16) == session and (to == request or to == 0 and head:byte(6) == STATUS)
+        and uint(head, 21, 4) == slot
+end
 function NS.ParseReply(data, session, request, slot)
     if #data ~= PACKET then return nil, 'Invalid reply packet' end
     if data == EMPTY then return nil, 'Empty reply slot' end
@@ -66,13 +75,12 @@ function NS.ParseReply(data, session, request, slot)
     if Adler(data:sub(1, PACKET-4)) ~= data:sub(PACKET-3) then return nil, 'Invalid reply checksum' end
     local state, length = data:byte(6), uint(data, 7, 2)
     local revision, part, total = uint(data, 25, 4), uint(data, 29, 2), uint(data, 31, 2)
-    if state > 7 or length > CHUNK or part < 1 or total < 1 or total > 127 or part > total then
+    if state > STATUS or length > CHUNK or part < 1 or total < 1 or total > 127 or part > total then
         return nil, 'Invalid reply fields'
     end
     if state == 7 and (part ~= 1 or total ~= 1 or length ~= 15) then return nil, 'Invalid hybrid packet' end
-    if data:sub(9, 16) ~= session or uint(data, 17, 4) ~= request or uint(data, 21, 4) ~= slot then
-        return nil, 'Stale reply packet'
-    end
+    if state == STATUS and (part ~= 1 or total ~= 1 or uint(data, 17, 4) ~= 0) then return nil, 'Invalid status packet' end
+    if not addressed(data, session, request, slot) then return nil, 'Stale reply packet' end
     if part < total and length ~= CHUNK then return nil, 'Short reply fragment' end
     if data:sub(33+length, PACKET-4):find('[^%z]') then return nil, 'Invalid reply padding' end
     return {state = state, revision = revision, part = part, total = total, text = data:sub(33, 32+length)}
@@ -85,10 +93,15 @@ function NS.PeekReply(head, session, request, slot)
     if #head < 32 then return nil, 'Invalid reply packet' end
     if head:sub(1, 32) == string.rep(ZERO, 32) then return nil, 'Empty reply slot' end
     if head:sub(1, 4) ~= 'CFN2' or head:byte(5) ~= 2 then return nil, 'Invalid reply packet' end
-    if head:sub(9, 16) ~= session or uint(head, 17, 4) ~= request or uint(head, 21, 4) ~= slot then
-        return nil, 'Stale reply packet'
-    end
+    if not addressed(head, session, request, slot) then return nil, 'Stale reply packet' end
     return {state = head:byte(6), revision = uint(head, 25, 4), part = uint(head, 29, 2), total = uint(head, 31, 2)}
+end
+
+-- A companion status: \1status=<code>\nat=<unix time>\2<message>. Nil when malformed.
+function NS.ParseStatus(text)
+    local code, at, message = text:match('^\1status=([%w%-]+)\nat=(%d+)\2(.*)$')
+    if not code then return nil end
+    return code, tonumber(at), NS.TrimUTF8((message:gsub('[%c|]', ' ')):sub(1, 240))
 end
 
 function NS.NewAssembly()

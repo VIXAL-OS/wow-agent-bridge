@@ -20,7 +20,7 @@ import time
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
-from .protocol import BANK_SIZE, REPLY_SIZE, REPLY_CHUNK, make_reply_packet, reply_text
+from .protocol import BANK_SIZE, REPLY_SIZE, REPLY_CHUNK, make_reply_packet, make_status_packet, reply_text
 from .hybrid import payload as hybrid_payload, slot_path, validate_source
 
 ADDON_NAME = 'AgentBridge'
@@ -264,11 +264,17 @@ class NativeBridge:
 
     MARGIN = 0.75
     REWRITE_EVERY = 1.0
+    # Losing sight of the strip: status notes go into the slots the addon reads next.
+    STATUS_SLOTS = 4       # written at once
+    STATUS_GROWTH = 30     # one more every this many seconds while sight stays lost (the
+    STATUS_MAX = 16        # addon reads at most one slot per look, with backoff)
+    STATUS_REFRESH = 45    # rewritten this often with a new time; the addon ignores old notes
+    STATUS_WINDOW = 900    # only for an addon seen receiving this recently
 
-    def __init__(self, directory, agent_label=lambda: 'The agent', clock=time.monotonic):
+    def __init__(self, directory, agent_label=lambda: 'The agent', clock=time.monotonic, wall=time.time):
         self.directory = validate_addon(directory)
         self.agent_label = agent_label
-        self.clock = clock
+        self.clock, self.wall = clock, wall
         for slot in (1, BANK_SIZE):
             if not font_path(self.directory, slot).is_file():
                 raise ValueError('Install the font bank first (tools.install_addon)')
@@ -280,6 +286,44 @@ class NativeBridge:
         self.slot, self.deadline, self.was_active = 0, 0, False
         self.written, self.written_at, self.frozen = None, 0, {}
         self.unavailable_hybrid = set()
+        self.control_at, self.outage = -1e9, None
+
+    def seen(self):
+        """The strip is in sight again: the next outage writes its own notes."""
+        self.outage = None
+
+    def blind(self, code, message):
+        """The strip is out of sight: write why into the slots the addon reads next.
+
+        Only while the addon was receiving: its last control frame was active and recent. The
+        slot it announced keeps a reply already written there; later slots are free, because
+        the addon reads slots in order and loads each one once. A note is a request-0 status
+        (see protocol.make_status_packet), so it answers whichever request reads it. Returns
+        how many slots were written.
+        """
+        now = self.clock()
+        if self.session is None or not self.was_active or now - self.control_at > self.STATUS_WINDOW:
+            return 0
+        outage = self.outage
+        if outage is None:
+            first = self.slot + (1 if self.written and self.written[:2] == (self.session, self.slot) else 0)
+            outage = self.outage = {'first': max(1, first), 'count': 0, 'code': None, 'at': -1e9, 'started': now}
+        want = min(self.STATUS_MAX, self.STATUS_SLOTS + int((now - outage['started']) // self.STATUS_GROWTH))
+        refresh = outage['code'] != code or now - outage['at'] >= self.STATUS_REFRESH
+        start = outage['first'] if refresh else outage['first'] + outage['count']
+        end = min(outage['first'] + want, BANK_SIZE + 1)
+        written = 0
+        for slot in range(start, end):
+            try:
+                atomic_write(font_path(self.directory, slot),
+                             make_font(make_status_packet(self.session, slot, code, message, self.wall()), slot))
+                written += 1
+            except OSError:
+                continue  # A slot the game is reading right now; the next refresh retries it.
+        outage['count'] = max(outage['count'], end - outage['first'])
+        if refresh:
+            outage['code'], outage['at'] = code, now
+        return written
 
     def accept(self, control, snapshot):
         if self.session != control.session:
@@ -288,6 +332,7 @@ class NativeBridge:
         if control.slot < self.slot:
             return False
         now = self.clock()
+        self.control_at = now
         deadline = now + control.remaining_ms / 1000 - self.MARGIN
         if control.slot != self.slot or (control.active and not self.was_active):
             self.deadline = deadline

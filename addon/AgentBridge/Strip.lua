@@ -36,7 +36,17 @@ end)
 
 -- Prompts repeat until the companion acknowledges them (any reply state past
 -- "waiting"), so a missed capture is recovered without resending by hand.
-local pending, frames, cursor, rotation = {}, {}, 1, 0
+local pending, frames, cursor, sweep = {}, {}, 0, 1
+-- One sweep shows every fragment once, then repeats the first few until its length shares no
+-- factor with 3, 5 or 7. A capture that samples every m-th strip step in lockstep sees a fixed
+-- set of positions modulo 3m/gcd(m, 4) data steps; with a sweep length coprime to that, those
+-- positions walk over every fragment within a few sweeps, whatever the fragment count. (Shifting
+-- each sweep by one fragment, as before, still missed fragments forever for counts of 3k+1.)
+local function sweepLength(n)
+    local length = n
+    while length % 3 == 0 or length % 5 == 0 or length % 7 == 0 do length = length + 1 end
+    return length
+end
 local recovery = {}
 function NS.StripStalled(request) recovery[request] = true end
 function NS.StripProgress(request) recovery[request] = nil end
@@ -61,12 +71,13 @@ end
 function NS.StripAlphaInfo() return preferred, alpha end
 local lastSubmit, lastData, lastAlpha, elapsed, tick = -1000, nil, nil, 0, 0
 local function rebuild()
-    frames, cursor, rotation = {}, 1, 0
+    frames, cursor = {}, 0
     for _, item in ipairs(pending) do
         if not item.held then
             for _, frame in ipairs(item.frames) do frames[#frames+1] = frame end
         end
     end
+    sweep = sweepLength(math.max(1, #frames))
 end
 function NS.HoldPrompt(request, hold)
     for _, item in ipairs(pending) do
@@ -97,7 +108,7 @@ function NS.StripSweepSeconds()
             interval = .35; break
         end
     end
-    return #frames * interval * 4 / 3
+    return (#frames > 0 and sweep or 0) * interval * 4 / 3
 end
 
 local function wanted()
@@ -150,12 +161,11 @@ driver:SetScript('OnUpdate', function(_, dt)
     if #frames == 0 or tick % 4 == 0 then
         data = NS.ControlFrame()
     else
-        -- Shift each retransmission by one fragment. A slower capture loop can
-        -- otherwise sample the same subset forever when its cadence lines up
-        -- with this strip, especially while the game is in the background.
-        data = frames[(cursor + rotation - 1) % #frames + 1]
-        cursor = cursor % #frames + 1
-        if cursor == 1 then rotation = (rotation + 1) % #frames end
+        -- A slower capture loop can line up with this strip, especially while the game is
+        -- in the background; the sweep length (see sweepLength) keeps it from sampling the
+        -- same subset forever.
+        data = frames[cursor % #frames + 1]
+        cursor = (cursor + 1) % sweep
     end
     if data == lastData and alpha == lastAlpha then return end
     NS.Profile('strip-paint', paint, data)

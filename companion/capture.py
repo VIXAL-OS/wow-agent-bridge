@@ -1,8 +1,32 @@
 """Copy one small screen rectangle (GDI BitBlt); Pillow's grab copies the whole desktop."""
 import ctypes
 import os
+import time
 
 from PIL import Image, ImageGrab
+
+
+class FrozenWatch:
+    """Notice window capture that returns a black or unchanging picture.
+
+    A running game redraws constantly, so a covered window whose captures stay identical (or
+    black) for a few seconds means window capture is not seeing the game, rather than that the
+    strip is simply not shown. Only a coarse thumbnail is compared, and nothing is kept.
+    """
+
+    def __init__(self, clock=time.monotonic, hold=3.0):
+        self.clock, self.hold = clock, hold
+        self.last, self.since = None, 0.0
+
+    def frozen(self, image):
+        thumb = image.reduce(max(1, min(image.width // 48, image.height // 27))).convert('L').tobytes()
+        now = self.clock()
+        if max(thumb) < 8:
+            return True
+        if thumb != self.last:
+            self.last, self.since = thumb, now
+            return False
+        return now - self.since >= self.hold
 
 if os.name == 'nt':
     from ctypes import wintypes

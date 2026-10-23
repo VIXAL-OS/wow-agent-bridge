@@ -159,7 +159,11 @@ end
 ---------------------------------------------------------------------------
 local slot, session, paused = 1, nil, false
 local reading
-local jobs = {}  -- [request] = {request, chat, assembly, due, expires, failures, missed, unchanged, lastRevision}
+-- [request] = {request, chat, assembly, due, expires, failures, missed, unchanged, lastRevision, held,
+--              answered, empty, stale, status, error, lastText, lastState, progressAt, stall}
+local jobs = {}
+-- A companion status older than this (seconds, by the clock both share) is an outdated note.
+local STATUS_FRESH = 120
 
 local function exhausted()
     local text = 'Reply channel used up for this game session. Restart WoW while the companion runs to recycle it.'
@@ -170,11 +174,33 @@ local function consume() slot = slot + 1; reading = nil end
 local function nextJob()
     local best
     for _, job in pairs(jobs) do
-        -- A job holding a long-reply announcement needs no more font slots.
-        if not job.hybrid and (not best or job.due < best.due) then best = job end
+        -- A job holding a long-reply announcement needs no more font slots, and a held one
+        -- (a prompt waiting for its character uploads) is not read until it is released.
+        if not job.hybrid and not job.held and (not best or job.due < best.due) then best = job end
     end
     return best
 end
+
+-- Why a request has not finished, from what its looks found: a status the companion wrote
+-- because it cannot see the strip, no answer at all, unreadable answers, or answers that never
+-- became final.
+local function describe(job)
+    if job.status then return 'The companion cannot see the strip: '..job.status.text end
+    if job.answered == 0 and job.error then
+        return 'Replies from the companion could not be read ('..job.error..').'
+    end
+    if job.answered == 0 and job.empty > 0 then
+        return 'The companion never answered. Check that it is running with capture on and WoW is not minimized.'
+    end
+    if job.answered > 0 then
+        local said = ((job.lastText or ''):match('^[^\n]*') or ''):gsub('|', '/')
+        if #said > 80 then said = NS.TrimUTF8(said:sub(1, 77))..'...' end
+        return 'The companion is running but the transfer did not finish'..(said ~= '' and (' (it last said: '..said..')') or '')
+            ..'. Keep WoW visible, not covered or minimized.'
+    end
+    return 'Companion acknowledgement timed out. Check that capture is enabled and WoW is not minimized.'
+end
+NS.DescribeRequest = function(request) return jobs[request] and describe(jobs[request]) end
 
 function NS.IsReceiving() return not paused and next(jobs) ~= nil end
 function NS.IsWaiting(request) return jobs[request] ~= nil end
@@ -191,12 +217,15 @@ function NS.Resume()
 end
 -- pace (optional): seconds until the next look while the reply is not final yet. Each look
 -- loads a font file, so an upload whose pages are still on the strip should not poll.
-function NS.BeginRequest(sequence, chat, callback, timeout, pace)
+-- stall (optional): called as stall(job, reason) when the timeout passes; returning a number of
+-- seconds keeps waiting that much longer (the next look comes soon), nil gives up.
+function NS.BeginRequest(sequence, chat, callback, timeout, pace, stall)
     if slot > SIZE then return false, exhausted() end
     local now = GetTime()
     session, paused = NS.session, false
     jobs[sequence] = {request = sequence, chat = chat, assembly = NS.NewAssembly(), due = now + FIRST_WINDOW,
-        expires = now + (timeout or WATCH_LIMIT), callback = callback, pace = pace, failures = 0, missed = 0, unchanged = 0}
+        expires = now + (timeout or WATCH_LIMIT), callback = callback, pace = pace, stall = stall,
+        failures = 0, missed = 0, unchanged = 0, answered = 0, empty = 0, stale = 0}
     NS.OnReceiveState(true)
     return true
 end
@@ -204,6 +233,19 @@ end
 function NS.PaceRequest(sequence, seconds)
     local job = jobs[sequence]
     if job and not (reading and reading.job == job) then job.due = GetTime() + seconds end
+end
+-- Stop reading a request's reply for now (hold), or start again soon. A prompt whose character
+-- snapshots are uploading has nothing new to say until they are done, and every look at it
+-- would take the slot announcement away from the upload's confirmation.
+function NS.HoldRequest(sequence, hold)
+    local job = jobs[sequence]
+    if not job or (job.held or false) == (hold or false) then return end
+    job.held = hold or nil
+    if not hold then
+        local now = GetTime()
+        job.due, job.missed = now + FIRST_WINDOW, 0
+        job.expires = math.max(job.expires, now + 600)
+    end
 end
 -- Stop watching a request (its chat was deleted); the companion keeps the reply.
 function NS.ForgetRequest(sequence)
@@ -240,7 +282,7 @@ local function settle(job, reason, text, state, complete)
     else NS.StripStalled(job.request) end
     if reason == 'Empty reply slot' then
         -- Nobody wrote this slot before it loaded (companion stopped, strip hidden).
-        job.missed, job.failures = job.missed + 1, 0
+        job.missed, job.failures, job.empty = job.missed + 1, 0, job.empty + 1
         job.due = now + math.min(30, 5 * 2^math.min(job.missed, 3))
         NS.SetStatus('Waiting for the companion. Is it running and capturing the strip? Retrying...')
         return
@@ -248,15 +290,16 @@ local function settle(job, reason, text, state, complete)
     if reason == 'Unchanged' then
         -- Nothing new since the last slot: poll again, a little less eagerly.
         job.failures, job.missed, job.unchanged = 0, 0, job.unchanged + 1
+        job.answered, job.status = job.answered + 1, nil
         job.due = now + math.min(MAX_POLL, POLL_WINDOW + job.unchanged * 1.5)
         return
     end
     if reason == 'Stale reply packet' then
-        job.failures = 0; job.due = now + FRAGMENT_WINDOW
+        job.failures, job.stale = 0, job.stale + 1; job.due = now + FRAGMENT_WINDOW
         return
     end
     if reason then
-        job.failures = job.failures + 1
+        job.failures, job.error = job.failures + 1, reason
         if job.failures >= 3 then
             NS.Pause()
             NS.SetStatus('Reply reception paused after repeated errors ('..reason..'). The reply is safe in the companion; Resume to retry.')
@@ -266,7 +309,10 @@ local function settle(job, reason, text, state, complete)
         NS.SetStatus('Retrying reply reception: '..reason)
         return
     end
-    job.failures, job.missed = 0, 0
+    job.failures, job.missed, job.answered, job.status = 0, 0, job.answered + 1, nil
+    if text and (text ~= job.lastText or state ~= job.lastState) then
+        job.lastText, job.lastState, job.progressAt = text, state, now
+    end
     if not text then job.due = now + FRAGMENT_WINDOW; return end
     if state == 0 and NS.CharacterNeed and NS.CharacterNeed(job.request, text) then
         job.lastRevision = job.assembly.revision
@@ -311,6 +357,22 @@ local function finish(job, reason, text, state, complete)
     settle(job, reason, text, state, complete)
 end
 
+-- The companion wrote why it cannot see the strip into this slot. It counts as no answer (the
+-- same backoff as an empty slot), but the reason is shown and kept for the request.
+local function settleStatus(job, text)
+    local code, at, message = NS.ParseStatus(text)
+    if not code or not (time and math.abs(time() - at) <= STATUS_FRESH) then
+        settle(job, 'Empty reply slot'); return  -- an outdated note: nothing current was written here
+    end
+    local now = GetTime()
+    NS.StripStalled(job.request)
+    job.status = {code = code, text = message, at = now}
+    job.missed, job.failures = job.missed + 1, 0
+    job.due = now + math.min(30, 5 * 2^math.min(job.missed, 3))
+    NS.SetStatus('Companion: '..NS.Escape(message))
+    if not job.callback then NS.ShowReply(job.request, 'Companion: '..message, 0, false) end
+end
+
 -- A long reply announced by a font packet: load its slot, or fall back to
 -- fonts for this reply if the slot does not check out.
 local function loadHybrid(job, descriptor)
@@ -323,11 +385,21 @@ end
 
 local function stepReceiver(now)
     for request, job in pairs(jobs) do
-        if now >= job.expires and not (reading and reading.job == job) then
+        if now >= job.expires and not job.held and not (reading and reading.job == job) then
+            local reason = describe(job)
+            -- A stall handler may keep waiting: pages already stored stay stored, so a longer
+            -- wait loses nothing, and the next look comes soon.
+            local more = job.stall and job.stall(job, reason)
+            if more then
+                job.expires, job.missed = now + more, 0
+                job.due = math.min(job.due, now + FIRST_WINDOW)
+            end
+        end
+        if now >= job.expires and not job.held and not (reading and reading.job == job) then
             jobs[request] = nil
             NS.AckPrompt(request)
             if job.callback then
-                job.callback('Companion acknowledgement timed out. Check that capture is enabled and WoW is not minimized, then retry.', 6)
+                job.callback(describe(job), 6)
             else
                 NS.ShowReply(request, 'Stopped checking after an hour. Check the companion for the reply, or click Retry to resend.', 6, true)
                 NS.OnReplyFinished(job.chat, 6)
@@ -390,13 +462,14 @@ local function stepReceiver(now)
         if reading.index == 64 then
             local info, why = NS.PeekReply(table.concat(reading.bytes), session, job.request, slot)
             if not info then finish(job, why); return end
-            if info.part == 1 and job.assembly.nextPart == 1 and info.revision == job.lastRevision then
+            if info.state ~= 8 and info.part == 1 and job.assembly.nextPart == 1 and info.revision == job.lastRevision then
                 finish(job, 'Unchanged'); return
             end
         end
         if reading.index == GLYPHS then
             local packet, why = NS.ParseReply(table.concat(reading.bytes), session, job.request, slot)
             if not packet then finish(job, why); return end
+            if packet.state == 8 then consume(); settleStatus(job, packet.text); return end
             if packet.state == 7 then
                 consume()
                 if not NS.ClaimHybrid(packet.text) then

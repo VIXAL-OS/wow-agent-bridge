@@ -149,7 +149,7 @@ class ManualSync(unittest.TestCase):
     def test_missing_companion_times_out_and_retry_is_available(self):
         self.sim.companion_on = False
         self.assertTrue(self.sim.ns.SyncCharacter()[0])
-        self.assertTrue(self.sim.run(300, until=lambda: not self.sim.ns.CharacterSyncBusy()))
+        self.assertTrue(self.sim.run(600, until=lambda: not self.sim.ns.CharacterSyncBusy()))
         self.assertIn('Character sync failed:', self.messages())
         self.assertNotIn('Character sync complete:', self.messages())
         self.sim.companion_on = True
