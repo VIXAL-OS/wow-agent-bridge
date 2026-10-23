@@ -56,6 +56,14 @@ function NS.Send(raw)
     local sequence = NS.NextRequest()
     local started, why = NS.BeginRequest(sequence, chat.id)
     if not started then return false, why or 'Reply channel unavailable. Run /ab test to check it.' end
+    -- The chat now carries this character's context: it belongs to this character.
+    local key = NS.CharacterKey()
+    local moved, before = NS.TagChat(chat.id, key)
+    if moved and before then
+        NS.Print('"'..NS.Escape(title)..'" now belongs to '..NS.Escape(NS.CharacterName(key))..' (it was '
+            ..NS.Escape(NS.CharacterName(before) or 'unknown')..'): this prompt carries '
+            ..NS.Escape(NS.CharacterName(key))..'\'s game context.')
+    end
     if character then NS.RememberCharacter(sequence, character) end
     NS.QueuePrompt(sequence, NS.EncodePrompt(text, NS.session, sequence))
     NS.SetBadge(nil)
@@ -110,8 +118,11 @@ local function listChats()
         local state = NS.IsChatBusy(chat.id) and ' (working)' or chat.unread and ' (unread)' or ''
         local agent, model = NS.ChatAgent(chat.id)
         local who = agent and (' |cff909090- '..NS.AGENTS[agent]..(model and (', '..NS.Escape(model)) or '')..'|r') or ''
-        NS.Print(mark..index..'. '..NS.Escape(NS.ChatTitle(chat.id))..state..who)
+        local character = ' |cffb0c4de['..NS.Escape(NS.CharacterName(chat.character) or 'unknown character')..']|r'
+        NS.Print(mark..index..'. '..NS.Escape(NS.ChatTitle(chat.id))..character..state..who)
     end
+    NS.Print(NS.S.chatFilter == 'character' and 'The chat list shows only this character\'s chats (/ab chats all shows every chat).'
+        or 'The chat list shows every character\'s chats (/ab chats mine shows only this character\'s).')
 end
 
 local ECHO = {off = 0, short = 800, full = 100000}
@@ -140,6 +151,7 @@ local HELP = {
     '/ab retry - resend this chat\'s last prompt; keeps any new draft',
     '/ab new [name] - start another chat (the others keep going)',
     '/ab chats - list chats;  /ab chat <number or name> - switch',
+    '/ab chats mine|all - list only this character\'s chats, or every chat (tagged with its character)',
     '/ab rename <name> | delete - rename or delete the current chat',
     '/ab agent claude|codex|hermes - which agent answers the current chat (no name: show it)',
     '/ab model <name>|default - the model for the current chat (no name: show it)',
@@ -173,6 +185,10 @@ SlashCmdList.AGENTBRIDGE = function(arg)
     elseif cmd == 'new' then
         NS.NewChat(rest ~= '' and rest or nil)
         NS.Print('started "'..NS.Escape(NS.ChatTitle(NS.S.chat))..'". /ai sends to it.')
+    elseif cmd == 'chats' and (word == 'mine' or word == 'all') then
+        NS.SetChatFilter(word == 'mine' and 'character' or nil)
+        NS.Print(word == 'mine' and 'the chat list now shows only this character\'s chats.'
+            or 'the chat list now shows every character\'s chats, tagged with their character.')
     elseif cmd == 'chats' then listChats()
     elseif cmd == 'chat' and rest ~= '' then
         local id = NS.FindChatByName(rest)

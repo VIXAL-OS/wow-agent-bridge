@@ -39,12 +39,115 @@ function NS.NewChat(name)
     local newest = 0
     for _, chat in ipairs(chats()) do newest = math.max(newest, chat.id) end
     -- Always a new id, even for two chats started within the same second.
-    local chat = {id = math.max(time(), newest + 1), name = clean(name)}
+    local chat = {id = math.max(time(), newest + 1), name = clean(name), character = NS.CharacterKey()}
     table.insert(chats(), 1, chat)
     NS.SelectChat(chat.id)
     NS.SetStatus('New chat. The agent will not see your other chats.')
     return chat
 end
+
+-- Which character a chat belongs to. chat.character is "Name-Realm": the character it was
+-- started on, then whichever character's game context its newest prompt carried. false means
+-- an older chat the companion could not place; nil means not known yet (see LookupChatCharacters).
+function NS.CharacterKey()
+    local name, realm = UnitName and UnitName('player'), GetRealmName and GetRealmName()
+    if type(name) ~= 'string' or name == '' or name == UNKNOWNOBJECT or name == 'Unknown'
+        or type(realm) ~= 'string' or realm == '' then return nil end
+    return name..'-'..realm
+end
+function NS.CharacterName(key)
+    return type(key) == 'string' and key:match('^([^%-]+)') or nil
+end
+function NS.ChatCharacter(id)
+    local chat = NS.FindChat(id)
+    if chat then return chat.character end
+end
+-- Tag a chat with a character; returns whether it changed and the previous tag.
+function NS.TagChat(id, key)
+    local chat = NS.FindChat(id)
+    if not chat or not key or chat.character == key then return false end
+    local before = chat.character
+    chat.character = key
+    if NS.RefreshChats then NS.RefreshChats() end
+    return true, before
+end
+
+-- The sidebar lists every chat with its character (the default), or only the chats of the
+-- character you are playing.
+function NS.VisibleChats()
+    local key = NS.S.chatFilter == 'character' and NS.CharacterKey()
+    if not key then return chats() end
+    local out = {}
+    for _, chat in ipairs(chats()) do
+        if chat.character == key then out[#out+1] = chat end
+    end
+    return out
+end
+-- With the filter on, the chat you are reading stays one of this character's: its newest, or a
+-- new one, so a prompt never goes to another character's chat by accident.
+function NS.FollowCharacter()
+    local key = NS.CharacterKey()
+    if NS.S.chatFilter ~= 'character' or not key then return end
+    local current = NS.CurrentChat()
+    if current and current.character == key then return end
+    for _, chat in ipairs(chats()) do
+        if chat.character == key then NS.SelectChat(chat.id); return end
+    end
+    NS.NewChat()
+end
+function NS.SetChatFilter(mode)
+    NS.S.chatFilter = mode == 'character' and 'character' or nil
+    NS.FollowCharacter()
+    if NS.RefreshChats then NS.RefreshChats() end
+end
+
+-- Chats from before character tags: the companion knows which character's context their prompts
+-- carried. Ask it once per session (one short exchange); an older companion refuses the
+-- question, and they stay untagged until a later session asks again.
+local lookedUp = false
+local CHATS_REPLY = '\1ABCHATS1\n'
+function NS.LookupChatCharacters()
+    if lookedUp or not NS.S or not NS.session then return false end
+    local ids = {}
+    for _, chat in ipairs(chats()) do
+        if chat.character == nil and NS.HasHistory(chat.id) and #ids < 64 then ids[#ids+1] = chat.id end
+    end
+    if #ids == 0 then return false end
+    lookedUp = true
+    local asked = {}
+    for _, id in ipairs(ids) do asked[id] = true end
+    local seq = NS.NextRequest()
+    local ok = NS.BeginRequest(seq, nil, function(reply, state)
+        if state ~= 4 or reply:sub(1, #CHATS_REPLY) ~= CHATS_REPLY then return end
+        for line in reply:sub(#CHATS_REPLY + 1):gmatch('[^\n]+') do
+            local id, who = line:match('^(%d+)|(.*)$')
+            local chat = asked[tonumber(id)] and NS.FindChat(tonumber(id))
+            if chat and chat.character == nil then
+                local valid = #who <= 100 and not who:find('[%c|]') and who:match('^[^%-]+%-.+$')
+                chat.character = valid and who or false
+            end
+        end
+        if NS.RefreshChats then NS.RefreshChats() end
+    end, 240)
+    if not ok then lookedUp = false; return false end
+    local fields = {{'probe', 'chats'}, {'chats', table.concat(ids, ',')}}
+    NS.QueuePrompt(seq, NS.EncodeCharacter(NS.Envelope(fields, 'ABCTX_CHATS'), NS.session, seq), true)
+    return true
+end
+
+-- At login: a chat with nothing in it yet belongs to whoever is playing.
+local login = CreateFrame('Frame')
+login:RegisterEvent('PLAYER_ENTERING_WORLD')
+login:SetScript('OnEvent', function()
+    if not NS.S then return end
+    local key = NS.CharacterKey()
+    if not key then return end
+    for _, chat in ipairs(chats()) do
+        if chat.character == nil and not chat.lastPrompt and not NS.HasHistory(chat.id) then chat.character = key end
+    end
+    NS.FollowCharacter()
+    if NS.RefreshChats then NS.RefreshChats() end
+end)
 
 function NS.RenameChat(id, name)
     local chat = NS.FindChat(id)
@@ -63,6 +166,7 @@ function NS.DeleteChat(id)
         NS.NewChat()
     elseif NS.S.chat == id then
         NS.SelectChat(chats()[math.min(index, #chats())].id)
+        if NS.FollowCharacter then NS.FollowCharacter() end
     elseif NS.RefreshChats then
         NS.RefreshChats()
     end

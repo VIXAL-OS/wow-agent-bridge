@@ -44,11 +44,17 @@ inset:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
     insets = {left = 4, right = 4, top = 4, bottom = 4}})
 inset:SetBackdropColor(0, 0, 0, .65)
 
+-- The chat's header: its title, the character it belongs to, and its agent.
+local chatHeader = inset:CreateFontString(nil, 'OVERLAY', 'GameFontNormalSmall')
+chatHeader:SetPoint('TOPLEFT', 10, -8); chatHeader:SetPoint('TOPRIGHT', -10, -8)
+chatHeader:SetJustifyH('LEFT'); chatHeader:SetHeight(14)
+NS.ChatHeader = chatHeader
+
 -- A document view: a scroll frame whose child holds one font string per line.
 -- (A chat-style message frame stacks text against its bottom edge and scrolls
 -- by whole messages, which reads badly for a reply.)
 local scroll = CreateFrame('ScrollFrame', 'AgentBridgeScroll', inset, 'UIPanelScrollFrameTemplate')
-scroll:SetPoint('TOPLEFT', 10, -8); scroll:SetPoint('BOTTOMRIGHT', -30, 8)
+scroll:SetPoint('TOPLEFT', 10, -26); scroll:SetPoint('BOTTOMRIGHT', -30, 8)
 local body = CreateFrame('Frame', 'AgentBridgeBody', scroll)
 NS.Body = body
 Size(body, 10, 10)
@@ -336,9 +342,11 @@ test:SetScript('OnClick', function() NS.RunSelfTest(true) end)
 function NS.OnReceiveState(active) pause:SetText(active and 'Pause' or 'Resume') end
 
 -- Chats down the left: the one you are reading is highlighted, "..." marks one
--- still working and "*" one with a reply you have not read. Right-click a chat
--- to rename or delete it; the mouse wheel scrolls a long list.
-local ROW = 20
+-- still working and "*" one with a reply you have not read. Under each title,
+-- the character it belongs to. Right-click a chat to rename or delete it; the
+-- mouse wheel scrolls a long list. The button at the bottom shows every
+-- character's chats or only the current character's.
+local ROW = 30
 local side = CreateFrame('Frame', nil, panel)
 side:SetPoint('TOPLEFT', 18, -48); side:SetPoint('BOTTOMLEFT', 18, 44); side:SetWidth(SIDEBAR)
 side:SetBackdrop({bgFile = 'Interface\\Tooltips\\UI-Tooltip-Background',
@@ -371,6 +379,33 @@ for index, entry in ipairs(MENU) do
     b:SetScript('OnClick', function() menu:Hide(); entry[2](menu.chat) end)
 end
 
+-- The character a chat belongs to, coloured: green for the one you are playing,
+-- grey-blue for another, dim for a chat that could not be placed.
+local function characterText(id)
+    local key = NS.ChatCharacter(id)
+    local name = NS.CharacterName(key)
+    if not name then return '|cff707070unknown character|r' end
+    if key == NS.CharacterKey() then return '|cff80e080'..NS.Escape(name)..'|r' end
+    return '|cffb0c4de'..NS.Escape(name)..'|r'
+end
+NS.ChatCharacterText = characterText
+
+local filter = CreateFrame('Button', nil, side, 'UIPanelButtonTemplate')
+Size(filter, SIDEBAR - 14, 20); filter:SetPoint('BOTTOM', 0, 6)
+NS.FilterButton = filter
+filter:SetScript('OnClick', function()
+    NS.SetChatFilter(NS.S.chatFilter ~= 'character' and 'character' or nil)
+end)
+filter:SetScript('OnEnter', function(self)
+    GameTooltip:SetOwner(self, 'ANCHOR_TOP')
+    GameTooltip:SetText('Chats by character', 1, 1, 1)
+    GameTooltip:AddLine('Each chat belongs to the character whose game context it carries. Click to list '
+        ..(NS.S.chatFilter == 'character' and 'every character\'s chats.' or 'only the chats of the character you are playing.'),
+        .8, .8, .8, true)
+    GameTooltip:Show()
+end)
+filter:SetScript('OnLeave', function() GameTooltip:Hide() end)
+
 local rows, first = {}, 1
 local function row(i)
     if rows[i] then return rows[i] end
@@ -382,13 +417,19 @@ local function row(i)
     b.selected:SetAllPoints(b); b.selected:SetTexture(.25, .45, 1, .35)
     -- Which agent answers this chat, at the right; the title takes the rest.
     b.tag = b:CreateFontString(nil, 'OVERLAY', 'GameFontDisableSmall')
-    b.tag:SetPoint('RIGHT', b, 'RIGHT', -3, 0); b.tag:SetJustifyH('RIGHT')
+    b.tag:SetPoint('TOPRIGHT', b, 'TOPRIGHT', -3, -3); b.tag:SetJustifyH('RIGHT')
     b.label = b:CreateFontString(nil, 'OVERLAY', 'GameFontHighlightSmall')
-    b.label:SetPoint('LEFT', b, 'LEFT', 4, 0); b.label:SetPoint('RIGHT', b.tag, 'LEFT', -3, 0)
-    b.label:SetHeight(ROW); b.label:SetJustifyH('LEFT')
+    b.label:SetPoint('TOPLEFT', b, 'TOPLEFT', 4, -3); b.label:SetPoint('RIGHT', b.tag, 'LEFT', -3, 0)
+    b.label:SetHeight(12); b.label:SetJustifyH('LEFT')
+    -- Below the title: the character it belongs to.
+    b.who = b:CreateFontString(nil, 'OVERLAY', 'GameFontDisableSmall')
+    b.who:SetPoint('BOTTOMLEFT', b, 'BOTTOMLEFT', 4, 3); b.who:SetPoint('BOTTOMRIGHT', b, 'BOTTOMRIGHT', -3, 3)
+    b.who:SetHeight(12); b.who:SetJustifyH('LEFT')
     b:SetScript('OnEnter', function(self)
         GameTooltip:SetOwner(self, 'ANCHOR_RIGHT')
         GameTooltip:SetText(NS.ChatTitle(self.chat), 1, 1, 1)
+        local key = NS.ChatCharacter(self.chat)
+        GameTooltip:AddLine('Character: '..(type(key) == 'string' and key or 'unknown (from before chats were tagged)'), .8, .8, .8, true)
         GameTooltip:AddLine(NS.DescribeAgent(self.chat), .8, .8, .8, true)
         GameTooltip:AddLine('Right-click to rename, delete, or change agent or model.', .6, .6, .6, true)
         GameTooltip:Show()
@@ -406,11 +447,27 @@ local function row(i)
     return b
 end
 
+-- The header above the transcript: which chat, whose character, which agent.
+local function refreshHeader()
+    local id = NS.S.chat
+    local agent = NS.ChatAgent(id)
+    local text = '|cffffd100'..NS.Escape(NS.ChatTitle(id))..'|r  |cff909090-|r  '..characterText(id)
+    local key, current = NS.ChatCharacter(id), NS.CharacterKey()
+    if type(key) == 'string' and current and key ~= current then
+        text = text..' |cffff9050(you are playing '..NS.Escape(NS.CharacterName(current))..')|r'
+    end
+    if agent then text = text..'  |cff909090-  '..NS.AGENTS[agent]..'|r' end
+    chatHeader:SetText(text)
+end
+
 function NS.RefreshChats()
     if not NS.S then return end
     if NS.RefreshRetry then NS.RefreshRetry() end
-    local list = NS.S.chats
-    local fit = math.max(1, math.floor(((side:GetHeight() or 300) - 40) / ROW))
+    refreshHeader()
+    local mine = NS.S.chatFilter == 'character' and NS.CharacterName(NS.CharacterKey())
+    filter:SetText(mine and ('Only '..mine) or 'All characters')
+    local list = NS.VisibleChats()
+    local fit = math.max(1, math.floor(((side:GetHeight() or 300) - 40 - 26) / ROW))
     first = math.max(1, math.min(first, #list - fit + 1))
     for i = 1, fit do
         local chat = list[first + i - 1]
@@ -421,6 +478,7 @@ function NS.RefreshChats()
             b.label:SetText(mark..NS.Escape(NS.ChatTitle(chat.id)))
             local agent = NS.ChatAgent(chat.id)
             b.tag:SetText(agent and NS.AGENTS[agent] or '')
+            b.who:SetText(characterText(chat.id))
             if chat.id == NS.S.chat then b.selected:Show() else b.selected:Hide() end
             b:Show()
         elseif rows[i] then
@@ -438,6 +496,8 @@ panel:HookScript('OnShow', function()
     local chat = NS.S and NS.CurrentChat and NS.CurrentChat()
     if chat then chat.unread = nil end
     NS.RefreshChats()
+    -- Chats from before character tags: ask the companion once which character each belongs to.
+    if NS.LookupChatCharacters then NS.LookupChatCharacters() end
 end)
 
 -- A visible, generous target instead of a tiny unlabelled corner.

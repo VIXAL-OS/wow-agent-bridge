@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sqlite3
 import time
 import zlib
 
@@ -16,6 +17,7 @@ from .savedvariables import saved_section
 MAX_DOCUMENT = 160000
 MAX_PAGES = 40
 NEED = '\x01ABCTX1\n'
+CHATS = '\x01ABCHATS1\n'  # answer to a chat-character lookup (probe=chats)
 # Upload windows: the addon sends up to WINDOW pages at once and watches only the last,
 # which names the others (window=<request>,<request>,...). Its reply stays "queued" until
 # every page of the window is stored, so the game loads one confirmation per window.
@@ -311,8 +313,40 @@ class CharacterStore:
         return {'others': others, 'owner': fields['character'][0], 'section': fields['section'][0],
                 'revision': fields['revision'][0]}
 
+    def chat_character(self, chat):
+        """The character whose game context the newest prompts of a chat (8 hex digits) carried,
+        as Name-Realm, or None when no stored prompt names one."""
+        try:
+            rows = self.db.execute('SELECT meta FROM jobs WHERE chat=? ORDER BY rowid DESC LIMIT 50', (chat,)).fetchall()
+        except sqlite3.Error:
+            return None  # An inbox without prompts.
+        for (meta,) in rows:
+            try:
+                context = json.loads(meta or '{}').get('context') or ''
+            except (ValueError, AttributeError):
+                continue
+            name = re.search(r'^Character: ([^,\n]+), level ', context, re.MULTILINE)
+            realm = re.search(r'^Client: .*, realm ([^\n]+)$', context, re.MULTILINE)
+            if name and realm:
+                who = f'{name.group(1).strip()}-{realm.group(1).strip()}'
+                if clean(who, 100) and '-' not in name.group(1):
+                    return who
+        return None
+
+    def chat_characters(self, fields, chunk):
+        """Answer the addon's lookup for chats it has not tagged with a character yet: one
+        "id|Name-Realm" line per chat, blank after the bar when no stored prompt names one."""
+        ids = fields.get('chats', [''])[0].split(',')
+        if (set(fields) != {'probe', 'chats'} or len(fields['chats']) != 1 or chunk != 'ABCTX_CHATS'
+                or not 1 <= len(ids) <= 64 or len(set(ids)) != len(ids)
+                or not all(re.fullmatch(r'[1-9][0-9]{0,9}', i) and int(i) < 2 ** 32 for i in ids)):
+            raise ValueError('Invalid chat lookup')
+        return CHATS + '\n'.join(f'{i}|{self.chat_character(f"{int(i):08x}") or ""}' for i in ids)
+
     def _page(self, blob):
         fields, chunk = parse_envelope(blob)
+        if fields.get('probe') == ['chats']:
+            return self.chat_characters(fields, chunk)
         if fields.get('probe') == ['manifest']:
             if (set(fields) - {'window'} != {'character', 'snapshot', 'probe'} or chunk != 'ABCTX_PROBE'
                     or not fields.get('snapshot') or ('window' in fields and not window_size(fields))):
