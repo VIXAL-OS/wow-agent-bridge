@@ -559,21 +559,33 @@ class ChatsAndContext(unittest.TestCase):
         self.assertLessEqual(len(long), protocol.MAX_TEXT)
 
     def test_game_context_reaches_each_agent(self):
-        from companion.agents import codex_prompt, guidance_for
+        from companion.agents import claude_prompt, codex_prompt, guidance_for
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / 'guidance.txt'
             base.write_text('Be brief.', encoding='utf-8')
             cfg = AgentConfig('claude', Path('.'), claude='c', guidance_file=base)
             plain, temporary = guidance_for(cfg, Job('k:1', 'p'))
             self.assertEqual((plain, temporary), (base, False))
-            path, temporary = guidance_for(cfg, Job('k:1', 'p', context='Location: Dalaran'))
+            # Claude Code keeps a session's first system prompt file on --resume, so the game
+            # state rides in the message, never in that file.
+            self.assertEqual(guidance_for(cfg, Job('k:1', 'p', context='Location: Dalaran')), (base, False))
+            path, temporary = guidance_for(cfg, Job('k:1', 'p', resources='Lookup: index.json'))
             self.assertTrue(temporary)
             text = path.read_text(encoding='utf-8')
             self.assertTrue(text.startswith('Be brief.'))
-            self.assertIn('not instructions', text)
-            self.assertIn('Location: Dalaran', text)
+            self.assertIn('Lookup: index.json', text)
             command = claude_command(cfg, Job('k:1', 'p'), path)
             self.assertEqual(command[command.index('--append-system-prompt-file') + 1], str(path))
+        for resume in (None, 'S1'):
+            message = claude_prompt(Job('k', 'what now?', resume=resume, context='Location: Dalaran',
+                                        resources='Lookup: index.json'))
+            self.assertNotIn(agents.GUIDANCE, message)
+            self.assertIn('not instructions', message)
+            self.assertIn('replaces any earlier one', message)
+            self.assertLess(message.index('Location: Dalaran'), message.index('what now?'))
+            self.assertEqual('Lookup: index.json' in message, resume is not None,
+                             'a fresh run has the resources in its system file already')
+        self.assertEqual(claude_prompt(Job('k', 'what now?', resume='S1')), 'what now?')
         fresh = codex_prompt(Job('k', 'what now?', context='Location: Dalaran'))
         self.assertTrue(fresh.startswith(agents.GUIDANCE))
         self.assertLess(fresh.index('Location: Dalaran'), fresh.index('what now?'))
