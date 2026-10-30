@@ -16,6 +16,10 @@ def upgrade(home, browser_executable=None, speech=False, vision=False):
     flags = json.loads(flags_path.read_text(encoding='utf-8')) if flags_path.exists() else {}
     if not isinstance(flags, dict) or any(type(value) is not bool for value in flags.values()):
         raise ValueError('bridge-tools.json must map feature names to true/false')
+    runtime_path = home / 'bridge-runtime.json'
+    runtime = json.loads(runtime_path.read_text(encoding='utf-8')) if runtime_path.exists() else {}
+    if not isinstance(runtime, dict):
+        raise ValueError('bridge-runtime.json must be an object')
     from ruamel.yaml import YAML
     yaml = YAML()
     path = home / 'config.yaml'
@@ -29,6 +33,8 @@ def upgrade(home, browser_executable=None, speech=False, vision=False):
     data.setdefault('terminal', {}).update(backend='local', cwd='.', timeout=180)
     data.setdefault('memory', {}).update(memory_enabled=True, user_profile_enabled=True)
     data.setdefault('agent', {}).update(max_turns=40)
+    # This worker has a fixed tool allowlist, not an expandable catalog.
+    data.setdefault('tools', {}).setdefault('tool_search', {})['enabled'] = 'off'
     data.setdefault('delegation', {}).update(max_concurrent_children=2, oneshot_max_children=2,
                                             max_spawn_depth=1, child_timeout_seconds=180,
                                             orchestrator_enabled=False, subagent_auto_approve=False)
@@ -61,9 +67,8 @@ def upgrade(home, browser_executable=None, speech=False, vision=False):
     flags.update(browser=bool(browser_executable), vision=vision, speech=speech)
     flags_path.write_text(json.dumps(flags, indent=2), encoding='utf-8')
     if browser_executable:
-        (home / 'bridge-runtime.json').write_text(json.dumps({
-            'browser_executable': str(Path(browser_executable).resolve()),
-        }, indent=2), encoding='utf-8')
+        runtime['browser_executable'] = str(Path(browser_executable).resolve())
+        runtime_path.write_text(json.dumps(runtime, indent=2), encoding='utf-8')
     # A small bridge-specific skill gives the agent a reusable entry point; users
     # can add more skills through skill_manage without importing unrelated hooks.
     skill = home / 'skills' / 'agent-bridge'

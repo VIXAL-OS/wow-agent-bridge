@@ -64,13 +64,19 @@ Use `/ab perf on`, reproduce a transfer, then `/ab perf` to print call counts, a
 - **Three agents.**
   - Claude Code runs `claude -p --output-format stream-json`, with live streaming and tool-activity status. Follow-ups use native `--resume`.
   - Codex runs `codex exec --json`, resuming threads with `exec resume` (its sandbox goes through a config override there), and falls back to passing history as data.
-  - Hermes runs its headless CLI in its own Python environment, with JSONL streaming, native session resume, project tools, persistent memory, reusable skills, and bounded delegation. Optional browser, vision and speech tools use its separate bridge profile.
+  - Hermes runs a protected worker in its own Python environment, with JSONL streaming, native session resume, project tools, persistent memory, reusable skills, and bounded delegation. Optional browser, vision and speech tools use its separate bridge profile.
   - All three can search the web, which is on by default. The status line shows each real query, so you can tell a search that happened from a reply that only claims a source.
   - Prompts go on stdin, never on a command line.
 
 ### Hermes setup
 
-Install [Hermes Agent](https://github.com/NousResearch/hermes-agent) separately. The adapter was tested with release `v2026.9.24` (`0.21.5`). It finds the Python executable under `~/.hermes/hermes-agent/venv` or `.venv`; another installation can be selected with the companion's `--hermes <python-path>` option. Hermes dependencies stay out of the companion's environment. The Anthropic provider needs Hermes's optional Anthropic SDK.
+Install [Hermes Agent](https://github.com/NousResearch/hermes-agent) separately. The current adapter is validated against stable `v0.22.5`, commit `bf0203a794a07aac3ff764972ab9087baa4e4f4e`, with Python 3.14 and that release's locked dependencies. Build its isolated environment through Hermes's package manager, with the `mcp`, `edge-tts` and `anthropic` extras. Dependencies stay out of the companion's environment. The companion initially finds Python under `~/.hermes/hermes-agent/venv` or `.venv`; `--hermes <python-path>` overrides that launcher.
+
+Stable v0.22.5 still contains the individual `browser_*` commands this adapter uses; later development source removed them. A stale editable install can also omit newly added modules. Keep the bridge on an audited fixed revision. `<bridge home>/bridge-runtime.json` selects `hermes_source` (an absolute source path), `hermes_python` (its matching isolated Python executable), and `hermes_entry: "oneshot-v0.22.5"`. Preserve `browser_executable`. Both helpers switch interpreter under the protected process lifetime before importing Hermes. Invalid paths and interpreter loops fail explicitly. Update source and environment together, never just the source of a moving checkout.
+
+The v0.22.5 entry uses Hermes's in-process one-shot library for provider selection, history and cleanup. Its new CLI would otherwise hand execution to a gateway and lose the bridge's process-local tool guards. The adapter preserves those guards, rejects unexpected tools, retains bounded turns/time, and does not enable automatic approval. Set `tools.tool_search.enabled: off` in the bridge profile: this worker exposes a fixed allowlist. Reading pages remains available at restricted access; forms require shell access. Arbitrary browser JavaScript/CDP commands are not exposed.
+
+New helper processes pick up this runtime selection without a WoW reload or companion restart. Wait for active jobs before switching. Keep the previous profile/code pair for rollback; the previously verified legacy release was `v2026.9.24` (`0.21.5`), commit `f97608f178d1ffeca59860195ab7da295f7c8e5f`. Omitting the three runtime-selection keys uses the launcher's legacy CLI path.
 
 For a Hydra bot using `ModelProvider` declarations in `bot.py`, import its configured routes with Hermes's Python:
 
@@ -110,7 +116,7 @@ Optional tools require their dependencies before enabling them:
 
 - **Browser:** install `agent-browser@0.26.0` with npm under `<Hermes bridge home>/runtime`, run its `agent-browser install` command to download Chrome for Testing, then pass the resulting Chrome path to `tools.upgrade_hermes --browser-executable '<path>'`. The bridge launches headless sessions with GPU rendering disabled. Reading pages is available at all access levels; clicks, typing and key presses require `workspace-write+shell`. Turning **Web search** off hides both search and browser tools.
 - **Image analysis:** add `--vision` when the `bridge-gemini` provider route is configured. This uses that provider to inspect image URLs or local image files; the WoW panel does not upload screenshots automatically.
-- **Speech:** install `edge-tts==7.2.7` in the Hermes environment and add `--speech`. Audio files are saved under the bridge profile's `cache/audio` folder; the WoW panel does not play them automatically.
+- **Speech:** include Hermes's locked `edge-tts` extra (v0.22.5 resolves 7.3.1) and add `--speech`. Audio files are saved under the bridge profile's `cache/audio` folder; the WoW panel does not play them automatically.
 
 Browser workers close their sessions on normal shutdown. On Windows, each Hermes
 worker and shared MCP worker also joins a private job object before starting tools:
@@ -143,9 +149,9 @@ speech tools through a private MCP process. This does not run a Hermes agent or
 switch the chat's main model. Vision uses the configured Gemini route and its API
 billing; speech uses Edge TTS. Credentials remain in the Hermes bridge profile.
 
-After setting up the optional Hermes tools above, install its MCP dependencies
-in the Hermes environment (the tested SDK is `mcp==2.0.0`, with
-`httpx2==2.7.0` and `starlette==1.3.1`), then run from this repository:
+After setting up the optional Hermes tools above, include the locked `mcp`
+extra in its isolated environment (v0.22.5 resolves SDK 2.3.0), then run from
+this repository:
 
 ```powershell
 .\.venv\Scripts\python.exe -m tools.configure_extras
@@ -193,12 +199,18 @@ These options apply only to bridge-launched runs, not the CLIs' global settings.
 The server also rejects disabled tools even if called directly. See
 [Codex auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review).
 
-Verified with Claude Code `2.1.223`, Codex `0.155.0-alpha.16.4` and the Hermes
-version above: native skill discovery and a single child delegation in both
+Previously verified with Claude Code `2.1.223`, Codex `0.155.0-alpha.16.4` and Hermes
+v2026.9.24: native skill discovery and a single child delegation in both
 CLIs; browser navigation and generated speech through both adapters; browser
 forms, image analysis and access restrictions directly through the shared MCP
 server. Older CLI versions may not understand these options. The new extras
 have not yet been verified through a live in-game prompt.
+
+The v0.22.5 migration separately verifies actual MCP initialization and exact tool
+lists at all access levels, navigation, form restrictions, image analysis, speech,
+normal/forced browser cleanup, and a native Hermes reply followed by session
+resume and a file read. These checks use isolated fixtures rather than the game
+transport; an in-game round trip after migration remains a user check.
 
 This setup does not add persistent scheduling, messaging integrations or a
 shared image-generation provider. Desktop-only plugins and automation tools do

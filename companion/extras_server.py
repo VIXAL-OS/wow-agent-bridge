@@ -90,4 +90,6 @@ if __name__ == '__main__':
     home, project = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
     if not home.is_dir() or not project.is_dir() or sys.argv[4] not in ('web', 'none'):
         raise ValueError('Invalid bridge home, project or web mode')
+    from hermes_runtime import bootstrap
+    bootstrap(home)
     asyncio.run(serve(home, project, sys.argv[3], sys.argv[4] == 'web'))
