@@ -590,6 +590,10 @@ Reply text is escaped and cannot run as code or perform a game action. A web sou
 - **Latency:** Claude answered in ~4 s, and the reply was in the panel ~10 s after the companion picked the prompt up.
 - **The scrolling reply panel and web search**, in real WoW questions answered through the game.
 - **Source links opening the default browser, reply rendering after reload, and item/spell link interaction**, confirmed by the user on 2026-09-24.
+- **Gems by socket** (2026-11-06): the first live gear and bag snapshots named every gem in seven equipped and four
+  bagged items. The same jewel code always resolved to the same gem, a belt-buckle gem showed as an added
+  prismatic socket, two bagged items showed their empty sockets, and every socket bonus state agreed with the
+  gem colours.
 
 **Not yet exercised live** (covered by simulation and unit tests only):
 
@@ -598,7 +602,6 @@ Reply text is escaped and cannot run as code or perform a game action. A web sou
 - Replies longer than one 4,060-byte packet, and streaming previews.
 - Aligned tables in the fixed-width font.
 - Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
-- Gems by socket in the gear and bag snapshots.
 
 In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
 
