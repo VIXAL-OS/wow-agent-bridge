@@ -260,7 +260,7 @@ class CharacterInGame(unittest.TestCase):
         self.sim.g.STUB.fire(b'PLAYER_EQUIPMENT_CHANGED', 1); self.sim.run(3)
         value, _ = self.document('gear')
         self.assertEqual(value[2], 'partial')
-        self.assertIn(['1', 'Uncached item', 'item:0', '', ''], value[4])
+        self.assertIn(['1', 'Uncached item', 'item:0', '', '', ''], value[4])
 
     def test_localized_search_placeholder_is_not_a_recipe_filter(self):
         # 3.3.5 puts SEARCH in GetText() when its empty search field loses focus.

@@ -158,19 +158,36 @@ OpenStackSplitFrame = function() end
 
 -- Tooltips: STUB.tooltips[link data] = {lines}. SetHyperlink fills the
 -- <name>TextLeftN font strings the way GameTooltipTemplate lays them out.
+-- A line is its text, or {text, r, g, b} for a coloured one (GetTextColor).
+-- SetInventoryItem and SetBagItem read STUB.tooltips['inventory:<slot>'] and
+-- ['bag:<bag>:<slot>']; an empty slot shows nothing, as in the client.
 STUB.tooltips = {}
 function Object:ClearLines() rawset(self, 'count', 0) end
 function Object:NumLines() return rawget(self, 'count') or 0 end
+function Object:GetTextColor()
+    local c = rawget(self, 'rgb') or {1, 1, 1}
+    return c[1], c[2], c[3], 1
+end
+local function fillTooltip(self, lines)
+    for i, line in ipairs(lines) do
+        local left, right = new('FontString', self.name..'TextLeft'..i), new('FontString', self.name..'TextRight'..i)
+        if type(line) == 'table' then left.text, left.rgb = line[1], {line[2], line[3], line[4]}
+        else left.text = line end
+        right.shown = false
+    end
+    rawset(self, 'count', #lines)
+end
 function Object:SetHyperlink(data)
     self.lastHyperlink = data
     local lines = STUB.tooltips[data]
     if not lines then error('Unknown link type') end
-    for i, text in ipairs(lines) do
-        local left, right = new('FontString', self.name..'TextLeft'..i), new('FontString', self.name..'TextRight'..i)
-        left.text, right.shown = text, false
-    end
-    rawset(self, 'count', #lines)
+    fillTooltip(self, lines)
 end
+function Object:SetInventoryItem(unit, slot)
+    if unit ~= 'player' then error('only the player is modelled') end
+    fillTooltip(self, STUB.tooltips['inventory:'..slot] or {})
+end
+function Object:SetBagItem(bag, slot) fillTooltip(self, STUB.tooltips['bag:'..bag..':'..slot] or {}) end
 
 -- Dialogs: shown ones are recorded; tests accept them by calling OnAccept.
 StaticPopupDialogs, STUB.popups = {}, {}

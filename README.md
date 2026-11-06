@@ -318,6 +318,16 @@ character snapshots using ordinary game APIs:
   are not complete tooltips and do not describe every proc or set effect.
 - **Bags:** occupied slots in the backpack and bags 1–4, with item names, full
   item strings and stack quantities. Bank, guild bank, mail and keyring are excluded.
+- **Gems**, for equipped items and gear in your bags: each socket in order with its
+  colour and the gem in it by name, gem colour and item ID, or "empty". A gem beyond
+  the item's own sockets is listed as an added prismatic socket (belt buckle or
+  blacksmith socket), and so is an empty one on equipped gear. The socket bonus is
+  marked active or inactive. Item links only carry gem enchantment codes, so the addon
+  reads names with `GetItemGem` and socket colours from a hidden tooltip of the same
+  item without gems; the bonus state is the colour of that line on the item's own
+  tooltip. A gem the client hasn't cached yet is listed by item ID and fetched, and the
+  scan runs again a few seconds later (up to five times). The prompt carries a
+  one-line summary of equipped gems; the gear and bag files have every socket.
 - **Recipes:** learned recipe names, recipe spell IDs and output item IDs when
   available. Open each of your own profession windows to scan it. Clear search
   and makeable filters, choose all categories/slots, and expand categories for a
@@ -588,6 +598,7 @@ Reply text is escaped and cannot run as code or perform a game action. A web sou
 - Replies longer than one 4,060-byte packet, and streaming previews.
 - Aligned tables in the fixed-width font.
 - Bank recycling across a game restart, and the Codex backend through the game (Codex works through the companion on its own).
+- Gems by socket in the gear and bag snapshots.
 
 In simulation, a short reply appears ~3.5 s after the agent finishes and a 14.7 KB reply transfers in ~9 s. Only the first 4,060 bytes preview while the agent is still writing. The in-game preview is capped at 60 KB; the companion keeps everything.
 
@@ -618,6 +629,7 @@ The end-to-end tests load the real addon Lua in Lua 5.1 against a stubbed 3.3.5a
 - native item/spell hyperlink events, Shift-click insertion, uncached items and link-row resizing
 - a sync whose confirmations are lost after every page arrived: it keeps waiting, shows the companion's out-of-sight note and finishes once the strip is visible; a held prompt never takes a slot announcement from its uploads; a silent companion fails with that reason
 - currency snapshots: collapsed headers expanded and restored without a rescan loop, money-only patches, partial scans
+- gems by socket in gear and bags: socket colours in order, belt-buckle gems and empty added sockets, active and inactive socket bonuses, uncached gems fetched and rescanned (with a cap), unreadable socket colours numbered rather than guessed, the prompt's gem summary, and old rows without gems
 - chats tagged with their character, the per-character list filter, and older chats placed by the companion (or left untagged by an older one)
 
 Unit tests cover the wire formats and pixel sampling under display scaling and low opacity, fonts and bank hard-link isolation, publisher deadlines, both agent parsers and their permission flags, model discovery, strip geometry and the installer. UI tests drive the panel itself: Markdown formatting, scroll position, and the transcript across prompts, `/reload` and its size cap. They also run two chats at once end to end, give chats their own agents and models, and check the envelope each prompt carries (chat, name, agent, model, game context, tooltips), the progress line's clock, chat-frame echo, `/ai`, the copy box, renaming and deleting through the dialogs, and migrating a single-conversation install to chats. Companion tests cover the per-chat scheduler, how each prompt's agent and model are chosen (and unusable names refused), the header that names them in replies, the inbox migration and how game context reaches each agent.

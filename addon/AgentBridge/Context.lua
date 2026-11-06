@@ -307,8 +307,127 @@ local function item(link)
     name = name or link:match('|h%[(.-)%]|h') or 'Uncached item'
     return data, clean(name), level and tostring(level) or '', name ~= 'Uncached item'
 end
+
+-- Gems by socket, for equipped and carried items. A link's jewel fields hold gem enchantment
+-- codes, which tell a reader nothing, so each socket is written out: its colour (from the
+-- tooltip of the same item without gems, which lists sockets in order), the gem's name, colour
+-- and item ID, and whether the socket bonus is active (the item's own tooltip shows that line
+-- green when it is, grey when not). A gem past the item's own sockets sits in an added
+-- prismatic socket (belt buckle, blacksmith sockets). A gem the client has not cached yet is
+-- named by item ID; its tooltip asks the server for it and the section is scanned again soon.
+local SOCKETS = {{'EMPTY_SOCKET_META', 'Meta Socket', 'Meta'}, {'EMPTY_SOCKET_RED', 'Red Socket', 'Red'},
+    {'EMPTY_SOCKET_YELLOW', 'Yellow Socket', 'Yellow'}, {'EMPTY_SOCKET_BLUE', 'Blue Socket', 'Blue'},
+    {'EMPTY_SOCKET_PRISMATIC', 'Prismatic Socket', 'Prismatic'}, {'EMPTY_SOCKET_NO_COLOR', 'Prismatic Socket', 'Prismatic'}}
+local GEM_RETRIES, gemRetries = 5, {}
+local function socketColour(text)
+    for _, socket in ipairs(SOCKETS) do
+        if text == (_G[socket[1]] or socket[2]) then return socket[3] end
+    end
+end
+-- Each line of a tooltip as {text, r, g, b}; an inline colour code wins over the font colour.
+local function readTip(set, ...)
+    tip:SetOwner(WorldFrame, 'ANCHOR_NONE')
+    tip:ClearLines()
+    local out = {}
+    if pcall(set, tip, ...) then
+        for i = 1, tonumber((tip:NumLines())) or 0 do
+            local left = _G['AgentBridgeTipTextLeft'..i]
+            local text = left and left:GetText()
+            if text and text ~= '' then
+                local r, g, b = 1, 1, 1
+                if left.GetTextColor then r, g, b = left:GetTextColor() end
+                local hr, hg, hb = text:match('^|c%x%x(%x%x)(%x%x)(%x%x)')
+                if hr then r, g, b = tonumber(hr, 16) / 255, tonumber(hg, 16) / 255, tonumber(hb, 16) / 255 end
+                out[#out+1] = {plain(text), tonumber(r) or 1, tonumber(g) or 1, tonumber(b) or 1}
+            end
+        end
+    end
+    tip:Hide()
+    return out
+end
+local function gemName(link, index, fallback)
+    local ok, name, gemLink = pcall(GetItemGem, link, index)
+    if not ok then name, gemLink = nil, nil end
+    local id = gemLink and gemLink:match('item:(%d+)')
+    if not id and tonumber(fallback) and tonumber(fallback) > 0 then id = string.format('%.0f', tonumber(fallback)) end
+    if not name and id then name = GetItemInfo('item:'..id) end
+    if not name then
+        -- Asking the tooltip for an uncached item makes the client fetch it.
+        if id then readTip(tip.SetHyperlink, 'item:'..id) end
+        return id and ('gem item '..id..', name not cached yet') or 'gem not identified yet', false
+    end
+    local kind = (gemLink or id) and select(7, GetItemInfo(gemLink or ('item:'..id)))
+    kind = kind and kind ~= '' and (clean(kind, 30):lower()..' gem, ') or ''
+    return clean(name, 80)..' ('..kind..'item '..(id or '?')..')', true
+end
+-- 'Red socket: Runed Cardinal Ruby (red gem, item 40113); ...; socket bonus +5 Spell Power: active',
+-- or '' for an item without sockets. Also returns false while something is still unknown.
+-- `added`: look for an empty added socket even on an item without sockets of its own (it shows
+-- only on the item's own tooltip, so that costs a tooltip read per item).
+local function gemsText(link, stats, gemIDs, added, setTip, ...)
+    local data = link and link:match('item:[%d:%-]+') or ''
+    local head, j1, j2, j3, j4, tail = data:match('^(item:%-?%d+:%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)(.*)$')
+    if not head or not GetItemGem then return '', true end
+    local jewels, sockets = {j1, j2, j3, j4}, 0
+    for key, count in pairs(stats or {}) do
+        if tostring(key):find('^EMPTY_SOCKET_') then sockets = sockets + (tonumber(count) or 0) end
+    end
+    local last = 0
+    for i = 1, 4 do if jewels[i] ~= '0' then last = i end end
+    if sockets == 0 and last == 0 and not added then return '', true end
+    local colours = {}
+    if sockets > 0 then
+        for _, line in ipairs(readTip(tip.SetHyperlink, head..':0:0:0:0'..tail)) do
+            colours[#colours+1] = socketColour(line[1])
+        end
+    end
+    local coloured = #colours == sockets
+    local known, out, bonus, emptyPrismatic = coloured, {}, nil, 0
+    local prefix = (ITEM_SOCKET_BONUS or 'Socket Bonus: %s'):match('^(.-)%%s')
+    if not prefix or prefix == '' then prefix = 'Socket Bonus: ' end
+    for _, line in ipairs(setTip and readTip(setTip, ...) or {}) do
+        if line[1]:sub(1, #prefix) == prefix then
+            local r, g, b = line[2], line[3], line[4]
+            local state = (g > .8 and r < .5 and b < .5) and 'active'
+                or (math.abs(r - g) < .1 and math.abs(g - b) < .1 and r < .8) and 'inactive' or 'state unknown'
+            bonus = 'socket bonus '..clean(line[1]:sub(#prefix + 1), 80)..': '..state
+        elseif socketColour(line[1]) == 'Prismatic' then
+            emptyPrismatic = emptyPrismatic + 1
+        end
+    end
+    for i = 1, math.max(sockets, last) do
+        local label = i > sockets and 'Added prismatic socket' or coloured and (colours[i]..' socket') or ('Socket '..i)
+        local text = 'empty'
+        if jewels[i] ~= '0' then
+            local named
+            text, named = gemName(link, i, gemIDs and gemIDs[i])
+            known = known and named
+        elseif colours[i] == 'Prismatic' then
+            emptyPrismatic = emptyPrismatic - 1
+        end
+        out[#out+1] = label..': '..text
+    end
+    -- An empty added socket shows only on the item's own tooltip.
+    for _ = 1, (sockets < 4 and last <= sockets) and math.min(emptyPrismatic, 1) or 0 do
+        out[#out+1] = 'Added prismatic socket: empty'
+    end
+    if bonus then out[#out+1] = bonus end
+    return clean(table.concat(out, '; '), 1200), known
+end
+local function gemsSettled(section, settled)
+    if settled then gemRetries[section] = 0; return end
+    gemRetries[section] = (gemRetries[section] or 0) + 1
+    if gemRetries[section] <= GEM_RETRIES and not dirty[section] then dirty[section] = GetTime() + 3 end
+end
+-- Gem item IDs from GetInventoryItemGems/GetContainerItemGems, a fallback for GetItemGem.
+local function gemIDs(fn, ...)
+    if not fn then return nil end
+    local result = {pcall(fn, ...)}
+    if not table.remove(result, 1) then return nil end
+    return result
+end
 local function gear(epoch)
-    local rows, complete = {}, true
+    local rows, complete, settled = {}, true, true
     for slot = 0, 19 do
         local link = GetInventoryItemLink('player', slot)
         local data, name, level, known = item(link)
@@ -320,13 +439,21 @@ local function gear(epoch)
             out[#out+1] = clean(_G[key] or key, 60)..'='..clean(stats[key], 24)
         end
         if data ~= '' and (not known or not level or level == '' or not stats) then complete = false end
-        rows[tostring(slot)] = {tostring(slot), name, data, level, table.concat(out, ', ')}
+        local gemText, named = '', true
+        if link and known then
+            gemText, named = gemsText(link, stats, gemIDs(GetInventoryItemGems, slot), true,
+                tip.SetInventoryItem, 'player', slot)
+        end
+        if not named then complete, settled = false, false end
+        rows[tostring(slot)] = {tostring(slot), name, data, level, table.concat(out, ', '), gemText}
         coroutine.yield()
     end
-    store('gear', rows, complete and 'complete' or 'partial', 'Equipped slots 0-19; base item stats, not full tooltips.', epoch)
+    store('gear', rows, complete and 'complete' or 'partial',
+        'Equipped slots 0-19; base item stats, not full tooltips; gems by socket.', epoch)
+    gemsSettled('gear', settled)
 end
 local function bags(epoch)
-    local rows, complete, capacity, used = {}, true, 0, 0
+    local rows, complete, capacity, used, settled = {}, true, 0, 0, true
     for bag = 0, 4 do
         local available = tonumber(GetContainerNumSlots(bag))
         if not available or available > 100 then complete = false end
@@ -339,14 +466,24 @@ local function bags(epoch)
                 local data, name, _, known = item(link)
                 if data == '' then data, name = 'item:0', 'Uncached item' end
                 if not known then complete = false end
+                -- Only gear can hold gems, so only gear pays for the socket tooltips.
+                local gemText, named = '', true
+                local equip = link and known and select(9, GetItemInfo(link))
+                if equip and equip ~= '' then
+                    gemText, named = gemsText(link, GetItemStats and GetItemStats(link),
+                        gemIDs(GetContainerItemGems, bag, slot), false, tip.SetBagItem, bag, slot)
+                end
+                if not named then complete, settled = false, false end
                 local key = bag..':'..slot
-                rows[key] = {key, name, data, tostring(count or 1)}; used = used + 1
+                rows[key] = {key, name, data, tostring(count or 1), gemText}; used = used + 1
             end
             coroutine.yield()
         end
     end
     store('bags', rows, complete and 'complete' or 'partial',
-        string.format('Carried bags only; %d/%d occupied slots; bank, mail and keyring excluded.', used, capacity), epoch)
+        string.format('Carried bags only; %d/%d occupied slots; bank, mail and keyring excluded; gems by socket.',
+            used, capacity), epoch)
+    gemsSettled('bags', settled)
 end
 local function positiveID(value)
     local n = tonumber(value)

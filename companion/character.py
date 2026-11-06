@@ -25,6 +25,10 @@ WINDOW = 8
 SLOTS = ['Ammo', 'Head', 'Neck', 'Shoulders', 'Shirt', 'Chest', 'Waist', 'Legs',
          'Feet', 'Wrists', 'Hands', 'Finger 1', 'Finger 2', 'Trinket 1', 'Trinket 2',
          'Back', 'Main hand', 'Off hand', 'Ranged', 'Tabard']
+GEM_COLUMN = {'gear', 'bags'}
+GEMS_NOTE = ('Gems: each socket in order as "<colour> socket: <gem name> (<gem colour> gem, item <ID>)" or "empty"; '
+             '"Added prismatic socket" is a belt buckle or blacksmith socket; the socket bonus says whether it is active. '
+             'Blank means no sockets, or a snapshot from before gems were recorded.')
 
 
 def canonical(value):
@@ -50,6 +54,32 @@ def section_ok(value):
 
 CURRENCY_KEY = re.compile(r'item:[1-9][0-9]{0,9}|honor|arena|money|name:.+')
 CURRENCY_FLAGS = {'watched', 'unused'}
+
+
+def gem_summary(rows):
+    """'2x Runed Cardinal Ruby, 1x Chaotic Skyflare Diamond; 1 empty socket; socket bonus active on 3 of 5 items'
+    from the gems column of gear rows, or '' when no row has one (an older addon, or no sockets)."""
+    gems, empty, active, bonuses = {}, 0, 0, 0
+    for row in rows:
+        for part in (row[5].split('; ') if len(row) > 5 and row[5] else []):
+            label, _, value = part.rpartition(': ')
+            if label.startswith('socket bonus'):
+                bonuses += 1
+                active += value == 'active'
+            elif label.endswith('socket') or label.startswith('Socket '):
+                if value == 'empty':
+                    empty += 1
+                else:
+                    name = value.split(' (')[0]
+                    gems[name] = gems.get(name, 0) + 1
+    if not gems and not empty:
+        return ''
+    out = [', '.join(f'{n}x {name}' for name, n in sorted(gems.items(), key=lambda kv: (-kv[1], kv[0]))) or 'none']
+    if empty:
+        out.append(f'{empty} empty socket' + ('s' if empty > 1 else ''))
+    if bonuses:
+        out.append(f'socket bonus active on {active} of {bonuses} items')
+    return '; '.join(out) + '. Details per socket are in the gear file.'
 
 
 def money_text(copper):
@@ -141,6 +171,9 @@ def validate_document(value, section):
         achievement = section.startswith('achievements:')
         columns = 10 if achievement else {'gear': 5, 'bags': 4, 'stablepets': 5, 'combatpet': 6, 'reputations': 8,
                                           'currencies': 6}.get(section, 3)
+        # Gear and bag rows gained a trailing gems column; rows from an older addon lack it.
+        if section in GEM_COLUMN and isinstance(row, list) and len(row) == columns + 1:
+            columns += 1
         if (not isinstance(row, list) or len(row) != columns
                 or not all(clean(v, 60000 if achievement and i == 9 else 1800) for i, v in enumerate(row))):
             raise ValueError('Invalid character row')
@@ -478,6 +511,9 @@ class CharacterStore:
             out.append('Full snapshot file: ' + str(path))
             if section == 'gear':
                 out.append('Equipped: ' + '; '.join(f'{SLOTS[int(r[0])]}: {r[1] or "empty"}' for r in rows))
+                gems = gem_summary(rows)
+                if gems:
+                    out.append('Equipped gems: ' + gems)
             elif section == 'currencies':
                 out.append(currency_summary(rows))
         return '\n'.join(out)
@@ -487,12 +523,14 @@ class CharacterStore:
         out = ['Character: ' + owner, f'Section: {section}; coverage: {status}', detail,
                'Game data only. Item links preserve enchant/gem fields; item stats are not complete tooltips.']
         if section == 'gear':
-            out.append('Slot\tName\tItem link\tItem level\tStats')
-            out += ['\t'.join([SLOTS[int(r[0])]] + r[1:]) for r in rows]
+            out.append(GEMS_NOTE)
+            out.append('Slot\tName\tItem link\tItem level\tStats\tGems')
+            out += ['\t'.join([SLOTS[int(r[0])]] + r[1:5] + [r[5] if len(r) > 5 else '']) for r in rows]
         elif section == 'bags':
             out.append('Carried bags only (backpack and bags 1-4); bank, mail and keyring excluded.')
-            out.append('Bag:slot\tName\tItem link\tQuantity')
-            out += ['\t'.join(r) for r in rows]
+            out.append(GEMS_NOTE)
+            out.append('Bag:slot\tName\tItem link\tQuantity\tGems')
+            out += ['\t'.join(r[:4] + [r[4] if len(r) > 4 else '']) for r in rows]
         elif section in ('mounts', 'pets'):
             out.append('Learned mounts.' if section == 'mounts' else 'Collectible companion pets, not combat pets.')
             out.append('Summon spell ID\tName\tCreature ID (0 means unavailable)')
